@@ -167,11 +167,15 @@ class DashboardData {
     required this.movements,
     required this.activeNow,
     required this.checkedInToday,
+    required this.openLog,
+    required this.branchName,
   });
 
   final List<Movement> movements;
   final int activeNow;
   final int checkedInToday;
+  final Map<String, dynamic>? openLog;
+  final String branchName;
 }
 
 class ReportData {
@@ -332,18 +336,20 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     final pages = [
       DashboardPage(session: session),
-      AttendancePage(session: session),
       ReportsPage(session: session),
       TransfersPage(session: session),
+      QueriesPage(session: session),
+      ChatPage(session: session),
       ProfilePage(session: session, onSessionChanged: updateSession),
       if (session.canManageEmployees) ManagementPage(session: session),
     ];
 
     final destinations = [
       const NavigationDestination(icon: Icon(Icons.home_rounded), label: 'الرئيسية'),
-      const NavigationDestination(icon: Icon(Icons.schedule_rounded), label: 'الدوام'),
       const NavigationDestination(icon: Icon(Icons.query_stats_rounded), label: 'التقارير'),
       const NavigationDestination(icon: Icon(Icons.sync_alt_rounded), label: 'المناقلات'),
+      const NavigationDestination(icon: Icon(Icons.search_rounded), label: 'استعلام'),
+      const NavigationDestination(icon: Icon(Icons.chat_rounded), label: 'الدردشة'),
       const NavigationDestination(icon: Icon(Icons.person_rounded), label: 'حسابي'),
       if (session.canManageEmployees)
         const NavigationDestination(icon: Icon(Icons.admin_panel_settings_rounded), label: 'إدارة'),
@@ -402,6 +408,7 @@ class _DashboardPageState extends State<DashboardPage> {
     final employees = await loadEmployeesForScope(widget.session, includeInactive: false);
     final employeeById = {for (final employee in employees) employee.id: employee};
     final employeeIds = employeeById.keys.toSet();
+    Map<String, dynamic>? myOpenLog;
 
     final rows = await supabase
         .from('ansar_attendance_logs')
@@ -426,6 +433,9 @@ class _DashboardPageState extends State<DashboardPage> {
       final status = row['status'] as String? ?? '';
 
       if (status == 'open') activeEmployees.add(employeeId);
+      if (employeeId == widget.session.id && status == 'open') {
+        myOpenLog ??= row;
+      }
       if (checkInValue != null) {
         final checkIn = DateTime.parse(checkInValue).toLocal();
         if (formatDateKey(checkIn) == todayKey) checkedInToday.add(employeeId);
@@ -451,7 +461,27 @@ class _DashboardPageState extends State<DashboardPage> {
       movements: movements.take(30).toList(),
       activeNow: activeEmployees.length,
       checkedInToday: checkedInToday.length,
+      openLog: myOpenLog,
+      branchName: branchLabel(branches, widget.session.branchNum),
     );
+  }
+
+  Future<void> checkIn() async {
+    await supabase.from('ansar_attendance_logs').insert({
+      'employee_id': widget.session.id,
+      'branch_num': widget.session.branchNum,
+      'check_in_at': DateTime.now().toUtc().toIso8601String(),
+      'status': 'open',
+    });
+    if (mounted) setState(() => future = loadDashboard());
+  }
+
+  Future<void> checkOut(Map<String, dynamic> openLog) async {
+    await supabase.from('ansar_attendance_logs').update({
+      'check_out_at': DateTime.now().toUtc().toIso8601String(),
+      'status': 'closed',
+    }).eq('id', openLog['id']);
+    if (mounted) setState(() => future = loadDashboard());
   }
 
   @override
@@ -472,9 +502,66 @@ class _DashboardPageState extends State<DashboardPage> {
           }
 
           final data = snapshot.data!;
+          final isWorking = data.openLog != null;
           return ListView(
             padding: const EdgeInsets.all(16),
             children: [
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          CircleAvatar(
+                            radius: 24,
+                            backgroundColor: isWorking ? Colors.green.shade50 : Colors.grey.shade100,
+                            child: Icon(
+                              isWorking ? Icons.work_history_rounded : Icons.work_off_rounded,
+                              color: isWorking ? Colors.green : Colors.grey,
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  isWorking ? 'أنت داخل العمل الآن' : 'لا يوجد دوام مفتوح',
+                                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                                ),
+                                Text(data.branchName, style: const TextStyle(color: Colors.black54)),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 14),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: FilledButton.icon(
+                              onPressed: isWorking ? null : checkIn,
+                              icon: const Icon(Icons.login_rounded),
+                              label: const Text('دخول'),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: isWorking ? () => checkOut(data.openLog!) : null,
+                              icon: const Icon(Icons.logout_rounded),
+                              label: const Text('خروج'),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
               Row(
                 children: [
                   Expanded(
@@ -912,6 +999,221 @@ class _ReportsPageState extends State<ReportsPage> {
         );
       },
     );
+  }
+}
+
+class QueriesPage extends StatefulWidget {
+  const QueriesPage({super.key, required this.session});
+
+  final EmployeeSession session;
+
+  @override
+  State<QueriesPage> createState() => _QueriesPageState();
+}
+
+class _QueriesPageState extends State<QueriesPage> {
+  final search = TextEditingController();
+  Future<List<ProductResult>>? future;
+
+  Future<List<ProductResult>> runSearch() async {
+    final value = search.text.trim();
+    if (value.isEmpty) return [];
+
+    final matNums = <int>{};
+    final numeric = int.tryParse(value);
+    if (numeric != null) matNums.add(numeric);
+
+    final barcodeRows = await supabase
+        .from('product_barcodes')
+        .select('mat_num')
+        .eq('barcode', value)
+        .limit(20);
+    for (final row in barcodeRows) {
+      final matNum = (row['mat_num'] as num?)?.toInt();
+      if (matNum != null) matNums.add(matNum);
+    }
+
+    final productRows = <Map<String, dynamic>>[];
+    if (matNums.isNotEmpty) {
+      final rows = await supabase
+          .from('products')
+          .select()
+          .inFilter('mat_num', matNums.toList())
+          .limit(30);
+      productRows.addAll(rows.cast<Map<String, dynamic>>());
+    }
+
+    final nameRows = await supabase
+        .from('products')
+        .select()
+        .ilike('name', '%$value%')
+        .limit(30);
+    for (final row in nameRows.cast<Map<String, dynamic>>()) {
+      final matNum = (row['mat_num'] as num?)?.toInt();
+      if (matNum == null) continue;
+      if (!productRows.any((product) => product['mat_num'] == matNum)) {
+        productRows.add(row);
+      }
+    }
+
+    final branches = await loadBranchesMap();
+    final results = <ProductResult>[];
+    for (final product in productRows.take(40)) {
+      final matNum = (product['mat_num'] as num?)?.toInt();
+      if (matNum == null) continue;
+      final stockRows = await supabase
+          .from('product_stock')
+          .select('sto_num, quantity')
+          .eq('mat_num', matNum);
+      final stock = <StockResult>[];
+      for (final row in stockRows.cast<Map<String, dynamic>>()) {
+        final branchNum = (row['sto_num'] as num?)?.toInt();
+        if (branchNum == null) continue;
+        stock.add(
+          StockResult(
+            branchName: branchLabel(branches, branchNum),
+            quantity: (row['quantity'] as num?)?.toDouble() ?? 0,
+          ),
+        );
+      }
+      stock.sort((a, b) => b.quantity.compareTo(a.quantity));
+      results.add(ProductResult(product: product, stock: stock));
+    }
+    return results;
+  }
+
+  void submitSearch() {
+    setState(() => future = runSearch());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: search,
+                    decoration: const InputDecoration(
+                      labelText: 'اسم الكتاب أو رقم المادة أو الباركود',
+                      prefixIcon: Icon(Icons.search_rounded),
+                    ),
+                    onSubmitted: (_) => submitSearch(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: submitSearch,
+                  child: const Text('بحث'),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        if (future == null)
+          const EmptyState(icon: Icons.manage_search_rounded, text: 'اكتب كلمة بحث لعرض الكتب والمخزون')
+        else
+          FutureBuilder<List<ProductResult>>(
+            future: future,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState != ConnectionState.done) {
+                return const Center(child: Padding(
+                  padding: EdgeInsets.all(24),
+                  child: CircularProgressIndicator(),
+                ));
+              }
+              if (snapshot.hasError) {
+                return ErrorState(message: cleanError(snapshot.error), onRetry: submitSearch);
+              }
+              final results = snapshot.data!;
+              if (results.isEmpty) {
+                return const EmptyState(icon: Icons.search_off_rounded, text: 'لا توجد نتائج مطابقة');
+              }
+              return Column(children: results.map((result) => ProductResultCard(result: result)).toList());
+            },
+          ),
+      ],
+    );
+  }
+}
+
+class ProductResult {
+  ProductResult({required this.product, required this.stock});
+
+  final Map<String, dynamic> product;
+  final List<StockResult> stock;
+}
+
+class StockResult {
+  StockResult({required this.branchName, required this.quantity});
+
+  final String branchName;
+  final double quantity;
+}
+
+class ProductResultCard extends StatelessWidget {
+  const ProductResultCard({super.key, required this.result});
+
+  final ProductResult result;
+
+  @override
+  Widget build(BuildContext context) {
+    final product = result.product;
+    final matNum = product['mat_num'];
+    return Card(
+      child: ExpansionTile(
+        leading: const CircleAvatar(child: Icon(Icons.menu_book_rounded)),
+        title: Text(product['name'] as String? ?? 'بدون اسم'),
+        subtitle: Text('رقم المادة $matNum · الكمية ${product['quantity'] ?? '-'}'),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              PriceChip(label: 'جرد', value: product['jard_price']),
+              PriceChip(label: 'نظامي', value: product['regular_price']),
+              PriceChip(label: 'سعر 1', value: product['price1']),
+              PriceChip(label: 'سعر 2', value: product['price2']),
+              PriceChip(label: 'سعر 3', value: product['price3']),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (result.stock.isEmpty)
+            const Align(
+              alignment: Alignment.centerRight,
+              child: Text('لا توجد كميات حسب الفروع', style: TextStyle(color: Colors.black54)),
+            )
+          else
+            ...result.stock.take(10).map(
+                  (stock) => ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(stock.branchName),
+                    trailing: Text(stock.quantity.toStringAsFixed(0)),
+                  ),
+                ),
+        ],
+      ),
+    );
+  }
+}
+
+class PriceChip extends StatelessWidget {
+  const PriceChip({super.key, required this.label, required this.value});
+
+  final String label;
+  final Object? value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Chip(label: Text('$label: ${value ?? '-'}'));
   }
 }
 
@@ -1810,21 +2112,366 @@ class _StatusDialogState extends State<StatusDialog> {
   }
 }
 
-class ChatPage extends StatelessWidget {
+class ChatPage extends StatefulWidget {
   const ChatPage({super.key, required this.session});
 
   final EmployeeSession session;
 
   @override
-  Widget build(BuildContext context) {
-    return const Center(
-      child: Padding(
-        padding: EdgeInsets.all(24),
-        child: Text(
-          'الدردشة ستكون في دفعة لاحقة بعد تثبيت صفحات الدوام والمناقلات والتقارير.',
-          textAlign: TextAlign.center,
+  State<ChatPage> createState() => _ChatPageState();
+}
+
+class _ChatPageState extends State<ChatPage> {
+  late Future<List<Map<String, dynamic>>> future;
+
+  @override
+  void initState() {
+    super.initState();
+    future = loadThreads();
+  }
+
+  Future<List<Map<String, dynamic>>> loadThreads() async {
+    final rows = await supabase
+        .from('ansar_chat_threads')
+        .select()
+        .eq('is_active', true)
+        .order('updated_at', ascending: false);
+
+    final participants = await supabase
+        .from('ansar_chat_participants')
+        .select('thread_id')
+        .eq('employee_id', widget.session.id);
+    final joinedThreadIds = participants.map((row) => row['thread_id']).toSet();
+
+    return rows.cast<Map<String, dynamic>>().where((row) {
+      final type = row['thread_type'] as String? ?? 'general';
+      if (type == 'general') return true;
+      if (widget.session.isAdmin) return true;
+      return joinedThreadIds.contains(row['id']);
+    }).toList();
+  }
+
+  Future<void> openThread(Map<String, dynamic> thread) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: ChatThreadPage(session: widget.session, thread: thread),
         ),
       ),
+    );
+    if (mounted) setState(() => future = loadThreads());
+  }
+
+  Future<void> createThread() async {
+    final employees = await loadEmployeesForScope(widget.session, includeInactive: false);
+    if (!mounted) return;
+    final result = await showDialog<CreateThreadResult>(
+      context: context,
+      builder: (_) => CreateThreadDialog(session: widget.session, employees: employees),
+    );
+    if (result == null) return;
+
+    final inserted = await supabase
+        .from('ansar_chat_threads')
+        .insert({
+          'title': result.title,
+          'thread_type': result.employeeIds.length == 1 ? 'direct' : 'group',
+          'created_by': widget.session.id,
+        })
+        .select('id')
+        .single();
+    final threadId = inserted['id'];
+    final participantIds = {widget.session.id, ...result.employeeIds};
+    await supabase.from('ansar_chat_participants').insert(
+          participantIds
+              .map((employeeId) => {
+                    'thread_id': threadId,
+                    'employee_id': employeeId,
+                    'role': employeeId == widget.session.id ? 'admin' : 'member',
+                  })
+              .toList(),
+        );
+    setState(() => future = loadThreads());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<List<Map<String, dynamic>>>(
+      future: future,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        if (snapshot.hasError) {
+          return ErrorState(
+            message: cleanError(snapshot.error),
+            onRetry: () => setState(() => future = loadThreads()),
+          );
+        }
+        final threads = snapshot.data!;
+        return Scaffold(
+          body: threads.isEmpty
+              ? const EmptyState(icon: Icons.chat_bubble_outline_rounded, text: 'لا توجد محادثات بعد')
+              : ListView.separated(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: threads.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (context, i) {
+                    final thread = threads[i];
+                    return Card(
+                      child: ListTile(
+                        leading: CircleAvatar(
+                          child: Icon(thread['thread_type'] == 'general'
+                              ? Icons.campaign_rounded
+                              : Icons.forum_rounded),
+                        ),
+                        title: Text(thread['title'] as String? ?? 'محادثة'),
+                        subtitle: Text(chatTypeLabel(thread['thread_type'] as String? ?? 'general')),
+                        onTap: () => openThread(thread),
+                      ),
+                    );
+                  },
+                ),
+          floatingActionButton: FloatingActionButton.extended(
+            onPressed: createThread,
+            icon: const Icon(Icons.add_comment_rounded),
+            label: const Text('محادثة'),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class ChatThreadPage extends StatefulWidget {
+  const ChatThreadPage({super.key, required this.session, required this.thread});
+
+  final EmployeeSession session;
+  final Map<String, dynamic> thread;
+
+  @override
+  State<ChatThreadPage> createState() => _ChatThreadPageState();
+}
+
+class _ChatThreadPageState extends State<ChatThreadPage> {
+  final message = TextEditingController();
+  late Future<List<Map<String, dynamic>>> future;
+
+  @override
+  void initState() {
+    super.initState();
+    future = loadMessages();
+  }
+
+  Future<List<Map<String, dynamic>>> loadMessages() async {
+    final rows = await supabase
+        .from('ansar_chat_messages')
+        .select()
+        .eq('thread_id', widget.thread['id'])
+        .isFilter('deleted_at', null)
+        .order('created_at', ascending: true)
+        .limit(120);
+    return rows.cast<Map<String, dynamic>>();
+  }
+
+  Future<void> sendMessage() async {
+    final body = message.text.trim();
+    if (body.isEmpty) return;
+    message.clear();
+    await supabase.from('ansar_chat_messages').insert({
+      'thread_id': widget.thread['id'],
+      'sender_id': widget.session.id,
+      'body': body,
+      'message_type': 'text',
+    });
+    await supabase
+        .from('ansar_chat_threads')
+        .update({'updated_at': DateTime.now().toUtc().toIso8601String()}).eq('id', widget.thread['id']);
+    setState(() => future = loadMessages());
+  }
+
+  Future<void> deleteMessage(Map<String, dynamic> row) async {
+    if (row['sender_id'] != widget.session.id && !widget.session.isAdmin) return;
+    await supabase
+        .from('ansar_chat_messages')
+        .update({'deleted_at': DateTime.now().toUtc().toIso8601String()}).eq('id', row['id']);
+    setState(() => future = loadMessages());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.thread['title'] as String? ?? 'محادثة'),
+        actions: [
+          IconButton(
+            tooltip: 'تحديث',
+            onPressed: () => setState(() => future = loadMessages()),
+            icon: const Icon(Icons.refresh_rounded),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: FutureBuilder<List<Map<String, dynamic>>>(
+              future: future,
+              builder: (context, snapshot) {
+                if (snapshot.connectionState != ConnectionState.done) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                if (snapshot.hasError) {
+                  return ErrorState(
+                    message: cleanError(snapshot.error),
+                    onRetry: () => setState(() => future = loadMessages()),
+                  );
+                }
+                final messages = snapshot.data!;
+                if (messages.isEmpty) {
+                  return const EmptyState(icon: Icons.mark_chat_unread_rounded, text: 'ابدأ أول رسالة');
+                }
+                return ListView.builder(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: messages.length,
+                  itemBuilder: (context, i) {
+                    final row = messages[i];
+                    final mine = row['sender_id'] == widget.session.id;
+                    return Align(
+                      alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 320),
+                        child: Card(
+                          color: mine ? brandColor.withValues(alpha: 0.1) : panelSurface,
+                          child: InkWell(
+                            onLongPress: () => deleteMessage(row),
+                            child: Padding(
+                              padding: const EdgeInsets.all(12),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(row['body'] as String? ?? ''),
+                                  const SizedBox(height: 5),
+                                  Text(
+                                    formatDateTime(DateTime.parse(row['created_at'] as String).toLocal()),
+                                    style: const TextStyle(fontSize: 11, color: Colors.black45),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: message,
+                      minLines: 1,
+                      maxLines: 4,
+                      decoration: const InputDecoration(
+                        hintText: 'اكتب رسالة',
+                        border: OutlineInputBorder(),
+                      ),
+                      onSubmitted: (_) => sendMessage(),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton.filled(
+                    onPressed: sendMessage,
+                    icon: const Icon(Icons.send_rounded),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class CreateThreadResult {
+  CreateThreadResult({required this.title, required this.employeeIds});
+
+  final String title;
+  final List<String> employeeIds;
+}
+
+class CreateThreadDialog extends StatefulWidget {
+  const CreateThreadDialog({super.key, required this.session, required this.employees});
+
+  final EmployeeSession session;
+  final List<EmployeeLite> employees;
+
+  @override
+  State<CreateThreadDialog> createState() => _CreateThreadDialogState();
+}
+
+class _CreateThreadDialogState extends State<CreateThreadDialog> {
+  final title = TextEditingController();
+  final selected = <String>{};
+
+  @override
+  Widget build(BuildContext context) {
+    final employees = widget.employees.where((employee) => employee.id != widget.session.id).toList();
+    return AlertDialog(
+      title: const Text('محادثة جديدة'),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(controller: title, decoration: const InputDecoration(labelText: 'عنوان المحادثة')),
+              const SizedBox(height: 8),
+              ...employees.map(
+                (employee) => CheckboxListTile(
+                  value: selected.contains(employee.id),
+                  title: Text(employee.name),
+                  subtitle: Text(roleLabel(employee.role)),
+                  onChanged: (checked) {
+                    setState(() {
+                      if (checked == true) {
+                        selected.add(employee.id);
+                      } else {
+                        selected.remove(employee.id);
+                      }
+                    });
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+        FilledButton(
+          onPressed: selected.isEmpty
+              ? null
+              : () {
+                  final fallbackTitle = selected.length == 1 ? 'محادثة خاصة' : 'مجموعة جديدة';
+                  Navigator.pop(
+                    context,
+                    CreateThreadResult(
+                      title: title.text.trim().isEmpty ? fallbackTitle : title.text.trim(),
+                      employeeIds: selected.toList(),
+                    ),
+                  );
+                },
+          child: const Text('إنشاء'),
+        ),
+      ],
     );
   }
 }
@@ -2197,6 +2844,21 @@ String statusLabel(String status) {
       return 'ملغي';
     default:
       return status;
+  }
+}
+
+String chatTypeLabel(String type) {
+  switch (type) {
+    case 'general':
+      return 'دردشة عامة';
+    case 'direct':
+      return 'دردشة خاصة';
+    case 'group':
+      return 'مجموعة';
+    case 'order':
+      return 'مناقلة';
+    default:
+      return type;
   }
 }
 
