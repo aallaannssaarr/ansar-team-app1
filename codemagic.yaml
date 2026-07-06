@@ -12,6 +12,16 @@ workflows:
       - name: Get dependencies
         script: |
           flutter pub get
+      - name: Set Android app name and icon
+        script: |
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          text = manifest.read_text(encoding="utf-8")
+          text = text.replace('android:label="ansar_team_app"', 'android:label="فريق الأنصار"')
+          manifest.write_text(text, encoding="utf-8")
+          PY
+          dart run flutter_launcher_icons
       - name: Analyze
         script: |
           flutter analyze

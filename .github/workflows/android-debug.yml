@@ -25,6 +25,17 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
+      - name: Set Android app name and icon
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          text = manifest.read_text(encoding="utf-8")
+          text = text.replace('android:label="ansar_team_app"', 'android:label="فريق الأنصار"')
+          manifest.write_text(text, encoding="utf-8")
+          PY
+          dart run flutter_launcher_icons
+
       - name: Analyze
         run: flutter analyze
 
