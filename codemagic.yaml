@@ -1,0 +1,22 @@
+workflows:
+  android-debug:
+    name: Android Debug APK
+    max_build_duration: 30
+    instance_type: mac_mini_m2
+    environment:
+      flutter: stable
+    scripts:
+      - name: Generate Android platform
+        script: |
+          flutter create --platforms=android .
+      - name: Get dependencies
+        script: |
+          flutter pub get
+      - name: Analyze
+        script: |
+          flutter analyze
+      - name: Build debug APK
+        script: |
+          flutter build apk --debug
+    artifacts:
+      - build/app/outputs/flutter-apk/app-debug.apk
