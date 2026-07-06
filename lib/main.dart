@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'ansar_config.dart';
@@ -8,7 +7,7 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Supabase.initialize(
     url: AnsarConfig.supabaseUrl,
-    anonKey: AnsarConfig.supabaseAnonKey,
+    publishableKey: AnsarConfig.supabaseAnonKey,
   );
   runApp(const AnsarApp());
 }
@@ -445,7 +444,7 @@ class _EmployeeDialogState extends State<EmployeeDialog> {
               decoration: const InputDecoration(labelText: 'رقم الفرع'),
             ),
             DropdownButtonFormField<String>(
-              value: role,
+              initialValue: role,
               items: const [
                 DropdownMenuItem(value: 'employee', child: Text('موظف')),
                 DropdownMenuItem(value: 'branch_manager', child: Text('مدير فرع')),
