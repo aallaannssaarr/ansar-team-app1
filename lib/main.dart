@@ -336,7 +336,7 @@ class _DashboardPageState extends State<DashboardPage> {
         .eq('is_active', true);
     final employees = {
       for (final row in employeeRows)
-        row['id'] as String: EmployeeLite.fromRow(row as Map<String, dynamic>),
+        row['id'] as String: EmployeeLite.fromRow(row),
     };
 
     final now = DateTime.now();
@@ -348,8 +348,7 @@ class _DashboardPageState extends State<DashboardPage> {
         .order('check_in_at', ascending: false);
 
     final todayLogs = <TodayAttendance>[];
-    for (final raw in todayRows) {
-      final row = raw as Map<String, dynamic>;
+    for (final row in todayRows) {
       final employee = employees[row['employee_id']];
       if (employee == null) continue;
       final branchNum = (row['branch_num'] as num?)?.toInt() ?? employee.branchNum;
@@ -373,8 +372,7 @@ class _DashboardPageState extends State<DashboardPage> {
         .gte('check_in_at', sinceUtc.toIso8601String());
     final hoursByEmployee = <String, double>{};
     final daysByEmployee = <String, Set<String>>{};
-    for (final raw in durationRows) {
-      final row = raw as Map<String, dynamic>;
+    for (final row in durationRows) {
       final employeeId = row['employee_id'] as String?;
       final checkInValue = row['check_in_at'] as String?;
       if (employeeId == null || checkInValue == null) continue;
@@ -862,13 +860,13 @@ class StatTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Card(
-      color: color.withOpacity(0.09),
+      color: color.withValues(alpha: 0.09),
       child: Padding(
         padding: const EdgeInsets.all(14),
         child: Row(
           children: [
             CircleAvatar(
-              backgroundColor: color.withOpacity(0.14),
+              backgroundColor: color.withValues(alpha: 0.14),
               child: Icon(icon, color: color),
             ),
             const SizedBox(width: 12),
@@ -1044,8 +1042,7 @@ class ErrorState extends StatelessWidget {
 Future<Map<int, BranchOption>> loadBranchesMap() async {
   final rows = await supabase.from('branches').select('sto_num, name').order('sto_num');
   final branches = <int, BranchOption>{};
-  for (final raw in rows) {
-    final row = raw as Map<String, dynamic>;
+  for (final row in rows) {
     final number = (row['sto_num'] as num?)?.toInt();
     if (number == null) continue;
     branches[number] = BranchOption(
