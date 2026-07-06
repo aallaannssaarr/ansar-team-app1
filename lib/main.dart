@@ -1209,9 +1209,18 @@ class _BranchesPageState extends State<BranchesPage> {
     );
     if (result == null) return;
     if (branch == null) {
-      await supabase.from('branches').insert(result);
+      await supabase.from('ansar_branches').upsert({
+        ...result,
+        'is_active': true,
+        'created_by': widget.session.id,
+      });
     } else {
-      await supabase.from('branches').update({'name': result['name']}).eq('sto_num', branch.number);
+      await supabase.from('ansar_branches').upsert({
+        'sto_num': branch.number,
+        'name': result['name'],
+        'is_active': true,
+        'created_by': widget.session.id,
+      });
     }
     setState(() => future = loadBranchesMap());
   }
@@ -1223,7 +1232,12 @@ class _BranchesPageState extends State<BranchesPage> {
       message: 'لا تحذف الفرع إذا كان مرتبطا بموظفين أو سجلات. الأفضل تعديله عند الحاجة.',
     );
     if (!confirmed) return;
-    await supabase.from('branches').delete().eq('sto_num', branch.number);
+    await supabase.from('ansar_branches').upsert({
+      'sto_num': branch.number,
+      'name': branch.name,
+      'is_active': false,
+      'created_by': widget.session.id,
+    });
     setState(() => future = loadBranchesMap());
   }
 
@@ -2060,15 +2074,36 @@ class ErrorState extends StatelessWidget {
 }
 
 Future<Map<int, BranchOption>> loadBranchesMap() async {
-  final rows = await supabase.from('branches').select('sto_num, name').order('sto_num');
   final branches = <int, BranchOption>{};
-  for (final row in rows) {
+  final legacyRows = await supabase.from('branches').select('sto_num, name').order('sto_num');
+  for (final row in legacyRows) {
     final number = (row['sto_num'] as num?)?.toInt();
     if (number == null) continue;
     branches[number] = BranchOption(
       number: number,
       name: (row['name'] ?? 'فرع $number') as String,
     );
+  }
+
+  try {
+    final appRows = await supabase
+        .from('ansar_branches')
+        .select('sto_num, name, is_active')
+        .order('sto_num');
+    for (final row in appRows) {
+      final number = (row['sto_num'] as num?)?.toInt();
+      if (number == null) continue;
+      if (row['is_active'] == false) {
+        branches.remove(number);
+      } else {
+        branches[number] = BranchOption(
+          number: number,
+          name: (row['name'] ?? 'فرع $number') as String,
+        );
+      }
+    }
+  } catch (_) {
+    // The app can still read legacy branches before ansar_branches is created.
   }
   return branches;
 }
