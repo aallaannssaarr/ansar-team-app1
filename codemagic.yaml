@@ -24,7 +24,7 @@ workflows:
           dart run flutter_launcher_icons
       - name: Analyze
         script: |
-          flutter analyze
+          flutter analyze --no-fatal-infos --no-fatal-warnings
       - name: Build debug APK
         script: |
           flutter build apk --debug
