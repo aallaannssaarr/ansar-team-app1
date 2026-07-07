@@ -25,6 +25,45 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
+      - name: Configure Firebase for Android
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          source = Path("google-services.json")
+          target = Path("android/app/google-services.json")
+          if not source.exists():
+              raise SystemExit("google-services.json is missing from the repository root")
+          target.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copyfile(source, target)
+
+          settings = Path("android/settings.gradle.kts")
+          settings_text = settings.read_text(encoding="utf-8")
+          google_services_plugin = '    id("com.google.gms.google-services") version "4.4.2" apply false\n'
+          if "com.google.gms.google-services" not in settings_text:
+              settings_text = settings_text.replace("plugins {\n", "plugins {\n" + google_services_plugin, 1)
+              settings.write_text(settings_text, encoding="utf-8")
+
+          app_gradle = Path("android/app/build.gradle.kts")
+          app_text = app_gradle.read_text(encoding="utf-8")
+          google_services_app_plugin = '    id("com.google.gms.google-services")\n'
+          if "com.google.gms.google-services" not in app_text:
+              app_text = app_text.replace(
+                  '    id("dev.flutter.flutter-gradle-plugin")\n',
+                  '    id("dev.flutter.flutter-gradle-plugin")\n' + google_services_app_plugin,
+                  1,
+              )
+              app_gradle.write_text(app_text, encoding="utf-8")
+
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          manifest_text = manifest.read_text(encoding="utf-8")
+          permission = '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
+          if "android.permission.POST_NOTIFICATIONS" not in manifest_text:
+              manifest_text = manifest_text.replace(">\n    <application", ">\n" + permission + "    <application", 1)
+              manifest.write_text(manifest_text, encoding="utf-8")
+          PY
+
       - name: Set Android app name and icon
         run: |
           python - <<'PY'

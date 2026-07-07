@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:fl_chart/fl_chart.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -10,6 +12,7 @@ import 'ansar_config.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
   await Supabase.initialize(
     url: AnsarConfig.supabaseUrl,
     publishableKey: AnsarConfig.supabaseServiceKey,
@@ -329,6 +332,7 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     session = widget.initialSession;
+    registerDeviceForNotifications(session);
   }
 
   void updateSession(EmployeeSession value) {
@@ -3790,6 +3794,43 @@ Future<void> enqueueNotification({
     });
   } catch (_) {
     // Notifications are helpful, but core workflow should not fail if queue policies are not ready.
+  }
+}
+
+Future<void> registerDeviceForNotifications(EmployeeSession session) async {
+  try {
+    final messaging = FirebaseMessaging.instance;
+    await messaging.requestPermission(alert: true, badge: true, sound: true);
+    final token = await messaging.getToken();
+    if (token == null || token.isEmpty) return;
+
+    await supabase.from('ansar_device_tokens').upsert(
+      {
+        'employee_id': session.id,
+        'platform': Platform.isAndroid ? 'android' : (Platform.isIOS ? 'ios' : 'web'),
+        'token': token,
+        'device_name': Platform.operatingSystem,
+        'is_active': true,
+        'last_seen_at': DateTime.now().toUtc().toIso8601String(),
+      },
+      onConflict: 'token',
+    );
+
+    FirebaseMessaging.instance.onTokenRefresh.listen((newToken) async {
+      await supabase.from('ansar_device_tokens').upsert(
+        {
+          'employee_id': session.id,
+          'platform': Platform.isAndroid ? 'android' : (Platform.isIOS ? 'ios' : 'web'),
+          'token': newToken,
+          'device_name': Platform.operatingSystem,
+          'is_active': true,
+          'last_seen_at': DateTime.now().toUtc().toIso8601String(),
+        },
+        onConflict: 'token',
+      );
+    });
+  } catch (_) {
+    // Push setup should never block login or daily work.
   }
 }
 
