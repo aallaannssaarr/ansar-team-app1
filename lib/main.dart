@@ -29,6 +29,8 @@ List<Map<String, dynamic>>? cachedProducts;
 Map<int, String>? cachedBarcodes;
 Future<List<Map<String, dynamic>>>? cachedProductsFuture;
 Future<Map<int, String>>? cachedBarcodesFuture;
+List<Map<String, dynamic>>? cachedAccounts;
+Future<List<Map<String, dynamic>>>? cachedAccountsFuture;
 String? lastNotificationTokenPreview;
 String? lastNotificationRegistrationError;
 DateTime? lastNotificationRegistrationAt;
@@ -1171,6 +1173,7 @@ class _QueriesPageState extends State<QueriesPage> {
     final todayKey = formatDateKey(today);
     startDate = TextEditingController(text: todayKey);
     endDate = TextEditingController(text: todayKey);
+    unawaited(warmQueriesCache());
   }
 
   @override
@@ -1188,25 +1191,34 @@ class _QueriesPageState extends State<QueriesPage> {
     final productRows = await searchProductsLikeLegacy(value, limit: 60);
 
     final branches = await loadLegacyBranchesMap();
+    final matNums = productRows
+        .take(40)
+        .map((product) => (product['mat_num'] as num?)?.toInt())
+        .whereType<int>()
+        .toList();
+    final stockRows = matNums.isEmpty
+        ? <Map<String, dynamic>>[]
+        : await supabase
+            .from('product_stock')
+            .select('mat_num, sto_num, quantity')
+            .inFilter('mat_num', matNums);
+    final stockByMat = <int, List<StockResult>>{};
+    for (final row in stockRows.cast<Map<String, dynamic>>()) {
+      final matNum = (row['mat_num'] as num?)?.toInt();
+      final branchNum = (row['sto_num'] as num?)?.toInt();
+      if (matNum == null || branchNum == null) continue;
+      stockByMat.putIfAbsent(matNum, () => <StockResult>[]).add(
+            StockResult(
+              branchName: branchLabel(branches, branchNum),
+              quantity: (row['quantity'] as num?)?.toDouble() ?? 0,
+            ),
+          );
+    }
     final results = <ProductResult>[];
     for (final product in productRows.take(40)) {
       final matNum = (product['mat_num'] as num?)?.toInt();
       if (matNum == null) continue;
-      final stockRows = await supabase
-          .from('product_stock')
-          .select('sto_num, quantity')
-          .eq('mat_num', matNum);
-      final stock = <StockResult>[];
-      for (final row in stockRows.cast<Map<String, dynamic>>()) {
-        final branchNum = (row['sto_num'] as num?)?.toInt();
-        if (branchNum == null) continue;
-        stock.add(
-          StockResult(
-            branchName: branchLabel(branches, branchNum),
-            quantity: (row['quantity'] as num?)?.toDouble() ?? 0,
-          ),
-        );
-      }
+      final stock = stockByMat[matNum] ?? <StockResult>[];
       stock.sort((a, b) => b.quantity.compareTo(a.quantity));
       results.add(ProductResult(product: product, stock: stock));
     }
@@ -1226,10 +1238,15 @@ class _QueriesPageState extends State<QueriesPage> {
     final value = search.text.trim();
     if (value.isEmpty) return [];
     final numeric = int.tryParse(value);
-    final rows = numeric == null
-        ? await supabase.from('accounts').select('num, name, ras, owner').ilike('name', '%$value%').limit(40)
-        : await supabase.from('accounts').select('num, name, ras, owner').eq('num', numeric).limit(40);
-    return rows.cast<Map<String, dynamic>>();
+    final accounts = await loadAccountsCached();
+    final normalized = normalizeSearch(value);
+    final results = accounts.where((account) {
+      final num = (account['num'] as num?)?.toInt();
+      final name = normalizeSearch(account['name'] as String? ?? '');
+      if (numeric != null) return num?.toString().contains(value) == true;
+      return name.contains(normalized);
+    }).take(40).toList();
+    return results;
   }
 
   Future<List<Map<String, dynamic>>> runCashSummary() async {
@@ -1254,7 +1271,16 @@ class _QueriesPageState extends State<QueriesPage> {
       query = books.length == 1 ? query.eq('book', books.first) : query.inFilter('book', books);
     }
     final rows = await query.order('date', ascending: false).order('bnum', ascending: false).limit(100);
-    return rows.cast<Map<String, dynamic>>();
+    final accounts = {
+      for (final account in await loadAccountsCached()) (account['num'] as num?)?.toInt(): account['name'] as String? ?? ''
+    };
+    return rows.cast<Map<String, dynamic>>().map((bill) {
+      final accNum = (bill['accnum'] as num?)?.toInt();
+      return {
+        ...bill,
+        'account_name': accNum == null ? 'زبون عابر' : accounts[accNum] ?? 'حساب $accNum',
+      };
+    }).toList();
   }
 
   Future<void> openAccountStatement(Map<String, dynamic> account) async {
@@ -1284,17 +1310,11 @@ class _QueriesPageState extends State<QueriesPage> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        SegmentedButton<int>(
-          segments: const [
-            ButtonSegment(value: 0, icon: Icon(Icons.menu_book_rounded), label: Text('الكتب والمخزون')),
-            ButtonSegment(value: 1, icon: Icon(Icons.account_balance_wallet_rounded), label: Text('الحسابات')),
-            ButtonSegment(value: 2, icon: Icon(Icons.payments_rounded), label: Text('الصناديق')),
-            ButtonSegment(value: 3, icon: Icon(Icons.receipt_long_rounded), label: Text('مبيعات اليوم')),
-          ],
-          selected: {queryMode},
-          onSelectionChanged: (value) {
+        _QueryModeTabs(
+          selected: queryMode,
+          onChanged: (value) {
             setState(() {
-              queryMode = value.first;
+              queryMode = value;
               future = null;
               search.clear();
             });
@@ -1480,8 +1500,8 @@ class _QueriesPageState extends State<QueriesPage> {
                         child: ListTile(
                           leading: const CircleAvatar(child: Icon(Icons.receipt_long_rounded)),
                           title: Text('فاتورة ${bill['bnum']} · ${salesBookName(bill['book'])}'),
-                          subtitle: Text('حساب ${bill['accnum']} · ${bill['date']}'),
-                          trailing: Text('${bill['totalvalue'] ?? 0}'),
+                          subtitle: Text('${bill['account_name']} · ${paymentLabelFromRemark(bill['remark']).text} · ${bill['date']}'),
+                          trailing: Text(formatMoneyValue(bill['totalvalue'])),
                           onTap: () => openSalesDetails(bill),
                         ),
                       ),
@@ -1491,6 +1511,46 @@ class _QueriesPageState extends State<QueriesPage> {
             },
           ),
       ],
+    );
+  }
+}
+
+class _QueryModeTabs extends StatelessWidget {
+  const _QueryModeTabs({required this.selected, required this.onChanged});
+
+  final int selected;
+  final ValueChanged<int> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    const items = [
+      (value: 0, icon: Icons.menu_book_rounded, label: 'الكتب والمخزون'),
+      (value: 1, icon: Icons.account_balance_wallet_rounded, label: 'الحسابات'),
+      (value: 2, icon: Icons.payments_rounded, label: 'الصناديق'),
+      (value: 3, icon: Icons.receipt_long_rounded, label: 'المبيعات اليومية'),
+    ];
+    return SizedBox(
+      height: 48,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: items.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        itemBuilder: (context, index) {
+          final item = items[index];
+          final active = selected == item.value;
+          return ChoiceChip(
+            selected: active,
+            selectedColor: brandColor,
+            avatar: Icon(item.icon, size: 18, color: active ? Colors.white : brandColor),
+            label: Text(item.label, maxLines: 1, overflow: TextOverflow.visible),
+            labelStyle: TextStyle(
+              color: active ? Colors.white : inkColor,
+              fontWeight: active ? FontWeight.w700 : FontWeight.w500,
+            ),
+            onSelected: (_) => onChanged(item.value),
+          );
+        },
+      ),
     );
   }
 }
@@ -1535,7 +1595,16 @@ class _AccountStatementPageState extends State<AccountStatementPage> {
         .order('date', ascending: true)
         .order('num', ascending: true)
         .order('item', ascending: true);
-    return rows.cast<Map<String, dynamic>>();
+    final accounts = {
+      for (final account in await loadAccountsCached()) (account['num'] as num?)?.toInt(): account['name'] as String? ?? ''
+    };
+    return rows.cast<Map<String, dynamic>>().map((entry) {
+      final otherNum = (entry['acc_num2'] as num?)?.toInt();
+      return {
+        ...entry,
+        'other_account_name': otherNum == null ? '-' : accounts[otherNum] ?? 'حساب $otherNum',
+      };
+    }).toList();
   }
 
   @override
@@ -1576,7 +1645,7 @@ class _AccountStatementPageState extends State<AccountStatementPage> {
                   return Card(
                     child: ListTile(
                       title: Text(entry['remark'] as String? ?? 'حركة'),
-                      subtitle: Text('${entry['date']} · سند ${entry['num'] ?? '-'} · مقابل ${entry['acc_num2'] ?? '-'}'),
+                      subtitle: Text('${entry['date']} · سند ${entry['num'] ?? '-'} · مقابل ${entry['other_account_name'] ?? '-'}'),
                       trailing: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
                         crossAxisAlignment: CrossAxisAlignment.end,
@@ -1607,7 +1676,7 @@ class SalesBillDetailsPage extends StatefulWidget {
 }
 
 class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
-  late Future<List<Map<String, dynamic>>> future;
+  late Future<SalesBillDetailsData> future;
 
   @override
   void initState() {
@@ -1615,7 +1684,7 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
     future = loadItems();
   }
 
-  Future<List<Map<String, dynamic>>> loadItems() async {
+  Future<SalesBillDetailsData> loadItems() async {
     final rows = await supabase
         .from('bill_items_full')
         .select('item, matnum, quantity, price, value, remarki')
@@ -1625,54 +1694,139 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
         .order('item', ascending: true);
     final items = rows.cast<Map<String, dynamic>>();
     final matNums = items.map((row) => (row['matnum'] as num?)?.toInt()).whereType<int>().toSet().toList();
-    if (matNums.isEmpty) return items;
-    final products = await supabase.from('products').select('mat_num, name').inFilter('mat_num', matNums);
+    final products = matNums.isEmpty
+        ? <Map<String, dynamic>>[]
+        : await supabase.from('products').select('mat_num, name').inFilter('mat_num', matNums);
     final names = {
       for (final product in products.cast<Map<String, dynamic>>())
         (product['mat_num'] as num).toInt(): product['name'] as String? ?? ''
     };
-    return items.map((item) => {...item, 'product_name': names[(item['matnum'] as num?)?.toInt()]}).toList();
+    final branches = await loadLegacyBranchesMap();
+    return SalesBillDetailsData(
+      branches: branches,
+      items: items.map((item) => {...item, 'product_name': names[(item['matnum'] as num?)?.toInt()]}).toList(),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: Text('فاتورة ${widget.bill['bnum']}')),
-      body: FutureBuilder<List<Map<String, dynamic>>>(
+      body: FutureBuilder<SalesBillDetailsData>(
         future: future,
         builder: (context, snapshot) {
           if (snapshot.connectionState != ConnectionState.done) {
             return const Center(child: CircularProgressIndicator());
           }
           if (snapshot.hasError) return ErrorState(message: cleanError(snapshot.error), onRetry: () => setState(() => future = loadItems()));
-          final items = snapshot.data!;
+          final data = snapshot.data!;
+          final items = data.items;
+          final payment = paymentLabelFromRemark(widget.bill['remark']);
+          final stoNum = parseStoNum(widget.bill['remark']);
+          final total = (widget.bill['totalvalue'] as num?)?.toDouble() ?? 0;
+          final gross = items.fold<double>(
+            0,
+            (sum, item) =>
+                sum + (((item['quantity'] as num?)?.toDouble() ?? 0) * ((item['price'] as num?)?.toDouble() ?? 0)),
+          );
+          final discount = gross > total && gross > 0 ? gross - total : 0.0;
           return ListView(
             padding: const EdgeInsets.all(16),
             children: [
               Card(
-                child: ListTile(
-                  title: Text('${salesBookName(widget.bill['book'])} · ${widget.bill['date']}'),
-                  subtitle: Text('حساب ${widget.bill['accnum']}'),
-                  trailing: Text('${widget.bill['totalvalue'] ?? 0}'),
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          CircleAvatar(
+                            backgroundColor: brandColor.withOpacity(0.1),
+                            child: const Icon(Icons.receipt_long_rounded, color: brandColor),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text('فاتورة ${widget.bill['bnum']}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 17)),
+                                Text('${widget.bill['account_name'] ?? 'حساب ${widget.bill['accnum']}'}'),
+                              ],
+                            ),
+                          ),
+                          Chip(
+                            avatar: Icon(payment.isCash ? Icons.payments_rounded : Icons.schedule_rounded, size: 16),
+                            label: Text(payment.text),
+                          ),
+                        ],
+                      ),
+                      const Divider(height: 22),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          InfoChip(icon: Icons.storefront_rounded, label: salesBookName(widget.bill['book'])),
+                          InfoChip(icon: Icons.warehouse_rounded, label: stoNum == null ? 'مستودع غير محدد' : branchLabel(data.branches, stoNum)),
+                          InfoChip(icon: Icons.calendar_month_rounded, label: '${widget.bill['date']}'),
+                          InfoChip(icon: Icons.summarize_rounded, label: 'الإجمالي ${formatMoneyValue(total)}'),
+                          if (discount > 0) InfoChip(icon: Icons.percent_rounded, label: 'حسم ${formatMoneyValue(discount)}'),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
               const SizedBox(height: 12),
               if (items.isEmpty)
                 const EmptyState(icon: Icons.inventory_2_outlined, text: 'لا توجد بنود')
               else
-                ...items.map((item) => Card(
-                      child: ListTile(
-                        title: Text(item['product_name'] as String? ?? 'مادة ${item['matnum']}'),
-                        subtitle: Text('كمية ${item['quantity']} × سعر ${item['price']}'),
-                        trailing: Text('${item['value'] ?? 0}'),
+                ...items.map((item) {
+                  final itemSto = parseStoNum(item['remarki']);
+                  final itemDiscount = discountDisplay(item);
+                  return Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Text(
+                              item['product_name'] as String? ?? 'مادة ${item['matnum']}',
+                              style: const TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                            const SizedBox(height: 8),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                InfoChip(icon: Icons.numbers_rounded, label: 'كمية ${formatMoneyValue(item['quantity'])}'),
+                                InfoChip(icon: Icons.sell_rounded, label: 'سعر ${formatMoneyValue(item['price'])}'),
+                                InfoChip(icon: Icons.percent_rounded, label: 'حسم $itemDiscount'),
+                                InfoChip(icon: Icons.calculate_rounded, label: 'قيمة ${formatMoneyValue(item['value'])}'),
+                                InfoChip(
+                                  icon: Icons.warehouse_rounded,
+                                  label: itemSto == null ? 'مستودع غير محدد' : branchLabel(data.branches, itemSto),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
                       ),
-                    )),
+                    );
+                }),
             ],
           );
         },
       ),
     );
   }
+}
+
+class SalesBillDetailsData {
+  SalesBillDetailsData({required this.items, required this.branches});
+
+  final List<Map<String, dynamic>> items;
+  final Map<int, BranchOption> branches;
 }
 
 class StockResult {
@@ -1719,18 +1873,18 @@ class ProductResultCard extends StatelessWidget {
       child: ExpansionTile(
         leading: const CircleAvatar(child: Icon(Icons.menu_book_rounded)),
         title: Text(product['name'] as String? ?? 'بدون اسم'),
-        subtitle: Text('رقم المادة $matNum · الكمية ${product['quantity'] ?? '-'}'),
+        subtitle: Text('رقم المادة $matNum · إجمالي الكمية ${formatMoneyValue(product['quantity'])}'),
         childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
         children: [
           Wrap(
             spacing: 8,
             runSpacing: 8,
             children: [
-              PriceChip(label: 'جرد', value: product['jard_price']),
-              PriceChip(label: 'نظامي', value: product['regular_price']),
-              PriceChip(label: 'سعر 1', value: product['price1']),
-              PriceChip(label: 'سعر 2', value: product['price2']),
-              PriceChip(label: 'سعر 3', value: product['price3']),
+              PriceChip(label: 'سعر الجرد', value: product['jard_price']),
+              PriceChip(label: 'السعر القائم', value: product['regular_price']),
+              PriceChip(label: 'سعر المكتبات', value: product['price1']),
+              PriceChip(label: 'سعر المعاهد', value: product['price2']),
+              PriceChip(label: 'سعر المفرق', value: product['price3']),
             ],
           ),
           const SizedBox(height: 10),
@@ -1744,8 +1898,12 @@ class ProductResultCard extends StatelessWidget {
                   (stock) => ListTile(
                     dense: true,
                     contentPadding: EdgeInsets.zero,
+                    leading: Icon(
+                      stock.quantity > 0 ? Icons.storefront_rounded : Icons.storefront_outlined,
+                      color: stock.quantity > 0 ? brandColor : Colors.black38,
+                    ),
                     title: Text(stock.branchName),
-                    trailing: Text(stock.quantity.toStringAsFixed(0)),
+                    trailing: Text(formatMoneyValue(stock.quantity)),
                   ),
                 ),
         ],
@@ -1762,7 +1920,23 @@ class PriceChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Chip(label: Text('$label: ${value ?? '-'}'));
+    return Chip(label: Text('$label: ${formatMoneyValue(value)}'));
+  }
+}
+
+class InfoChip extends StatelessWidget {
+  const InfoChip({super.key, required this.icon, required this.label});
+
+  final IconData icon;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Chip(
+      avatar: Icon(icon, size: 16),
+      label: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    );
   }
 }
 
@@ -4472,6 +4646,31 @@ Future<void> warmProductSearchCache() async {
   await Future.wait([loadAllProductsCached(), loadAllBarcodesCached()]);
 }
 
+Future<List<Map<String, dynamic>>> loadAccountsCached() async {
+  if (cachedAccounts != null) return cachedAccounts!;
+  final running = cachedAccountsFuture;
+  if (running != null) return running;
+  cachedAccountsFuture = supabase
+      .from('accounts')
+      .select('num, name, ras, owner')
+      .order('num', ascending: true)
+      .then((rows) => rows.cast<Map<String, dynamic>>());
+  try {
+    cachedAccounts = await cachedAccountsFuture;
+    return cachedAccounts!;
+  } finally {
+    cachedAccountsFuture = null;
+  }
+}
+
+Future<void> warmQueriesCache() async {
+  await Future.wait([
+    warmProductSearchCache(),
+    loadAccountsCached(),
+    loadLegacyBranchesMap(),
+  ]);
+}
+
 Future<List<Map<String, dynamic>>> searchProductsLikeLegacy(
   String query, {
   required int limit,
@@ -4929,6 +5128,56 @@ String formatTime(DateTime value) {
 
 String formatDateTime(DateTime value) {
   return '${shortDate(value)} ${formatTime(value)}';
+}
+
+String formatMoneyValue(Object? value) {
+  if (value == null) return '-';
+  final number = (value as num?)?.toDouble() ?? double.tryParse('$value');
+  if (number == null) return '$value';
+  if ((number - number.roundToDouble()).abs() < 0.001) return number.toStringAsFixed(0);
+  return number.toStringAsFixed(2);
+}
+
+int? parseStoNum(Object? value) {
+  final match = RegExp(r'__sto:(\d+)').firstMatch(value?.toString() ?? '');
+  return match == null ? null : int.tryParse(match.group(1)!);
+}
+
+int? parsePayKind(Object? value) {
+  final match = RegExp(r'__pay:(\d+)').firstMatch(value?.toString() ?? '');
+  return match == null ? null : int.tryParse(match.group(1)!);
+}
+
+double parseDiscountItem(Object? value) {
+  final match = RegExp(r'__dis:([\d.]+)').firstMatch(value?.toString() ?? '');
+  return match == null ? 0 : double.tryParse(match.group(1)!) ?? 0;
+}
+
+PaymentInfo paymentLabelFromRemark(Object? remark) {
+  final payKind = parsePayKind(remark);
+  if (payKind == 1) return const PaymentInfo('نقدا', true);
+  if (payKind == 0) return const PaymentInfo('آجل', false);
+  return const PaymentInfo('غير محدد', false);
+}
+
+String discountDisplay(Map<String, dynamic> item) {
+  final explicit = parseDiscountItem(item['remarki']);
+  if (explicit > 0) return '${formatMoneyValue(explicit)}%';
+  final quantity = (item['quantity'] as num?)?.toDouble() ?? 0;
+  final price = (item['price'] as num?)?.toDouble() ?? 0;
+  final value = (item['value'] as num?)?.toDouble() ?? 0;
+  final gross = quantity * price;
+  if (gross > 0 && value < gross - 0.001) {
+    return '${formatMoneyValue((1 - value / gross) * 100)}%';
+  }
+  return '-';
+}
+
+class PaymentInfo {
+  const PaymentInfo(this.text, this.isCash);
+
+  final String text;
+  final bool isCash;
 }
 
 String formatEventTime(Object? value) {
