@@ -333,6 +333,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   int index = 0;
   StreamSubscription<RemoteMessage>? foregroundMessages;
   Timer? notificationRegistrationTimer;
+  Timer? inAppNotificationsTimer;
+  final seenInAppNotificationIds = <String>{};
+  DateTime inAppNotificationCursor = DateTime.now().toUtc();
 
   @override
   void initState() {
@@ -340,6 +343,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     session = widget.initialSession;
     startNotificationRegistrationMonitor();
+    startInAppNotificationMonitor();
     foregroundMessages = FirebaseMessaging.onMessage.listen((message) {
       if (!mounted) return;
       final title = message.notification?.title ?? 'إشعار جديد';
@@ -353,6 +357,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void updateSession(EmployeeSession value) {
     setState(() => session = value);
     startNotificationRegistrationMonitor();
+    startInAppNotificationMonitor();
   }
 
   void startNotificationRegistrationMonitor() {
@@ -363,11 +368,51 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
   }
 
+  void startInAppNotificationMonitor() {
+    inAppNotificationsTimer?.cancel();
+    inAppNotificationCursor = DateTime.now().toUtc().subtract(const Duration(seconds: 8));
+    seenInAppNotificationIds.clear();
+    unawaited(checkInAppNotifications());
+    inAppNotificationsTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      checkInAppNotifications();
+    });
+  }
+
+  Future<void> checkInAppNotifications() async {
+    try {
+      final rows = await supabase
+          .from('ansar_notification_queue')
+          .select('id, employee_id, branch_num, title, body, data, created_at')
+          .gt('created_at', inAppNotificationCursor.toIso8601String())
+          .order('created_at', ascending: true)
+          .limit(20);
+      for (final row in rows.cast<Map<String, dynamic>>()) {
+        final createdAt = DateTime.tryParse(row['created_at'] as String? ?? '')?.toUtc();
+        if (createdAt != null && createdAt.isAfter(inAppNotificationCursor)) {
+          inAppNotificationCursor = createdAt;
+        }
+        if (!isNotificationForSession(row, session)) continue;
+        final id = row['id'] as String? ?? '';
+        if (id.isEmpty || seenInAppNotificationIds.contains(id)) continue;
+        seenInAppNotificationIds.add(id);
+        if (!mounted) return;
+        final title = row['title'] as String? ?? 'إشعار جديد';
+        final body = row['body'] as String? ?? '';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(body.isEmpty ? title : '$title\n$body')),
+        );
+      }
+    } catch (_) {
+      // In-app alerts are a fallback path; they should not interrupt normal use.
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     foregroundMessages?.cancel();
     notificationRegistrationTimer?.cancel();
+    inAppNotificationsTimer?.cancel();
     super.dispose();
   }
 
@@ -375,6 +420,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       startNotificationRegistrationMonitor();
+      startInAppNotificationMonitor();
     }
   }
 
@@ -4134,6 +4180,21 @@ Future<void> kickNotificationSender() async {
   } catch (_) {
     // The scheduled sender will retry pending notifications if the immediate kick fails.
   }
+}
+
+bool isNotificationForSession(Map<String, dynamic> row, EmployeeSession session) {
+  final data = row['data'];
+  if (data is Map && data['sender_id'] == session.id) return false;
+
+  final employeeId = row['employee_id'] as String?;
+  if (employeeId != null && employeeId.isNotEmpty) return employeeId == session.id;
+
+  final branchNum = (row['branch_num'] as num?)?.toInt();
+  if (branchNum != null) {
+    return session.isAdmin || session.canManageAllBranches || branchNum == session.branchNum;
+  }
+
+  return true;
 }
 
 Future<void> enqueueChatNotification({
