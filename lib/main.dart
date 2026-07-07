@@ -1,11 +1,15 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:fl_chart/fl_chart.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:printing/printing.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'ansar_config.dart';
@@ -23,6 +27,8 @@ Future<void> main() async {
 final supabase = Supabase.instance.client;
 List<Map<String, dynamic>>? cachedProducts;
 Map<int, String>? cachedBarcodes;
+Future<List<Map<String, dynamic>>>? cachedProductsFuture;
+Future<Map<int, String>>? cachedBarcodesFuture;
 String? lastNotificationTokenPreview;
 String? lastNotificationRegistrationError;
 DateTime? lastNotificationRegistrationAt;
@@ -2612,13 +2618,16 @@ class TransfersPage extends StatefulWidget {
 
 class _TransfersPageState extends State<TransfersPage> {
   late Future<TransferData> future;
-  bool showHistory = false;
+  String statusFilter = 'active';
+  int? fromBranchFilter;
+  int? toBranchFilter;
   bool transferBusy = false;
 
   @override
   void initState() {
     super.initState();
     future = loadTransfers();
+    unawaited(warmProductSearchCache());
   }
 
   Future<TransferData> loadTransfers() async {
@@ -2638,12 +2647,22 @@ class _TransfersPageState extends State<TransfersPage> {
         return fromBranch == widget.session.branchNum || toBranch == widget.session.branchNum;
       }
       return row['requested_by'] == widget.session.id || toBranch == widget.session.branchNum;
-    }).where((row) {
-      final status = row['status'] as String? ?? 'submitted';
-      final completed = {'completed', 'cancelled', 'rejected'}.contains(status);
-      return showHistory ? completed : !completed;
     }).toList();
     return TransferData(branches: branches, employees: employeeById, orders: visible);
+  }
+
+  List<Map<String, dynamic>> filteredOrders(List<Map<String, dynamic>> orders) {
+    return orders.where((order) {
+      final status = order['status'] as String? ?? 'submitted';
+      final fromBranch = (order['from_branch_num'] as num?)?.toInt();
+      final toBranch = (order['to_branch_num'] as num?)?.toInt();
+      final active = !{'completed', 'cancelled', 'rejected'}.contains(status);
+      final statusMatches = statusFilter == 'all' ||
+          (statusFilter == 'active' ? active : status == statusFilter);
+      final fromMatches = fromBranchFilter == null || fromBranch == fromBranchFilter;
+      final toMatches = toBranchFilter == null || toBranch == toBranchFilter;
+      return statusMatches && fromMatches && toMatches;
+    }).toList();
   }
 
   Future<void> createOrder(TransferData data) async {
@@ -2774,46 +2793,48 @@ class _TransfersPageState extends State<TransfersPage> {
           );
         }
         final data = snapshot.data!;
+        final visibleOrders = filteredOrders(data.orders);
         return Scaffold(
           body: Column(
             children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-                child: SegmentedButton<bool>(
-                  segments: const [
-                    ButtonSegment(value: false, icon: Icon(Icons.pending_actions_rounded), label: Text('نشطة')),
-                    ButtonSegment(value: true, icon: Icon(Icons.history_rounded), label: Text('السجل')),
-                  ],
-                  selected: {showHistory},
-                  onSelectionChanged: (value) => setState(() {
-                    showHistory = value.first;
-                    future = loadTransfers();
-                  }),
-                ),
+              _TransferFilters(
+                branches: data.branches,
+                orders: data.orders,
+                statusFilter: statusFilter,
+                fromBranchFilter: fromBranchFilter,
+                toBranchFilter: toBranchFilter,
+                onStatusChanged: (value) => setState(() => statusFilter = value),
+                onFromChanged: (value) => setState(() => fromBranchFilter = value),
+                onToChanged: (value) => setState(() => toBranchFilter = value),
+                onRefresh: () => setState(() => future = loadTransfers()),
               ),
               Expanded(
-                child: data.orders.isEmpty
+                child: visibleOrders.isEmpty
                     ? EmptyState(
                         icon: Icons.sync_alt_rounded,
-                        text: showHistory ? 'لا توجد مناقلات مكتملة في السجل' : 'لا توجد مناقلات نشطة',
+                        text: 'لا توجد مناقلات ضمن هذا العرض',
                       )
                     : ListView.separated(
                         padding: const EdgeInsets.all(16),
-                        itemCount: data.orders.length,
+                        itemCount: visibleOrders.length,
                   separatorBuilder: (_, __) => const Divider(height: 1),
                   itemBuilder: (context, i) {
-                    final order = data.orders[i];
+                    final order = visibleOrders[i];
                     final fromBranch = (order['from_branch_num'] as num?)?.toInt() ?? 0;
                     final toBranch = (order['to_branch_num'] as num?)?.toInt() ?? 0;
                     final requester = data.employees[order['requested_by']];
                     final canHandle = widget.session.isAdmin || toBranch == widget.session.branchNum;
+                    final status = order['status'] as String? ?? 'submitted';
                     return Card(
                       child: ListTile(
-                        leading: const CircleAvatar(child: Icon(Icons.inventory_2_rounded)),
+                        leading: CircleAvatar(
+                          backgroundColor: transferStatusColor(status).withOpacity(0.12),
+                          child: Icon(transferStatusIcon(status), color: transferStatusColor(status)),
+                        ),
                         title: Text('طلب رقم ${order['order_no'] ?? '-'}'),
                         subtitle: Text(
                           '${branchLabel(data.branches, fromBranch)} ← ${branchLabel(data.branches, toBranch)}\n'
-                          '${requester?.name ?? 'موظف'} · ${statusLabel(order['status'] as String? ?? '')}',
+                          '${requester?.name ?? 'موظف'} · ${statusLabel(status)}',
                         ),
                         isThreeLine: true,
                         onTap: () => openOrderDetails(order, data),
@@ -2846,6 +2867,117 @@ class _TransfersPageState extends State<TransfersPage> {
   }
 }
 
+class _TransferFilters extends StatelessWidget {
+  const _TransferFilters({
+    required this.branches,
+    required this.orders,
+    required this.statusFilter,
+    required this.fromBranchFilter,
+    required this.toBranchFilter,
+    required this.onStatusChanged,
+    required this.onFromChanged,
+    required this.onToChanged,
+    required this.onRefresh,
+  });
+
+  final Map<int, BranchOption> branches;
+  final List<Map<String, dynamic>> orders;
+  final String statusFilter;
+  final int? fromBranchFilter;
+  final int? toBranchFilter;
+  final ValueChanged<String> onStatusChanged;
+  final ValueChanged<int?> onFromChanged;
+  final ValueChanged<int?> onToChanged;
+  final VoidCallback onRefresh;
+
+  int statusCount(String filter) {
+    return orders.where((order) {
+      final status = order['status'] as String? ?? 'submitted';
+      final active = !{'completed', 'cancelled', 'rejected'}.contains(status);
+      if (filter == 'all') return true;
+      if (filter == 'active') return active;
+      return status == filter;
+    }).length;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final branchItems = [
+      const DropdownMenuItem<int?>(value: null, child: Text('كل الفروع')),
+      ...branches.values.map((branch) => DropdownMenuItem<int?>(
+            value: branch.number,
+            child: Text(branch.name),
+          )),
+    ];
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SizedBox(
+            height: 48,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: transferStatusTabs.length,
+              separatorBuilder: (_, __) => const SizedBox(width: 8),
+              itemBuilder: (context, index) {
+                final value = transferStatusTabs[index];
+                final selected = value == statusFilter;
+                final color = value == 'all' || value == 'active' ? brandColor : transferStatusColor(value);
+                return ChoiceChip(
+                  selected: selected,
+                  avatar: Icon(
+                    value == 'all' ? Icons.all_inbox_rounded : transferStatusIcon(value),
+                    size: 18,
+                    color: selected ? Colors.white : color,
+                  ),
+                  label: Text('${transferTabLabel(value)} ${statusCount(value)}'),
+                  selectedColor: color,
+                  labelStyle: TextStyle(color: selected ? Colors.white : inkColor),
+                  onSelected: (_) => onStatusChanged(value),
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: DropdownButtonFormField<int?>(
+                  initialValue: fromBranchFilter,
+                  decoration: const InputDecoration(
+                    labelText: 'من فرع',
+                    prefixIcon: Icon(Icons.call_made_rounded),
+                  ),
+                  items: branchItems,
+                  onChanged: onFromChanged,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: DropdownButtonFormField<int?>(
+                  initialValue: toBranchFilter,
+                  decoration: const InputDecoration(
+                    labelText: 'إلى فرع',
+                    prefixIcon: Icon(Icons.call_received_rounded),
+                  ),
+                  items: branchItems,
+                  onChanged: onToChanged,
+                ),
+              ),
+              IconButton(
+                tooltip: 'تحديث',
+                onPressed: onRefresh,
+                icon: const Icon(Icons.refresh_rounded),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class TransferDetailsPage extends StatefulWidget {
   const TransferDetailsPage({
     super.key,
@@ -2863,7 +2995,8 @@ class TransferDetailsPage extends StatefulWidget {
 }
 
 class _TransferDetailsPageState extends State<TransferDetailsPage> {
-  late Future<List<Map<String, dynamic>>> future;
+  late Future<TransferDetailsData> future;
+  bool sharingPdf = false;
 
   bool get canHandle {
     final toBranch = (widget.order['to_branch_num'] as num?)?.toInt();
@@ -2876,7 +3009,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     future = loadItems();
   }
 
-  Future<List<Map<String, dynamic>>> loadItems() async {
+  Future<TransferDetailsData> loadItems() async {
     final items = await supabase
         .from('ansar_transfer_order_items')
         .select()
@@ -2887,21 +3020,36 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
         .map((row) => (row['mat_num'] as num?)?.toInt())
         .whereType<int>()
         .toList();
-    if (matNums.isEmpty) return result;
-    final products = await supabase
-        .from('products')
-        .select('mat_num, name, quantity')
-        .inFilter('mat_num', matNums);
+    final products = matNums.isEmpty
+        ? <Map<String, dynamic>>[]
+        : await supabase
+            .from('products')
+            .select('mat_num, name, quantity')
+            .inFilter('mat_num', matNums);
     final productByMat = {
       for (final row in products.cast<Map<String, dynamic>>())
         (row['mat_num'] as num).toInt(): row,
     };
-    return result
+    final enrichedItems = result
         .map((row) => {
               ...row,
               'product': productByMat[(row['mat_num'] as num?)?.toInt()],
             })
         .toList();
+    final eventsRows = await supabase
+        .from('ansar_order_events')
+        .select()
+        .eq('order_id', widget.order['id'])
+        .order('created_at', ascending: false);
+    final events = eventsRows.cast<Map<String, dynamic>>();
+    final employeesRows = await supabase
+        .from('ansar_employees')
+        .select('id, display_name, full_name, username, branch_num, role, is_active');
+    final employees = {
+      for (final row in employeesRows.cast<Map<String, dynamic>>())
+        row['id'] as String: EmployeeLite.fromRow(row),
+    };
+    return TransferDetailsData(items: enrichedItems, events: events, employees: employees);
   }
 
   Future<void> updateItem(Map<String, dynamic> item, String status) async {
@@ -2935,6 +3083,14 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       'item_status': status,
       'approved_quantity': approved,
     }).eq('id', item['id']);
+    await supabase.from('ansar_order_events').insert({
+      'order_id': widget.order['id'],
+      'employee_id': widget.session.id,
+      'event_type': 'item_changed',
+      'old_status': item['item_status'],
+      'new_status': status,
+      'note': 'بند ${(item['product'] as Map<String, dynamic>?)?['name'] ?? item['mat_num']} - الكمية المتوفرة $approved',
+    });
     unawaited(enqueueNotification(
       title: 'تحديث بند مناقلة',
       body: 'تم تحديث بند في طلب المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${itemStatusLabel(status)}',
@@ -2956,12 +3112,119 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       if (status == 'approved') 'approved_at': DateTime.now().toUtc().toIso8601String(),
       if (status == 'completed') 'completed_at': DateTime.now().toUtc().toIso8601String(),
     }).eq('id', widget.order['id']);
+    await supabase.from('ansar_order_events').insert({
+      'order_id': widget.order['id'],
+      'employee_id': widget.session.id,
+      'event_type': 'status_changed',
+      'old_status': widget.order['status'],
+      'new_status': status,
+    });
     unawaited(enqueueNotification(
       title: 'تحديث مناقلة',
       body: 'تم تحديث حالة المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
       data: {'type': 'transfer_updated', 'order_id': widget.order['id'], 'status': status},
     ));
     if (mounted) Navigator.pop(context);
+  }
+
+  Future<void> sharePdf(TransferDetailsData data) async {
+    setState(() => sharingPdf = true);
+    try {
+      final bytes = await buildTransferPdf(data);
+      await Printing.sharePdf(
+        bytes: bytes,
+        filename: 'transfer-${widget.order['order_no'] ?? widget.order['id']}.pdf',
+      );
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => sharingPdf = false);
+    }
+  }
+
+  Future<Uint8List> buildTransferPdf(TransferDetailsData data) async {
+    final fromBranch = (widget.order['from_branch_num'] as num?)?.toInt() ?? 0;
+    final toBranch = (widget.order['to_branch_num'] as num?)?.toInt() ?? 0;
+    final font = await PdfGoogleFonts.cairoRegular();
+    final bold = await PdfGoogleFonts.cairoBold();
+    final theme = pw.ThemeData.withFont(base: font, bold: bold);
+    final document = pw.Document(theme: theme);
+    final headers = ['الكتاب', 'المطلوب', 'المتوفر', 'الحالة', 'ملاحظة'];
+    final rows = data.items.map((item) {
+      final product = item['product'] as Map<String, dynamic>?;
+      final requested = item['requested_quantity']?.toString() ?? '-';
+      final approved = item['approved_quantity']?.toString() ?? '-';
+      final status = itemStatusLabel(item['item_status'] as String? ?? 'requested');
+      return [
+        product?['name'] as String? ?? 'مادة ${item['mat_num']}',
+        requested,
+        approved,
+        status,
+        item['note']?.toString() ?? '',
+      ];
+    }).toList();
+    document.addPage(
+      pw.MultiPage(
+        textDirection: pw.TextDirection.rtl,
+        pageTheme: const pw.PageTheme(
+          margin: pw.EdgeInsets.all(28),
+        ),
+        build: (context) => [
+          pw.Row(
+            mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+            children: [
+              pw.Text('فريق الأنصار', style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
+              pw.Text('تقرير مناقلة', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+            ],
+          ),
+          pw.SizedBox(height: 16),
+          pw.Container(
+            padding: const pw.EdgeInsets.all(12),
+            decoration: pw.BoxDecoration(
+              border: pw.Border.all(color: PdfColors.grey400),
+              borderRadius: pw.BorderRadius.circular(8),
+            ),
+            child: pw.Column(
+              crossAxisAlignment: pw.CrossAxisAlignment.start,
+              children: [
+                pw.Text('رقم الطلب: ${widget.order['order_no'] ?? '-'}'),
+                pw.Text('من: ${branchLabel(widget.branches, fromBranch)}'),
+                pw.Text('إلى: ${branchLabel(widget.branches, toBranch)}'),
+                pw.Text('الحالة: ${statusLabel(widget.order['status'] as String? ?? 'submitted')}'),
+                pw.Text('تاريخ التقرير: ${formatDateTime(DateTime.now())}'),
+              ],
+            ),
+          ),
+          pw.SizedBox(height: 18),
+          pw.Text('بنود المناقلة', style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
+          pw.SizedBox(height: 8),
+          pw.TableHelper.fromTextArray(
+            headers: headers,
+            data: rows,
+            headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
+            headerDecoration: pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
+            cellAlignment: pw.Alignment.centerRight,
+            headerAlignment: pw.Alignment.centerRight,
+            border: pw.TableBorder.all(color: PdfColors.grey300),
+          ),
+          if (data.events.isNotEmpty) ...[
+            pw.SizedBox(height: 18),
+            pw.Text('سجل المعالجة', style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
+            pw.SizedBox(height: 8),
+            ...data.events.take(8).map((event) {
+              final employee = data.employees[event['employee_id']];
+              return pw.Padding(
+                padding: const pw.EdgeInsets.only(bottom: 5),
+                child: pw.Text(
+                  '${eventLabel(event)} - ${employee?.name ?? 'موظف'} - ${formatEventTime(event['created_at'])}',
+                ),
+              );
+            }),
+          ],
+        ],
+      ),
+    );
+    return document.save();
   }
 
   @override
@@ -2980,7 +3243,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
             ),
         ],
       ),
-      body: FutureBuilder<List<Map<String, dynamic>>>(
+      body: FutureBuilder<TransferDetailsData>(
         future: future,
         builder: (context, snapshot) {
           if (snapshot.connectionState != ConnectionState.done) {
@@ -2989,7 +3252,8 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
           if (snapshot.hasError) {
             return ErrorState(message: cleanError(snapshot.error), onRetry: () => setState(() => future = loadItems()));
           }
-          final items = snapshot.data!;
+          final details = snapshot.data!;
+          final items = details.items;
           return ListView(
             padding: const EdgeInsets.all(16),
             children: [
@@ -2997,6 +3261,13 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                 child: ListTile(
                   title: Text('${branchLabel(widget.branches, fromBranch)} ← ${branchLabel(widget.branches, toBranch)}'),
                   subtitle: Text(statusLabel(widget.order['status'] as String? ?? 'submitted')),
+                  trailing: OutlinedButton.icon(
+                    onPressed: sharingPdf ? null : () => sharePdf(details),
+                    icon: sharingPdf
+                        ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.picture_as_pdf_rounded),
+                    label: const Text('PDF'),
+                  ),
                 ),
               ),
               const SizedBox(height: 12),
@@ -3018,7 +3289,18 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                             style: const TextStyle(fontWeight: FontWeight.bold),
                           ),
                           const SizedBox(height: 4),
-                          Text('المطلوب: ${item['requested_quantity']} · الحالة: ${itemStatusLabel(status)}'),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 6,
+                            children: [
+                              Chip(label: Text('المطلوب ${item['requested_quantity']}')),
+                              Chip(label: Text('المتوفر ${item['approved_quantity'] ?? '-'}')),
+                              Chip(
+                                avatar: Icon(transferStatusIcon(status), size: 16),
+                                label: Text(itemStatusLabel(status)),
+                              ),
+                            ],
+                          ),
                           if (item['note'] != null) Text('ملاحظة: ${item['note']}'),
                           if (canHandle) ...[
                             const SizedBox(height: 8),
@@ -3045,6 +3327,22 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                     ),
                   );
                 }),
+              const SizedBox(height: 12),
+              const SectionHeader(title: 'سجل المعالجة'),
+              if (details.events.isEmpty)
+                const EmptyState(icon: Icons.history_rounded, text: 'لا توجد تحديثات بعد')
+              else
+                ...details.events.map((event) {
+                  final employee = details.employees[event['employee_id']];
+                  return ListTile(
+                    leading: CircleAvatar(
+                      backgroundColor: brandColor.withOpacity(0.1),
+                      child: const Icon(Icons.manage_history_rounded, color: brandColor),
+                    ),
+                    title: Text(eventLabel(event)),
+                    subtitle: Text('${employee?.name ?? 'موظف'} · ${formatEventTime(event['created_at'])}'),
+                  );
+                }),
             ],
           );
         },
@@ -3059,6 +3357,18 @@ class TransferData {
   final Map<int, BranchOption> branches;
   final Map<String, EmployeeLite> employees;
   final List<Map<String, dynamic>> orders;
+}
+
+class TransferDetailsData {
+  TransferDetailsData({
+    required this.items,
+    required this.events,
+    required this.employees,
+  });
+
+  final List<Map<String, dynamic>> items;
+  final List<Map<String, dynamic>> events;
+  final Map<String, EmployeeLite> employees;
 }
 
 class CreateTransferResult {
@@ -3102,6 +3412,9 @@ class _TransferDialogState extends State<TransferDialog> {
   List<Map<String, dynamic>> suggestions = [];
   Map<String, dynamic>? selectedProduct;
   bool searching = false;
+  bool cacheLoading = true;
+  int productsCount = 0;
+  Timer? searchDebounce;
   int? toBranch;
 
   @override
@@ -3109,18 +3422,54 @@ class _TransferDialogState extends State<TransferDialog> {
     super.initState();
     final options = widget.branches.keys.where((number) => number != widget.session.branchNum);
     if (options.isNotEmpty) toBranch = options.first;
+    unawaited(prepareSearchCache());
+  }
+
+  @override
+  void dispose() {
+    searchDebounce?.cancel();
+    note.dispose();
+    bookSearch.dispose();
+    quantity.dispose();
+    itemNote.dispose();
+    super.dispose();
+  }
+
+  Future<void> prepareSearchCache() async {
+    try {
+      await warmProductSearchCache();
+      if (mounted) {
+        setState(() {
+          productsCount = cachedProducts?.length ?? 0;
+          cacheLoading = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => cacheLoading = false);
+    }
+  }
+
+  void queueSearch(String value) {
+    selectedProduct = null;
+    searchDebounce?.cancel();
+    searchDebounce = Timer(const Duration(milliseconds: 260), () => searchBooks(value));
   }
 
   Future<void> searchBooks(String value) async {
     final query = value.trim();
     if (query.length < 2) {
-      setState(() => suggestions = []);
+      setState(() {
+        suggestions = [];
+        searching = false;
+      });
       return;
     }
     setState(() => searching = true);
     try {
+      await warmProductSearchCache();
       final found = await searchProductsLikeLegacy(query, limit: 12);
       if (mounted) {
+        if (bookSearch.text.trim() != query) return;
         setState(() {
           suggestions = found;
           searching = false;
@@ -3162,69 +3511,125 @@ class _TransferDialogState extends State<TransferDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       title: const Text('طلب مناقلة'),
-      content: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            DropdownButtonFormField<int>(
-              initialValue: toBranch,
-              decoration: const InputDecoration(labelText: 'الفرع المطلوب منه'),
-              items: widget.branches.values
-                  .where((branch) => branch.number != widget.session.branchNum)
-                  .map((branch) => DropdownMenuItem(value: branch.number, child: Text(branch.label)))
-                  .toList(),
-              onChanged: (value) => setState(() => toBranch = value),
-            ),
-            TextField(controller: note, decoration: const InputDecoration(labelText: 'ملاحظة الطلب')),
-            const SizedBox(height: 12),
-            TextField(
-              controller: bookSearch,
-              decoration: InputDecoration(
-                labelText: 'ابحث عن الكتاب من قاعدة البيانات',
-                suffixIcon: searching
-                    ? const Padding(
-                        padding: EdgeInsets.all(12),
-                        child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
-                      )
-                    : const Icon(Icons.manage_search_rounded),
-              ),
-              onChanged: searchBooks,
-            ),
-            if (suggestions.isNotEmpty)
-              Card(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: suggestions
-                      .map(
-                        (product) => ListTile(
-                          dense: true,
-                          title: Text(product['name'] as String? ?? 'بدون اسم'),
-                          subtitle: Text('رقم ${product['mat_num']} · كمية ${product['quantity'] ?? '-'}'),
-                          onTap: () => selectProduct(product),
-                        ),
-                      )
+      content: SizedBox(
+        width: 680,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.76),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                DropdownButtonFormField<int>(
+                  initialValue: toBranch,
+                  decoration: const InputDecoration(
+                    labelText: 'الفرع المطلوب منه',
+                    prefixIcon: Icon(Icons.storefront_rounded),
+                  ),
+                  items: widget.branches.values
+                      .where((branch) => branch.number != widget.session.branchNum)
+                      .map((branch) => DropdownMenuItem(value: branch.number, child: Text(branch.label)))
                       .toList(),
+                  onChanged: (value) => setState(() => toBranch = value),
                 ),
-              ),
-            TextField(
-              controller: quantity,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'الكمية'),
+                TextField(controller: note, decoration: const InputDecoration(labelText: 'ملاحظة الطلب')),
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: softSurface,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.black12),
+                  ),
+                  child: Column(
+                    children: [
+                      TextField(
+                        controller: bookSearch,
+                        decoration: InputDecoration(
+                          labelText: 'ابحث عن الكتاب من قاعدة البيانات',
+                          helperText: cacheLoading
+                              ? 'يتم تجهيز فهرس الكتب لأول مرة'
+                              : productsCount > 0
+                                  ? 'جاهز للبحث السريع داخل $productsCount كتاب'
+                                  : null,
+                          suffixIcon: searching || cacheLoading
+                              ? const Padding(
+                                  padding: EdgeInsets.all(12),
+                                  child: SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                  ),
+                                )
+                              : const Icon(Icons.manage_search_rounded),
+                        ),
+                        onChanged: queueSearch,
+                      ),
+                      if (suggestions.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Card(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: suggestions
+                                  .map(
+                                    (product) => ListTile(
+                                      dense: true,
+                                      leading: const Icon(Icons.menu_book_rounded),
+                                      title: Text(product['name'] as String? ?? 'بدون اسم'),
+                                      subtitle: Text('رقم ${product['mat_num']} · كمية ${product['quantity'] ?? '-'}'),
+                                      onTap: () => selectProduct(product),
+                                    ),
+                                  )
+                                  .toList(),
+                            ),
+                          ),
+                        ),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: quantity,
+                              keyboardType: TextInputType.number,
+                              decoration: const InputDecoration(labelText: 'الكمية'),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            flex: 2,
+                            child: TextField(
+                              controller: itemNote,
+                              decoration: const InputDecoration(labelText: 'ملاحظة البند'),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: OutlinedButton.icon(
+                          onPressed: addItem,
+                          icon: const Icon(Icons.add_rounded),
+                          label: const Text('إضافة بند'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                if (items.isEmpty)
+                  const EmptyState(icon: Icons.playlist_add_rounded, text: 'أضف كتابا واحدا على الأقل')
+                else
+                  ...items.map((item) => ListTile(
+                        dense: true,
+                        leading: const Icon(Icons.check_circle_outline_rounded, color: brandColor),
+                        title: Text(item.name),
+                        subtitle: Text('رقم ${item.matNum}${item.note.isEmpty ? '' : ' · ${item.note}'}'),
+                        trailing: Text('${item.quantity}'),
+                      )),
+              ],
             ),
-            TextField(controller: itemNote, decoration: const InputDecoration(labelText: 'ملاحظة البند')),
-            const SizedBox(height: 8),
-            OutlinedButton.icon(
-              onPressed: addItem,
-              icon: const Icon(Icons.add_rounded),
-              label: const Text('إضافة بند'),
-            ),
-            ...items.map((item) => ListTile(
-                  dense: true,
-                  title: Text(item.name),
-                  subtitle: Text('رقم ${item.matNum}'),
-                  trailing: Text('${item.quantity}'),
-                )),
-          ],
+          ),
         ),
       ),
       actions: [
@@ -3992,6 +4397,18 @@ Future<Map<int, BranchOption>> loadBranchesMap() async {
 
 Future<List<Map<String, dynamic>>> loadAllProductsCached() async {
   if (cachedProducts != null) return cachedProducts!;
+  final running = cachedProductsFuture;
+  if (running != null) return running;
+  cachedProductsFuture = _loadAllProducts();
+  try {
+    cachedProducts = await cachedProductsFuture;
+    return cachedProducts!;
+  } finally {
+    cachedProductsFuture = null;
+  }
+}
+
+Future<List<Map<String, dynamic>>> _loadAllProducts() async {
   final all = <Map<String, dynamic>>[];
   var from = 0;
   const pageSize = 1000;
@@ -4010,12 +4427,23 @@ Future<List<Map<String, dynamic>>> loadAllProductsCached() async {
     final matNum = (product['mat_num'] as num?)?.toInt();
     if (matNum != null) unique.putIfAbsent(matNum, () => product);
   }
-  cachedProducts = unique.values.toList();
-  return cachedProducts!;
+  return unique.values.toList();
 }
 
 Future<Map<int, String>> loadAllBarcodesCached() async {
   if (cachedBarcodes != null) return cachedBarcodes!;
+  final running = cachedBarcodesFuture;
+  if (running != null) return running;
+  cachedBarcodesFuture = _loadAllBarcodes();
+  try {
+    cachedBarcodes = await cachedBarcodesFuture;
+    return cachedBarcodes!;
+  } finally {
+    cachedBarcodesFuture = null;
+  }
+}
+
+Future<Map<int, String>> _loadAllBarcodes() async {
   final all = <Map<String, dynamic>>[];
   var from = 0;
   const pageSize = 1000;
@@ -4037,8 +4465,11 @@ Future<Map<int, String>> loadAllBarcodesCached() async {
       map[matNum] = barcode;
     }
   }
-  cachedBarcodes = map;
   return map;
+}
+
+Future<void> warmProductSearchCache() async {
+  await Future.wait([loadAllProductsCached(), loadAllBarcodesCached()]);
 }
 
 Future<List<Map<String, dynamic>>> searchProductsLikeLegacy(
@@ -4180,6 +4611,77 @@ String statusLabel(String status) {
       return 'ملغي';
     default:
       return status;
+  }
+}
+
+IconData transferStatusIcon(String status) {
+  switch (status) {
+    case 'available':
+      return Icons.check_circle_rounded;
+    case 'submitted':
+      return Icons.outbox_rounded;
+    case 'approved':
+      return Icons.verified_rounded;
+    case 'partially_available':
+      return Icons.rule_rounded;
+    case 'preparing':
+      return Icons.inventory_2_rounded;
+    case 'in_delivery':
+      return Icons.local_shipping_rounded;
+    case 'completed':
+      return Icons.task_alt_rounded;
+    case 'rejected':
+      return Icons.block_rounded;
+    case 'cancelled':
+      return Icons.cancel_rounded;
+    default:
+      return Icons.sync_alt_rounded;
+  }
+}
+
+Color transferStatusColor(String status) {
+  switch (status) {
+    case 'available':
+      return const Color(0xff16834f);
+    case 'completed':
+      return const Color(0xff16834f);
+    case 'cancelled':
+    case 'rejected':
+      return const Color(0xffb13a32);
+    case 'in_delivery':
+      return const Color(0xff2d65b3);
+    case 'preparing':
+      return const Color(0xff9a6a15);
+    case 'approved':
+      return brandColor;
+    case 'partially_available':
+      return accentColor;
+    default:
+      return inkColor;
+  }
+}
+
+const transferStatusTabs = <String>[
+  'all',
+  'active',
+  'submitted',
+  'approved',
+  'partially_available',
+  'preparing',
+  'in_delivery',
+  'completed',
+  'rejected',
+  'cancelled',
+];
+
+String transferTabLabel(String value) {
+  switch (value) {
+    case 'all':
+      return 'الكل';
+    case 'active':
+      return 'النشطة';
+    default:
+      return statusLabel(value);
   }
 }
 
@@ -4427,6 +4929,31 @@ String formatTime(DateTime value) {
 
 String formatDateTime(DateTime value) {
   return '${shortDate(value)} ${formatTime(value)}';
+}
+
+String formatEventTime(Object? value) {
+  if (value is! String || value.isEmpty) return '-';
+  return formatDateTime(DateTime.parse(value).toLocal());
+}
+
+String eventLabel(Map<String, dynamic> event) {
+  final type = event['event_type'] as String? ?? '';
+  final oldStatus = event['old_status'] as String?;
+  final newStatus = event['new_status'] as String?;
+  final note = event['note'] as String?;
+  switch (type) {
+    case 'created':
+      return 'إنشاء الطلب';
+    case 'status_changed':
+      if (oldStatus != null && newStatus != null) {
+        return 'تغيير الحالة من ${statusLabel(oldStatus)} إلى ${statusLabel(newStatus)}';
+      }
+      return 'تغيير حالة المناقلة';
+    case 'item_changed':
+      return note == null ? 'تحديث بند' : 'تحديث بند: $note';
+    default:
+      return note ?? type;
+  }
 }
 
 String shortDate(DateTime value) {
