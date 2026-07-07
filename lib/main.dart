@@ -417,7 +417,7 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<DashboardData> loadDashboard() async {
-    final branches = await loadBranchesMap();
+    final branches = await loadAppBranchesMap();
     final employees = await loadEmployeesForScope(widget.session, includeInactive: false);
     final employeeById = {for (final employee in employees) employee.id: employee};
     final employeeIds = employeeById.keys.toSet();
@@ -653,7 +653,7 @@ class _AttendancePageState extends State<AttendancePage> {
       error = null;
     });
     try {
-      branches = await loadBranchesMap();
+      branches = await loadAppBranchesMap();
       final rows = await supabase
           .from('ansar_attendance_logs')
           .select()
@@ -788,7 +788,7 @@ class _ReportsPageState extends State<ReportsPage> {
   }
 
   Future<ReportData> loadReports() async {
-    final branches = await loadBranchesMap();
+    final branches = await loadAppBranchesMap();
     var employees = await loadEmployeesForScope(widget.session, includeInactive: false);
     if (selectedBranch != null) {
       employees = employees.where((employee) => employee.branchNum == selectedBranch).toList();
@@ -1030,8 +1030,28 @@ class QueriesPage extends StatefulWidget {
 
 class _QueriesPageState extends State<QueriesPage> {
   final search = TextEditingController();
+  late final TextEditingController startDate;
+  late final TextEditingController endDate;
   Future<Object>? future;
   int queryMode = 0;
+  String selectedSalesBooks = 'all';
+
+  @override
+  void initState() {
+    super.initState();
+    final today = DateTime.now();
+    final todayKey = formatDateKey(today);
+    startDate = TextEditingController(text: todayKey);
+    endDate = TextEditingController(text: todayKey);
+  }
+
+  @override
+  void dispose() {
+    search.dispose();
+    startDate.dispose();
+    endDate.dispose();
+    super.dispose();
+  }
 
   Future<List<ProductResult>> runSearch() async {
     final value = search.text.trim();
@@ -1039,7 +1059,7 @@ class _QueriesPageState extends State<QueriesPage> {
 
     final productRows = await searchProductsLikeLegacy(value, limit: 60);
 
-    final branches = await loadBranchesMap();
+    final branches = await loadLegacyBranchesMap();
     final results = <ProductResult>[];
     for (final product in productRows.take(40)) {
       final matNum = (product['mat_num'] as num?)?.toInt();
@@ -1095,18 +1115,40 @@ class _QueriesPageState extends State<QueriesPage> {
   }
 
   Future<List<Map<String, dynamic>>> runDailySales() async {
-    final today = DateTime.now();
-    final date = formatDateKey(today);
-    final rows = await supabase
+    var query = supabase
         .from('bills_full')
         .select('book, bnum, date, accnum, totalvalue, remark, kind')
         .eq('kind', 0)
-        .gte('date', date)
-        .lte('date', date)
-        .order('date', ascending: false)
-        .order('bnum', ascending: false)
-        .limit(80);
+        .gte('date', startDate.text)
+        .lte('date', endDate.text);
+    if (selectedSalesBooks != 'all') {
+      final books = selectedSalesBooks.split(',').map(int.parse).toList();
+      query = books.length == 1 ? query.eq('book', books.first) : query.inFilter('book', books);
+    }
+    final rows = await query.order('date', ascending: false).order('bnum', ascending: false).limit(100);
     return rows.cast<Map<String, dynamic>>();
+  }
+
+  Future<void> openAccountStatement(Map<String, dynamic> account) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: AccountStatementPage(account: account),
+        ),
+      ),
+    );
+  }
+
+  Future<void> openSalesDetails(Map<String, dynamic> bill) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: SalesBillDetailsPage(bill: bill),
+        ),
+      ),
+    );
   }
 
   @override
@@ -1128,33 +1170,79 @@ class _QueriesPageState extends State<QueriesPage> {
               future = null;
               search.clear();
             });
+            if (queryMode == 2 || queryMode == 3) submitSearch();
           },
         ),
         const SizedBox(height: 12),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: search,
-                    decoration: const InputDecoration(
-                      labelText: 'اكتب كلمة البحث',
-                      prefixIcon: Icon(Icons.search_rounded),
+        if (queryMode == 0 || queryMode == 1)
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: search,
+                      decoration: const InputDecoration(
+                        labelText: 'اكتب كلمة البحث',
+                        prefixIcon: Icon(Icons.search_rounded),
+                      ),
+                      onSubmitted: (_) => submitSearch(),
                     ),
-                    onSubmitted: (_) => submitSearch(),
                   ),
-                ),
-                const SizedBox(width: 8),
-                FilledButton(
-                  onPressed: submitSearch,
-                  child: const Text('بحث'),
-                ),
-              ],
+                  const SizedBox(width: 8),
+                  FilledButton(
+                    onPressed: submitSearch,
+                    child: const Text('بحث'),
+                  ),
+                ],
+              ),
             ),
           ),
-        ),
+        if (queryMode == 1 || queryMode == 3) ...[
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: startDate,
+                  decoration: const InputDecoration(labelText: 'من تاريخ'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: TextField(
+                  controller: endDate,
+                  decoration: const InputDecoration(labelText: 'إلى تاريخ'),
+                ),
+              ),
+            ],
+          ),
+        ],
+        if (queryMode == 3) ...[
+          const SizedBox(height: 10),
+          DropdownButtonFormField<String>(
+            initialValue: selectedSalesBooks,
+            decoration: const InputDecoration(labelText: 'الفرع'),
+            items: salesBookOptions
+                .map((option) => DropdownMenuItem(value: option.value, child: Text(option.label)))
+                .toList(),
+            onChanged: (value) {
+              setState(() {
+                selectedSalesBooks = value ?? 'all';
+                future = runDailySales();
+              });
+            },
+          ),
+        ],
+        if (queryMode == 2 || queryMode == 3) ...[
+          const SizedBox(height: 10),
+          FilledButton.icon(
+            onPressed: submitSearch,
+            icon: const Icon(Icons.refresh_rounded),
+            label: const Text('تحديث'),
+          ),
+        ],
         const SizedBox(height: 12),
         if (future == null)
           const EmptyState(icon: Icons.manage_search_rounded, text: 'اكتب كلمة بحث لعرض الكتب والمخزون')
@@ -1204,6 +1292,7 @@ class _QueriesPageState extends State<QueriesPage> {
                           title: Text(account['name'] as String? ?? 'بدون اسم'),
                           subtitle: Text('رقم ${account['num']} · رصيد ${account['ras'] ?? '-'}'),
                           trailing: Text('${account['owner'] ?? ''}'),
+                          onTap: () => openAccountStatement(account),
                         ),
                       ),
                     )
@@ -1262,9 +1351,10 @@ class _QueriesPageState extends State<QueriesPage> {
                       (bill) => Card(
                         child: ListTile(
                           leading: const CircleAvatar(child: Icon(Icons.receipt_long_rounded)),
-                          title: Text('فاتورة ${bill['bnum']} · دفتر ${bill['book']}'),
+                          title: Text('فاتورة ${bill['bnum']} · ${salesBookName(bill['book'])}'),
                           subtitle: Text('حساب ${bill['accnum']} · ${bill['date']}'),
                           trailing: Text('${bill['totalvalue'] ?? 0}'),
+                          onTap: () => openSalesDetails(bill),
                         ),
                       ),
                     )
@@ -1284,11 +1374,208 @@ class ProductResult {
   final List<StockResult> stock;
 }
 
+class AccountStatementPage extends StatefulWidget {
+  const AccountStatementPage({super.key, required this.account});
+
+  final Map<String, dynamic> account;
+
+  @override
+  State<AccountStatementPage> createState() => _AccountStatementPageState();
+}
+
+class _AccountStatementPageState extends State<AccountStatementPage> {
+  late final TextEditingController startDate;
+  late final TextEditingController endDate;
+  late Future<List<Map<String, dynamic>>> future;
+
+  @override
+  void initState() {
+    super.initState();
+    final today = DateTime.now();
+    endDate = TextEditingController(text: formatDateKey(today));
+    startDate = TextEditingController(text: formatDateKey(DateTime(today.year, today.month, 1)));
+    future = loadEntries();
+  }
+
+  Future<List<Map<String, dynamic>>> loadEntries() async {
+    final rows = await supabase
+        .from('account_entries')
+        .select('num, item, kind, date, remark, acc_num2, cash, billnum')
+        .eq('acc_num', widget.account['num'])
+        .gte('date', startDate.text)
+        .lte('date', endDate.text)
+        .order('date', ascending: true)
+        .order('num', ascending: true)
+        .order('item', ascending: true);
+    return rows.cast<Map<String, dynamic>>();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.account['name'] as String? ?? 'كشف حساب')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Row(
+            children: [
+              Expanded(child: TextField(controller: startDate, decoration: const InputDecoration(labelText: 'من تاريخ'))),
+              const SizedBox(width: 10),
+              Expanded(child: TextField(controller: endDate, decoration: const InputDecoration(labelText: 'إلى تاريخ'))),
+            ],
+          ),
+          const SizedBox(height: 10),
+          FilledButton.icon(
+            onPressed: () => setState(() => future = loadEntries()),
+            icon: const Icon(Icons.search_rounded),
+            label: const Text('عرض الكشف'),
+          ),
+          const SizedBox(height: 12),
+          FutureBuilder<List<Map<String, dynamic>>>(
+            future: future,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState != ConnectionState.done) {
+                return const Center(child: Padding(padding: EdgeInsets.all(24), child: CircularProgressIndicator()));
+              }
+              if (snapshot.hasError) return ErrorState(message: cleanError(snapshot.error), onRetry: () => setState(() => future = loadEntries()));
+              final rows = snapshot.data!;
+              if (rows.isEmpty) return const EmptyState(icon: Icons.receipt_long_rounded, text: 'لا توجد حركات ضمن الفترة');
+              var running = 0.0;
+              return Column(
+                children: rows.map((entry) {
+                  final cash = (entry['cash'] as num?)?.toDouble() ?? 0;
+                  running += cash;
+                  return Card(
+                    child: ListTile(
+                      title: Text(entry['remark'] as String? ?? 'حركة'),
+                      subtitle: Text('${entry['date']} · سند ${entry['num'] ?? '-'} · مقابل ${entry['acc_num2'] ?? '-'}'),
+                      trailing: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          Text(cash.toStringAsFixed(0), style: TextStyle(color: cash < 0 ? Colors.red : Colors.green)),
+                          Text('رصيد ${running.toStringAsFixed(0)}', style: const TextStyle(fontSize: 11)),
+                        ],
+                      ),
+                    ),
+                  );
+                }).toList(),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class SalesBillDetailsPage extends StatefulWidget {
+  const SalesBillDetailsPage({super.key, required this.bill});
+
+  final Map<String, dynamic> bill;
+
+  @override
+  State<SalesBillDetailsPage> createState() => _SalesBillDetailsPageState();
+}
+
+class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
+  late Future<List<Map<String, dynamic>>> future;
+
+  @override
+  void initState() {
+    super.initState();
+    future = loadItems();
+  }
+
+  Future<List<Map<String, dynamic>>> loadItems() async {
+    final rows = await supabase
+        .from('bill_items_full')
+        .select('item, matnum, quantity, price, value, remarki')
+        .eq('book', widget.bill['book'])
+        .eq('bnum', widget.bill['bnum'])
+        .eq('kind', 0)
+        .order('item', ascending: true);
+    final items = rows.cast<Map<String, dynamic>>();
+    final matNums = items.map((row) => (row['matnum'] as num?)?.toInt()).whereType<int>().toSet().toList();
+    if (matNums.isEmpty) return items;
+    final products = await supabase.from('products').select('mat_num, name').inFilter('mat_num', matNums);
+    final names = {
+      for (final product in products.cast<Map<String, dynamic>>())
+        (product['mat_num'] as num).toInt(): product['name'] as String? ?? ''
+    };
+    return items.map((item) => {...item, 'product_name': names[(item['matnum'] as num?)?.toInt()]}).toList();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text('فاتورة ${widget.bill['bnum']}')),
+      body: FutureBuilder<List<Map<String, dynamic>>>(
+        future: future,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snapshot.hasError) return ErrorState(message: cleanError(snapshot.error), onRetry: () => setState(() => future = loadItems()));
+          final items = snapshot.data!;
+          return ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              Card(
+                child: ListTile(
+                  title: Text('${salesBookName(widget.bill['book'])} · ${widget.bill['date']}'),
+                  subtitle: Text('حساب ${widget.bill['accnum']}'),
+                  trailing: Text('${widget.bill['totalvalue'] ?? 0}'),
+                ),
+              ),
+              const SizedBox(height: 12),
+              if (items.isEmpty)
+                const EmptyState(icon: Icons.inventory_2_outlined, text: 'لا توجد بنود')
+              else
+                ...items.map((item) => Card(
+                      child: ListTile(
+                        title: Text(item['product_name'] as String? ?? 'مادة ${item['matnum']}'),
+                        subtitle: Text('كمية ${item['quantity']} × سعر ${item['price']}'),
+                        trailing: Text('${item['value'] ?? 0}'),
+                      ),
+                    )),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
 class StockResult {
   StockResult({required this.branchName, required this.quantity});
 
   final String branchName;
   final double quantity;
+}
+
+class SalesBookOption {
+  const SalesBookOption(this.value, this.label);
+
+  final String value;
+  final String label;
+}
+
+const salesBookOptions = [
+  SalesBookOption('all', 'كل الفروع'),
+  SalesBookOption('30', 'ادلب'),
+  SalesBookOption('56', 'الباب'),
+  SalesBookOption('70', 'الدانا'),
+  SalesBookOption('20,21', 'حمص'),
+  SalesBookOption('55', 'دمشق'),
+];
+
+String salesBookName(Object? book) {
+  final value = '$book';
+  for (final option in salesBookOptions) {
+    if (option.value.split(',').contains(value)) return option.label;
+  }
+  return 'دفتر $value';
 }
 
 class ProductResultCard extends StatelessWidget {
@@ -1407,7 +1694,7 @@ class _EmployeesPageState extends State<EmployeesPage> {
   }
 
   Future<EmployeesData> loadEmployees() async {
-    final branches = await loadBranchesMap();
+    final branches = await loadAppBranchesMap();
     final rows = await supabase
         .from('ansar_employees')
         .select()
@@ -1635,7 +1922,7 @@ class _BranchesPageState extends State<BranchesPage> {
   @override
   void initState() {
     super.initState();
-    future = loadBranchesMap();
+    future = loadAppBranchesMap();
   }
 
   Future<void> openBranchDialog([BranchOption? branch]) async {
@@ -1658,7 +1945,7 @@ class _BranchesPageState extends State<BranchesPage> {
         'created_by': widget.session.id,
       });
     }
-    setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadBranchesMap()));
+    setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadAppBranchesMap()));
   }
 
   Future<void> deleteBranch(BranchOption branch) async {
@@ -1674,7 +1961,7 @@ class _BranchesPageState extends State<BranchesPage> {
       'is_active': false,
       'created_by': widget.session.id,
     });
-    setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadBranchesMap()));
+    setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadAppBranchesMap()));
   }
 
   @override
@@ -1688,7 +1975,7 @@ class _BranchesPageState extends State<BranchesPage> {
         if (snapshot.hasError) {
           return ErrorState(
             message: cleanError(snapshot.error),
-            onRetry: () => setState(() => future = loadBranchesMap()),
+            onRetry: () => setState(() => future = loadAppBranchesMap()),
           );
         }
         final branches = snapshot.data!.values.toList();
@@ -1938,7 +2225,7 @@ class _TransfersPageState extends State<TransfersPage> {
   }
 
   Future<TransferData> loadTransfers() async {
-    final branches = await loadBranchesMap();
+    final branches = await loadAppBranchesMap();
     final employees = await loadEmployeesForScope(widget.session, includeInactive: false);
     final employeeById = {for (final employee in employees) employee.id: employee};
     final rows = await supabase
@@ -3219,7 +3506,7 @@ class ErrorState extends StatelessWidget {
   }
 }
 
-Future<Map<int, BranchOption>> loadBranchesMap() async {
+Future<Map<int, BranchOption>> loadLegacyBranchesMap() async {
   final branches = <int, BranchOption>{};
   final legacyRows = await supabase.from('branches').select('sto_num, name').order('sto_num');
   for (final row in legacyRows) {
@@ -3230,7 +3517,11 @@ Future<Map<int, BranchOption>> loadBranchesMap() async {
       name: (row['name'] ?? 'فرع $number') as String,
     );
   }
+  return branches;
+}
 
+Future<Map<int, BranchOption>> loadAppBranchesMap() async {
+  final branches = <int, BranchOption>{};
   try {
     final appRows = await supabase
         .from('ansar_branches')
@@ -3249,9 +3540,15 @@ Future<Map<int, BranchOption>> loadBranchesMap() async {
       }
     }
   } catch (_) {
-    // The app can still read legacy branches before ansar_branches is created.
+    // ansar_branches may not exist yet while the user is setting up the database.
   }
   return branches;
+}
+
+Future<Map<int, BranchOption>> loadBranchesMap() async {
+  final legacy = await loadLegacyBranchesMap();
+  final app = await loadAppBranchesMap();
+  return {...legacy, ...app};
 }
 
 Future<List<Map<String, dynamic>>> loadAllProductsCached() async {
