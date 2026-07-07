@@ -2413,6 +2413,20 @@ class _ProfilePageState extends State<ProfilePage> {
     });
   }
 
+  Future<void> resetNotifications() async {
+    setState(() {
+      registeringNotifications = true;
+      message = null;
+    });
+    await resetAndRegisterDeviceForNotifications(widget.session);
+    if (!mounted) return;
+    setState(() {
+      registeringNotifications = false;
+      message = lastNotificationRegistrationError ??
+          (lastNotificationTokenPreview == null ? 'لم يتم تسجيل الجهاز بعد' : 'تمت إعادة ضبط الإشعارات لهذا الجهاز');
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListView(
@@ -2440,6 +2454,12 @@ class _ProfilePageState extends State<ProfilePage> {
                       ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
                       : const Icon(Icons.notifications_active_rounded),
                   label: const Text('تفعيل الإشعارات'),
+                ),
+                const SizedBox(height: 8),
+                TextButton.icon(
+                  onPressed: registeringNotifications ? null : resetNotifications,
+                  icon: const Icon(Icons.refresh_rounded),
+                  label: const Text('إعادة ضبط الإشعارات'),
                 ),
               ],
             ),
@@ -4144,11 +4164,7 @@ Future<void> registerDeviceForNotifications(EmployeeSession session) async {
     if (settings.authorizationStatus == AuthorizationStatus.denied) {
       throw Exception('تم رفض إذن الإشعارات من إعدادات الهاتف');
     }
-    final token = await messaging.getToken();
-    if (token == null || token.isEmpty) {
-      throw Exception('لم يعط Firebase رمزاً لهذا الجهاز');
-    }
-
+    final token = await getMessagingTokenWithRecovery(messaging);
     await saveDeviceToken(session, token);
 
     FirebaseMessaging.instance.onTokenRefresh.listen((newToken) async {
@@ -4159,6 +4175,49 @@ Future<void> registerDeviceForNotifications(EmployeeSession session) async {
     lastNotificationRegistrationAt = DateTime.now();
     // Push setup should never block login or daily work.
   }
+}
+
+Future<String> getMessagingTokenWithRecovery(FirebaseMessaging messaging) async {
+  try {
+    final token = await messaging.getToken();
+    if (token == null || token.isEmpty) {
+      throw Exception('لم يعط Firebase رمزاً لهذا الجهاز');
+    }
+    return token;
+  } catch (error) {
+    if (!isTooManyRegistrationsError(error)) rethrow;
+    await messaging.deleteToken();
+    await Future.delayed(const Duration(seconds: 2));
+    final token = await messaging.getToken();
+    if (token == null || token.isEmpty) {
+      throw Exception('لم يعط Firebase رمزاً جديداً بعد إعادة الضبط');
+    }
+    return token;
+  }
+}
+
+Future<void> resetAndRegisterDeviceForNotifications(EmployeeSession session) async {
+  try {
+    final messaging = FirebaseMessaging.instance;
+    lastNotificationRegistrationError = null;
+    lastNotificationTokenPreview = null;
+    await messaging.setAutoInitEnabled(true);
+    await messaging.deleteToken();
+    await Future.delayed(const Duration(seconds: 2));
+    final settings = await messaging.requestPermission(alert: true, badge: true, sound: true);
+    if (settings.authorizationStatus == AuthorizationStatus.denied) {
+      throw Exception('تم رفض إذن الإشعارات من إعدادات الهاتف');
+    }
+    final token = await getMessagingTokenWithRecovery(messaging);
+    await saveDeviceToken(session, token);
+  } catch (error) {
+    lastNotificationRegistrationError = cleanError(error);
+    lastNotificationRegistrationAt = DateTime.now();
+  }
+}
+
+bool isTooManyRegistrationsError(Object error) {
+  return error.toString().contains('TOO_MANY_REGISTRATIONS');
 }
 
 Future<void> saveDeviceToken(EmployeeSession session, String token) async {
