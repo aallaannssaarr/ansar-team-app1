@@ -1314,9 +1314,9 @@ class _QueriesPageState extends State<QueriesPage> {
     final accounts = await loadAccountsCached();
     final normalized = normalizeSearch(value);
     final results = accounts.where((account) {
-      final num = (account['num'] as num?)?.toInt();
+      final accountNum = (account['num'] as num?)?.toInt();
       final name = normalizeSearch(account['name'] as String? ?? '');
-      if (numeric != null) return num?.toString().contains(value) == true;
+      if (numeric != null) return accountNum?.toString().contains(value) == true;
       return name.contains(normalized);
     }).take(40).toList();
     return results;
