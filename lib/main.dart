@@ -520,7 +520,6 @@ class _DashboardPageState extends State<DashboardPage> {
     unawaited(enqueueNotification(
       title: 'تسجيل دخول دوام',
       body: '${widget.session.name} سجل الدخول إلى الدوام',
-      branchNum: widget.session.branchNum,
       data: {
         'type': 'attendance_check_in',
         'employee_id': widget.session.id,
@@ -540,7 +539,6 @@ class _DashboardPageState extends State<DashboardPage> {
     unawaited(enqueueNotification(
       title: 'تسجيل خروج دوام',
       body: '${widget.session.name} سجل الخروج من الدوام',
-      branchNum: widget.session.branchNum,
       data: {
         'type': 'attendance_check_out',
         'employee_id': widget.session.id,
@@ -2329,6 +2327,7 @@ class _ProfilePageState extends State<ProfilePage> {
   late final TextEditingController email;
   late final TextEditingController jobTitle;
   bool saving = false;
+  bool registeringNotifications = false;
   String? message;
 
   @override
@@ -2400,6 +2399,20 @@ class _ProfilePageState extends State<ProfilePage> {
     }
   }
 
+  Future<void> enableNotifications() async {
+    setState(() {
+      registeringNotifications = true;
+      message = null;
+    });
+    await registerDeviceForNotifications(widget.session);
+    if (!mounted) return;
+    setState(() {
+      registeringNotifications = false;
+      message = lastNotificationRegistrationError ??
+          (lastNotificationTokenPreview == null ? 'لم يتم تسجيل الجهاز بعد' : 'تم تفعيل الإشعارات لهذا الجهاز');
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListView(
@@ -2419,6 +2432,14 @@ class _ProfilePageState extends State<ProfilePage> {
                   onPressed: saving ? null : pickAvatar,
                   icon: const Icon(Icons.photo_camera_rounded),
                   label: const Text('تغيير الصورة'),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: registeringNotifications ? null : enableNotifications,
+                  icon: registeringNotifications
+                      ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.notifications_active_rounded),
+                  label: const Text('تفعيل الإشعارات'),
                 ),
               ],
             ),
@@ -2537,7 +2558,6 @@ class _TransfersPageState extends State<TransfersPage> {
       title: 'مناقلة جديدة',
       body:
           'طلب مناقلة من ${branchLabel(data.branches, widget.session.branchNum)} إلى ${branchLabel(data.branches, result.toBranch)}',
-      branchNum: result.toBranch,
       data: {'type': 'transfer_created', 'order_id': inserted['id']},
     ));
     if (mounted) setState(() => future = loadTransfers());
@@ -2570,7 +2590,6 @@ class _TransfersPageState extends State<TransfersPage> {
     unawaited(enqueueNotification(
       title: 'تحديث مناقلة',
       body: 'تم تحديث حالة المناقلة رقم ${order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
-      branchNum: (order['from_branch_num'] as num?)?.toInt(),
       data: {'type': 'transfer_updated', 'order_id': order['id'], 'status': status},
     ));
     if (mounted) setState(() => future = loadTransfers());
@@ -2767,7 +2786,6 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     unawaited(enqueueNotification(
       title: 'تحديث بند مناقلة',
       body: 'تم تحديث بند في طلب المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${itemStatusLabel(status)}',
-      branchNum: (widget.order['from_branch_num'] as num?)?.toInt(),
       data: {'type': 'transfer_item_updated', 'order_id': widget.order['id']},
     ));
     setState(() => future = loadItems());
@@ -2789,7 +2807,6 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     unawaited(enqueueNotification(
       title: 'تحديث مناقلة',
       body: 'تم تحديث حالة المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
-      branchNum: (widget.order['from_branch_num'] as num?)?.toInt(),
       data: {'type': 'transfer_updated', 'order_id': widget.order['id'], 'status': status},
     ));
     if (mounted) Navigator.pop(context);
@@ -4097,13 +4114,7 @@ Future<void> enqueueChatNotification({
   };
 
   if (type == 'general') {
-    final rows = await supabase
-        .from('ansar_employees')
-        .select('id')
-        .eq('is_active', true)
-        .neq('id', sender.id);
-    await enqueueNotificationsForEmployees(
-      employeeIds: rows.map((row) => row['id'] as String? ?? ''),
+    await enqueueNotification(
       title: title,
       body: body,
       data: data,
