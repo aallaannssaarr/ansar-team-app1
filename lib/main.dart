@@ -324,7 +324,7 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   late EmployeeSession session;
   int index = 0;
   StreamSubscription<RemoteMessage>? foregroundMessages;
@@ -332,6 +332,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     session = widget.initialSession;
     registerDeviceForNotifications(session);
     foregroundMessages = FirebaseMessaging.onMessage.listen((message) {
@@ -350,8 +351,16 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     foregroundMessages?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      registerDeviceForNotifications(session);
+    }
   }
 
   @override
@@ -505,7 +514,7 @@ class _DashboardPageState extends State<DashboardPage> {
       'check_in_at': DateTime.now().toUtc().toIso8601String(),
       'status': 'open',
     });
-    await enqueueNotification(
+    unawaited(enqueueNotification(
       title: 'تسجيل دخول دوام',
       body: '${widget.session.name} سجل الدخول إلى الدوام',
       branchNum: widget.session.branchNum,
@@ -514,9 +523,9 @@ class _DashboardPageState extends State<DashboardPage> {
         'employee_id': widget.session.id,
         'branch_num': widget.session.branchNum,
       },
-    );
+    ));
     if (mounted) {
-      setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadDashboard()));
+      setState(() => future = loadDashboard());
     }
   }
 
@@ -525,7 +534,7 @@ class _DashboardPageState extends State<DashboardPage> {
       'check_out_at': DateTime.now().toUtc().toIso8601String(),
       'status': 'closed',
     }).eq('id', openLog['id']);
-    await enqueueNotification(
+    unawaited(enqueueNotification(
       title: 'تسجيل خروج دوام',
       body: '${widget.session.name} سجل الخروج من الدوام',
       branchNum: widget.session.branchNum,
@@ -534,9 +543,9 @@ class _DashboardPageState extends State<DashboardPage> {
         'employee_id': widget.session.id,
         'branch_num': widget.session.branchNum,
       },
-    );
+    ));
     if (mounted) {
-      setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadDashboard()));
+      setState(() => future = loadDashboard());
     }
   }
 
@@ -1699,6 +1708,7 @@ class _ManagementPageState extends State<ManagementPage> {
             segments: const [
               ButtonSegment(value: 0, icon: Icon(Icons.people_rounded), label: Text('الموظفون')),
               ButtonSegment(value: 1, icon: Icon(Icons.store_rounded), label: Text('الفروع')),
+              ButtonSegment(value: 2, icon: Icon(Icons.notifications_active_rounded), label: Text('الإشعارات')),
             ],
             selected: {tab},
             onSelectionChanged: (value) => setState(() => tab = value.first),
@@ -1707,7 +1717,9 @@ class _ManagementPageState extends State<ManagementPage> {
         Expanded(
           child: tab == 0
               ? EmployeesPage(session: widget.session)
-              : BranchesPage(session: widget.session),
+              : tab == 1
+                  ? BranchesPage(session: widget.session)
+                  : const NotificationDiagnosticsPage(),
         ),
       ],
     );
@@ -1767,7 +1779,7 @@ class _EmployeesPageState extends State<EmployeesPage> {
     } else {
       await supabase.from('ansar_employees').update(result).eq('id', employee['id']);
     }
-    setState(() => employeesFuture = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadEmployees()));
+    setState(() => employeesFuture = loadEmployees());
   }
 
   Future<void> disableEmployee(Map<String, dynamic> employee) async {
@@ -1778,7 +1790,7 @@ class _EmployeesPageState extends State<EmployeesPage> {
     );
     if (!confirmed) return;
     await supabase.from('ansar_employees').update({'is_active': false}).eq('id', employee['id']);
-    setState(() => employeesFuture = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadEmployees()));
+    setState(() => employeesFuture = loadEmployees());
   }
 
   @override
@@ -1984,7 +1996,7 @@ class _BranchesPageState extends State<BranchesPage> {
         'created_by': widget.session.id,
       });
     }
-    setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadAppBranchesMap()));
+    setState(() => future = loadAppBranchesMap());
   }
 
   Future<void> deleteBranch(BranchOption branch) async {
@@ -2000,7 +2012,7 @@ class _BranchesPageState extends State<BranchesPage> {
       'is_active': false,
       'created_by': widget.session.id,
     });
-    setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadAppBranchesMap()));
+    setState(() => future = loadAppBranchesMap());
   }
 
   @override
@@ -2107,6 +2119,152 @@ class _BranchDialogState extends State<BranchDialog> {
       ],
     );
   }
+}
+
+class NotificationDiagnosticsPage extends StatefulWidget {
+  const NotificationDiagnosticsPage({super.key});
+
+  @override
+  State<NotificationDiagnosticsPage> createState() => _NotificationDiagnosticsPageState();
+}
+
+class _NotificationDiagnosticsPageState extends State<NotificationDiagnosticsPage> {
+  late Future<NotificationDiagnosticsData> future;
+  bool sending = false;
+
+  @override
+  void initState() {
+    super.initState();
+    future = loadDiagnostics();
+  }
+
+  Future<NotificationDiagnosticsData> loadDiagnostics() async {
+    final tokens = await supabase
+        .from('ansar_device_tokens')
+        .select('id, employee_id, platform, is_active, last_seen_at, created_at')
+        .order('last_seen_at', ascending: false)
+        .limit(50);
+    final queue = await supabase
+        .from('ansar_notification_queue')
+        .select('id, title, body, status, error_message, created_at, sent_at')
+        .order('created_at', ascending: false)
+        .limit(30);
+    return NotificationDiagnosticsData(
+      tokens: tokens.cast<Map<String, dynamic>>(),
+      queue: queue.cast<Map<String, dynamic>>(),
+    );
+  }
+
+  Future<void> runSenderNow() async {
+    setState(() => sending = true);
+    await kickNotificationSender();
+    await Future.delayed(const Duration(seconds: 2));
+    if (mounted) {
+      setState(() {
+        sending = false;
+        future = loadDiagnostics();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<NotificationDiagnosticsData>(
+      future: future,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        if (snapshot.hasError) {
+          return ErrorState(
+            message: cleanError(snapshot.error),
+            onRetry: () => setState(() => future = loadDiagnostics()),
+          );
+        }
+
+        final data = snapshot.data!;
+        final activeTokens = data.tokens.where((row) => row['is_active'] != false).length;
+        final pending = data.queue.where((row) => row['status'] == 'pending').length;
+        final failed = data.queue.where((row) => row['status'] == 'failed').length;
+
+        return ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                Chip(label: Text('الأجهزة النشطة: $activeTokens')),
+                Chip(label: Text('قيد الإرسال: $pending')),
+                Chip(label: Text('فشل: $failed')),
+              ],
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: sending ? null : runSenderNow,
+              icon: sending
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.send_rounded),
+              label: const Text('تشغيل مرسل الإشعارات الآن'),
+            ),
+            const SizedBox(height: 16),
+            Text('آخر الأجهزة', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            if (data.tokens.isEmpty)
+              const EmptyState(icon: Icons.phone_android_rounded, text: 'لا توجد أجهزة مسجلة بعد')
+            else
+              ...data.tokens.take(8).map(
+                    (row) => ListTile(
+                      leading: const Icon(Icons.phone_android_rounded),
+                      title: Text(row['platform'] as String? ?? 'android'),
+                      subtitle: Text(row['last_seen_at'] as String? ?? row['created_at'] as String? ?? '-'),
+                      trailing: Icon(
+                        row['is_active'] != false ? Icons.check_circle_rounded : Icons.cancel_rounded,
+                        color: row['is_active'] != false ? Colors.green : Colors.red,
+                      ),
+                    ),
+                  ),
+            const SizedBox(height: 16),
+            Text('آخر الإشعارات', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            if (data.queue.isEmpty)
+              const EmptyState(icon: Icons.notifications_none_rounded, text: 'لا توجد إشعارات في الطابور')
+            else
+              ...data.queue.map(
+                (row) {
+                  final status = row['status'] as String? ?? 'pending';
+                  final color = status == 'sent'
+                      ? Colors.green
+                      : status == 'failed'
+                          ? Colors.red
+                          : accentColor;
+                  return Card(
+                    child: ListTile(
+                      leading: Icon(Icons.notifications_rounded, color: color),
+                      title: Text(row['title'] as String? ?? '-'),
+                      subtitle: Text(
+                        [
+                          row['body'] as String? ?? '',
+                          if (row['error_message'] != null) 'الخطأ: ${row['error_message']}',
+                        ].where((value) => value.isNotEmpty).join('\n'),
+                      ),
+                      trailing: Text(status),
+                    ),
+                  );
+                },
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class NotificationDiagnosticsData {
+  NotificationDiagnosticsData({required this.tokens, required this.queue});
+
+  final List<Map<String, dynamic>> tokens;
+  final List<Map<String, dynamic>> queue;
 }
 
 class ProfilePage extends StatefulWidget {
@@ -2279,7 +2437,7 @@ class _TransfersPageState extends State<TransfersPage> {
       if (widget.session.isBranchManager) {
         return fromBranch == widget.session.branchNum || toBranch == widget.session.branchNum;
       }
-      return row['requested_by'] == widget.session.id;
+      return row['requested_by'] == widget.session.id || toBranch == widget.session.branchNum;
     }).where((row) {
       final status = row['status'] as String? ?? 'submitted';
       final completed = {'completed', 'cancelled', 'rejected'}.contains(status);
@@ -2330,15 +2488,14 @@ class _TransfersPageState extends State<TransfersPage> {
       'new_status': 'submitted',
       'note': 'تم إنشاء الطلب من التطبيق',
     });
-    await enqueueNotification(
+    unawaited(enqueueNotification(
       title: 'مناقلة جديدة',
       body:
           'طلب مناقلة من ${branchLabel(data.branches, widget.session.branchNum)} إلى ${branchLabel(data.branches, result.toBranch)}',
       branchNum: result.toBranch,
       data: {'type': 'transfer_created', 'order_id': inserted['id']},
-    );
-    await Future.delayed(const Duration(milliseconds: 350));
-    setState(() => future = loadTransfers());
+    ));
+    if (mounted) setState(() => future = loadTransfers());
   }
 
   Future<void> updateOrderStatus(Map<String, dynamic> order) async {
@@ -2365,14 +2522,13 @@ class _TransfersPageState extends State<TransfersPage> {
       'old_status': order['status'],
       'new_status': status,
     });
-    await enqueueNotification(
+    unawaited(enqueueNotification(
       title: 'تحديث مناقلة',
       body: 'تم تحديث حالة المناقلة رقم ${order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
       branchNum: (order['from_branch_num'] as num?)?.toInt(),
       data: {'type': 'transfer_updated', 'order_id': order['id'], 'status': status},
-    );
-    await Future.delayed(const Duration(milliseconds: 350));
-    setState(() => future = loadTransfers());
+    ));
+    if (mounted) setState(() => future = loadTransfers());
   }
 
   Future<void> openOrderDetails(Map<String, dynamic> order, TransferData data) async {
@@ -2563,12 +2719,12 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       'item_status': status,
       'approved_quantity': approved,
     }).eq('id', item['id']);
-    await enqueueNotification(
+    unawaited(enqueueNotification(
       title: 'تحديث بند مناقلة',
       body: 'تم تحديث بند في طلب المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${itemStatusLabel(status)}',
       branchNum: (widget.order['from_branch_num'] as num?)?.toInt(),
       data: {'type': 'transfer_item_updated', 'order_id': widget.order['id']},
-    );
+    ));
     setState(() => future = loadItems());
   }
 
@@ -2585,12 +2741,12 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       if (status == 'approved') 'approved_at': DateTime.now().toUtc().toIso8601String(),
       if (status == 'completed') 'completed_at': DateTime.now().toUtc().toIso8601String(),
     }).eq('id', widget.order['id']);
-    await enqueueNotification(
+    unawaited(enqueueNotification(
       title: 'تحديث مناقلة',
       body: 'تم تحديث حالة المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
       branchNum: (widget.order['from_branch_num'] as num?)?.toInt(),
       data: {'type': 'transfer_updated', 'order_id': widget.order['id'], 'status': status},
-    );
+    ));
     if (mounted) Navigator.pop(context);
   }
 
@@ -3117,12 +3273,12 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     await supabase
         .from('ansar_chat_threads')
         .update({'updated_at': DateTime.now().toUtc().toIso8601String()}).eq('id', widget.thread['id']);
-    await enqueueChatNotification(
+    setState(() => future = loadMessages());
+    unawaited(enqueueChatNotification(
       thread: widget.thread,
       sender: widget.session,
       body: body.length > 80 ? '${body.substring(0, 80)}...' : body,
-    );
-    setState(() => future = loadMessages());
+    ));
   }
 
   Future<void> deleteMessage(Map<String, dynamic> row) async {
@@ -3840,6 +3996,7 @@ Future<void> enqueueNotification({
       'data': data,
       'status': 'pending',
     });
+    unawaited(kickNotificationSender());
   } catch (_) {
     // Notifications are helpful, but core workflow should not fail if queue policies are not ready.
   }
@@ -3865,8 +4022,17 @@ Future<void> enqueueNotificationsForEmployees({
                   })
               .toList(),
         );
+    unawaited(kickNotificationSender());
   } catch (_) {
     // Notifications are helpful, but core workflow should not fail if queue policies are not ready.
+  }
+}
+
+Future<void> kickNotificationSender() async {
+  try {
+    await supabase.functions.invoke('send-notifications', body: {'source': 'app'});
+  } catch (_) {
+    // The scheduled sender will retry pending notifications if the immediate kick fails.
   }
 }
 

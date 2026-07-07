@@ -43,6 +43,9 @@ serve(async () => {
     try {
       const tokens = await getTargetTokens(item);
       const uniqueTokens = dedupeByToken(tokens);
+      if (uniqueTokens.length === 0) {
+        throw new Error("No active device tokens matched this notification");
+      }
       const results = await Promise.allSettled(
         uniqueTokens.map((device) => sendToDevice(accessToken, item, device)),
       );
