@@ -59,7 +59,10 @@ serve(async () => {
 
       const rejected = results.filter((result) => result.status === "rejected");
       if (rejected.length > 0 && rejected.length === results.length && results.length > 0) {
-        throw new Error(String(rejected[0].reason));
+        const allUnregistered = rejected.every((result) => String(result.reason).includes("UNREGISTERED"));
+        if (!allUnregistered) {
+          throw new Error(String(rejected[0].reason));
+        }
       }
 
       await markQueueItem(item.id, "sent");

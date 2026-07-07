@@ -26,6 +26,7 @@ Map<int, String>? cachedBarcodes;
 String? lastNotificationTokenPreview;
 String? lastNotificationRegistrationError;
 DateTime? lastNotificationRegistrationAt;
+StreamSubscription<String>? notificationTokenRefreshSubscription;
 
 const brandColor = Color(0xff087568);
 const accentColor = Color(0xffc9952f);
@@ -331,13 +332,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   late EmployeeSession session;
   int index = 0;
   StreamSubscription<RemoteMessage>? foregroundMessages;
+  Timer? notificationRegistrationTimer;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     session = widget.initialSession;
-    registerDeviceForNotifications(session);
+    startNotificationRegistrationMonitor();
     foregroundMessages = FirebaseMessaging.onMessage.listen((message) {
       if (!mounted) return;
       final title = message.notification?.title ?? 'إشعار جديد';
@@ -350,19 +352,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void updateSession(EmployeeSession value) {
     setState(() => session = value);
+    startNotificationRegistrationMonitor();
+  }
+
+  void startNotificationRegistrationMonitor() {
+    notificationRegistrationTimer?.cancel();
+    unawaited(registerDeviceForNotifications(session));
+    notificationRegistrationTimer = Timer.periodic(const Duration(seconds: 45), (_) {
+      registerDeviceForNotifications(session);
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     foregroundMessages?.cancel();
+    notificationRegistrationTimer?.cancel();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      registerDeviceForNotifications(session);
+      startNotificationRegistrationMonitor();
     }
   }
 
@@ -2249,6 +2261,12 @@ class _NotificationDiagnosticsPageState extends State<NotificationDiagnosticsPag
                   ].join('\n'),
                 ),
               ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'ملاحظة: التطبيق يحاول تسجيل أجهزة المستخدمين تلقائياً بعد تسجيل الدخول وأثناء فتح التطبيق.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.black54),
             ),
             const SizedBox(height: 16),
             Text('آخر الأجهزة', style: Theme.of(context).textTheme.titleMedium),
@@ -4167,11 +4185,14 @@ Future<void> registerDeviceForNotifications(EmployeeSession session) async {
     final token = await getMessagingTokenWithRecovery(messaging);
     await saveDeviceToken(session, token);
 
-    FirebaseMessaging.instance.onTokenRefresh.listen((newToken) async {
+    await notificationTokenRefreshSubscription?.cancel();
+    notificationTokenRefreshSubscription = FirebaseMessaging.instance.onTokenRefresh.listen((newToken) async {
       await saveDeviceToken(session, newToken);
     });
   } catch (error) {
-    lastNotificationRegistrationError = cleanError(error);
+    lastNotificationRegistrationError = isTemporaryMessagingServiceError(error)
+        ? 'خدمة إشعارات الهاتف غير متاحة مؤقتاً، سيحاول التطبيق تلقائياً'
+        : cleanError(error);
     lastNotificationRegistrationAt = DateTime.now();
     // Push setup should never block login or daily work.
   }
@@ -4211,13 +4232,20 @@ Future<void> resetAndRegisterDeviceForNotifications(EmployeeSession session) asy
     final token = await getMessagingTokenWithRecovery(messaging);
     await saveDeviceToken(session, token);
   } catch (error) {
-    lastNotificationRegistrationError = cleanError(error);
+    lastNotificationRegistrationError = isTemporaryMessagingServiceError(error)
+        ? 'خدمة إشعارات الهاتف غير متاحة مؤقتاً، سيحاول التطبيق تلقائياً'
+        : cleanError(error);
     lastNotificationRegistrationAt = DateTime.now();
   }
 }
 
 bool isTooManyRegistrationsError(Object error) {
   return error.toString().contains('TOO_MANY_REGISTRATIONS');
+}
+
+bool isTemporaryMessagingServiceError(Object error) {
+  final text = error.toString();
+  return text.contains('SERVICE_NOT_AVAILABLE') || text.contains('java.io.IOException');
 }
 
 Future<void> saveDeviceToken(EmployeeSession session, String token) async {
