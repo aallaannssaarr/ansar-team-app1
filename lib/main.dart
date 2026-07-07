@@ -183,6 +183,7 @@ class EmployeeDuration {
 class DashboardData {
   DashboardData({
     required this.movements,
+    required this.branchStatuses,
     required this.activeNow,
     required this.checkedInToday,
     required this.openLog,
@@ -190,10 +191,25 @@ class DashboardData {
   });
 
   final List<Movement> movements;
+  final List<BranchStatus> branchStatuses;
   final int activeNow;
   final int checkedInToday;
   final Map<String, dynamic>? openLog;
   final String branchName;
+}
+
+class BranchStatus {
+  BranchStatus({
+    required this.branchNum,
+    required this.branchName,
+    required this.activeEmployees,
+  });
+
+  final int branchNum;
+  final String branchName;
+  final List<EmployeeLite> activeEmployees;
+
+  bool get isOpen => activeEmployees.isNotEmpty;
 }
 
 class ReportData {
@@ -498,6 +514,7 @@ class _DashboardPageState extends State<DashboardPage> {
   late Future<DashboardData> future;
   Timer? timer;
   bool attendanceBusy = false;
+  bool movementsExpanded = false;
 
   @override
   void initState() {
@@ -516,7 +533,11 @@ class _DashboardPageState extends State<DashboardPage> {
 
   Future<DashboardData> loadDashboard() async {
     final branches = await loadAppBranchesMap();
-    final employees = await loadEmployeesForScope(widget.session, includeInactive: false);
+    final employeeRows = await supabase
+        .from('ansar_employees')
+        .select('id, display_name, full_name, username, branch_num, role, is_active')
+        .eq('is_active', true);
+    final employees = employeeRows.cast<Map<String, dynamic>>().map(EmployeeLite.fromRow).toList();
     final employeeById = {for (final employee in employees) employee.id: employee};
     final employeeIds = employeeById.keys.toSet();
     Map<String, dynamic>? myOpenLog;
@@ -526,12 +547,30 @@ class _DashboardPageState extends State<DashboardPage> {
         .select()
         .order('check_in_at', ascending: false)
         .limit(80);
+    final openRows = await supabase
+        .from('ansar_attendance_logs')
+        .select()
+        .eq('status', 'open')
+        .order('check_in_at', ascending: false);
 
     final now = DateTime.now();
     final todayKey = formatDateKey(now);
     final movements = <Movement>[];
     final activeEmployees = <String>{};
     final checkedInToday = <String>{};
+    final activeByBranch = <int, Set<String>>{};
+
+    for (final row in openRows.cast<Map<String, dynamic>>()) {
+      final employeeId = row['employee_id'] as String?;
+      if (employeeId == null || !employeeIds.contains(employeeId)) continue;
+      final employee = employeeById[employeeId]!;
+      final branchNum = (row['branch_num'] as num?)?.toInt() ?? employee.branchNum;
+      activeEmployees.add(employeeId);
+      activeByBranch.putIfAbsent(branchNum, () => <String>{}).add(employeeId);
+      if (employeeId == widget.session.id) {
+        myOpenLog ??= row;
+      }
+    }
 
     for (final row in rows) {
       final employeeId = row['employee_id'] as String?;
@@ -541,12 +580,7 @@ class _DashboardPageState extends State<DashboardPage> {
       final branchName = branchLabel(branches, branchNum);
       final checkInValue = row['check_in_at'] as String?;
       final checkOutValue = row['check_out_at'] as String?;
-      final status = row['status'] as String? ?? '';
 
-      if (status == 'open') activeEmployees.add(employeeId);
-      if (employeeId == widget.session.id && status == 'open') {
-        myOpenLog ??= row;
-      }
       if (checkInValue != null) {
         final checkIn = DateTime.parse(checkInValue).toLocal();
         if (formatDateKey(checkIn) == todayKey) checkedInToday.add(employeeId);
@@ -568,8 +602,23 @@ class _DashboardPageState extends State<DashboardPage> {
     }
 
     movements.sort((a, b) => b.time.compareTo(a.time));
+    final branchStatuses = branches.values.map((branch) {
+      final activeIds = activeByBranch[branch.number] ?? <String>{};
+      final active = activeIds.map((id) => employeeById[id]).whereType<EmployeeLite>().toList()
+        ..sort((a, b) => a.name.compareTo(b.name));
+      return BranchStatus(
+        branchNum: branch.number,
+        branchName: branch.name,
+        activeEmployees: active,
+      );
+    }).toList()
+      ..sort((a, b) {
+        if (a.isOpen != b.isOpen) return a.isOpen ? -1 : 1;
+        return a.branchName.compareTo(b.branchName);
+      });
     return DashboardData(
       movements: movements.take(30).toList(),
+      branchStatuses: branchStatuses,
       activeNow: activeEmployees.length,
       checkedInToday: checkedInToday.length,
       openLog: myOpenLog,
@@ -630,7 +679,11 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   Widget build(BuildContext context) {
     return RefreshIndicator(
-      onRefresh: () async => setState(() => future = loadDashboard()),
+      onRefresh: () {
+        final refreshed = loadDashboard();
+        setState(() => future = refreshed);
+        return refreshed.then((_) {});
+      },
       child: FutureBuilder<DashboardData>(
         future: future,
         builder: (context, snapshot) {
@@ -731,21 +784,41 @@ class _DashboardPageState extends State<DashboardPage> {
                 ],
               ),
               const SizedBox(height: 16),
-              SectionHeader(
-                title: 'آخر الحركات',
-                action: IconButton(
-                  tooltip: 'تحديث',
-                  onPressed: () => setState(() => future = loadDashboard()),
-                  icon: const Icon(Icons.refresh_rounded),
+              const SectionHeader(title: 'حالة الفروع الآن'),
+              if (data.branchStatuses.isEmpty)
+                const EmptyState(icon: Icons.storefront_rounded, text: 'لا توجد فروع مسجلة')
+              else
+                ...data.branchStatuses.map((branch) => BranchStatusCard(branch: branch)),
+              const SizedBox(height: 16),
+              Card(
+                child: ExpansionTile(
+                  initiallyExpanded: movementsExpanded,
+                  onExpansionChanged: (value) => setState(() => movementsExpanded = value),
+                  leading: const Icon(Icons.history_rounded),
+                  title: const Text('آخر الحركات', style: TextStyle(fontWeight: FontWeight.bold)),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        tooltip: 'تحديث',
+                        onPressed: () => setState(() => future = loadDashboard()),
+                        icon: const Icon(Icons.refresh_rounded),
+                      ),
+                      Icon(movementsExpanded ? Icons.expand_less_rounded : Icons.expand_more_rounded),
+                    ],
+                  ),
+                  childrenPadding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+                  children: [
+                    if (data.movements.isEmpty)
+                      const EmptyState(
+                        icon: Icons.event_busy_rounded,
+                        text: 'لا توجد حركات دوام بعد',
+                      )
+                    else
+                      ...data.movements.map((movement) => MovementTile(movement: movement)),
+                  ],
                 ),
               ),
-              if (data.movements.isEmpty)
-                const EmptyState(
-                  icon: Icons.event_busy_rounded,
-                  text: 'لا توجد حركات دوام بعد',
-                )
-              else
-                ...data.movements.map((movement) => MovementTile(movement: movement)),
             ],
           );
         },
@@ -4368,6 +4441,62 @@ class MovementTile extends StatelessWidget {
         ),
         title: Text('${movement.employee.name} - ${movement.type}'),
         subtitle: Text('${movement.branchName} · ${formatDateTime(movement.time)}'),
+      ),
+    );
+  }
+}
+
+class BranchStatusCard extends StatelessWidget {
+  const BranchStatusCard({super.key, required this.branch});
+
+  final BranchStatus branch;
+
+  @override
+  Widget build(BuildContext context) {
+    final open = branch.isOpen;
+    final count = branch.activeEmployees.length;
+    final names = branch.activeEmployees.take(3).map((employee) => employee.name).join('، ');
+    final extra = count > 3 ? ' و${count - 3} آخرين' : '';
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Row(
+          children: [
+            CircleAvatar(
+              radius: 24,
+              backgroundColor: open ? brandColor.withOpacity(0.12) : Colors.grey.shade100,
+              child: Icon(
+                open ? Icons.storefront_rounded : Icons.storefront_outlined,
+                color: open ? brandColor : Colors.grey,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(branch.branchName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  const SizedBox(height: 4),
+                  Text(
+                    open
+                        ? 'مفتوح الآن · ${count == 1 ? 'موظف واحد' : '$count موظفين'}'
+                        : 'مغلق الآن · لا يوجد موظفون داخل الفرع',
+                    style: TextStyle(color: open ? brandColor : Colors.black54),
+                  ),
+                  if (open && names.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text('$names$extra', style: const TextStyle(fontSize: 12, color: Colors.black54)),
+                  ],
+                ],
+              ),
+            ),
+            Chip(
+              avatar: Icon(open ? Icons.lock_open_rounded : Icons.lock_rounded, size: 16),
+              label: Text(open ? 'مفتوح' : 'مغلق'),
+              backgroundColor: open ? const Color(0xffe3f3ee) : Colors.grey.shade100,
+            ),
+          ],
+        ),
       ),
     );
   }
