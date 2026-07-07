@@ -12,12 +12,14 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Supabase.initialize(
     url: AnsarConfig.supabaseUrl,
-    publishableKey: AnsarConfig.supabaseAnonKey,
+    publishableKey: AnsarConfig.supabaseServiceKey,
   );
   runApp(const AnsarApp());
 }
 
 final supabase = Supabase.instance.client;
+List<Map<String, dynamic>>? cachedProducts;
+Map<int, String>? cachedBarcodes;
 
 const brandColor = Color(0xff087568);
 const accentColor = Color(0xffc9952f);
@@ -1035,42 +1037,7 @@ class _QueriesPageState extends State<QueriesPage> {
     final value = search.text.trim();
     if (value.isEmpty) return [];
 
-    final matNums = <int>{};
-    final numeric = int.tryParse(value);
-    if (numeric != null) matNums.add(numeric);
-
-    final barcodeRows = await supabase
-        .from('product_barcodes')
-        .select('mat_num')
-        .eq('barcode', value)
-        .limit(20);
-    for (final row in barcodeRows) {
-      final matNum = (row['mat_num'] as num?)?.toInt();
-      if (matNum != null) matNums.add(matNum);
-    }
-
-    final productRows = <Map<String, dynamic>>[];
-    if (matNums.isNotEmpty) {
-      final rows = await supabase
-          .from('products')
-          .select()
-          .inFilter('mat_num', matNums.toList())
-          .limit(30);
-      productRows.addAll(rows.cast<Map<String, dynamic>>());
-    }
-
-    final nameRows = await supabase
-        .from('products')
-        .select()
-        .ilike('name', '%$value%')
-        .limit(30);
-    for (final row in nameRows.cast<Map<String, dynamic>>()) {
-      final matNum = (row['mat_num'] as num?)?.toInt();
-      if (matNum == null) continue;
-      if (!productRows.any((product) => product['mat_num'] == matNum)) {
-        productRows.add(row);
-      }
-    }
+    final productRows = await searchProductsLikeLegacy(value, limit: 60);
 
     final branches = await loadBranchesMap();
     final results = <ProductResult>[];
@@ -1099,7 +1066,12 @@ class _QueriesPageState extends State<QueriesPage> {
   }
 
   void submitSearch() {
-    setState(() => future = queryMode == 0 ? runSearch() : runAccountsSearch());
+    setState(() {
+      if (queryMode == 0) future = runSearch();
+      if (queryMode == 1) future = runAccountsSearch();
+      if (queryMode == 2) future = runCashSummary();
+      if (queryMode == 3) future = runDailySales();
+    });
   }
 
   Future<List<Map<String, dynamic>>> runAccountsSearch() async {
@@ -1112,6 +1084,31 @@ class _QueriesPageState extends State<QueriesPage> {
     return rows.cast<Map<String, dynamic>>();
   }
 
+  Future<List<Map<String, dynamic>>> runCashSummary() async {
+    const cashBoxes = [181, 1872, 1873, 1876];
+    final rows = await supabase
+        .from('accounts')
+        .select('num, name, ras')
+        .inFilter('num', cashBoxes)
+        .order('num', ascending: true);
+    return rows.cast<Map<String, dynamic>>();
+  }
+
+  Future<List<Map<String, dynamic>>> runDailySales() async {
+    final today = DateTime.now();
+    final date = formatDateKey(today);
+    final rows = await supabase
+        .from('bills_full')
+        .select('book, bnum, date, accnum, totalvalue, remark, kind')
+        .eq('kind', 0)
+        .gte('date', date)
+        .lte('date', date)
+        .order('date', ascending: false)
+        .order('bnum', ascending: false)
+        .limit(80);
+    return rows.cast<Map<String, dynamic>>();
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListView(
@@ -1121,6 +1118,8 @@ class _QueriesPageState extends State<QueriesPage> {
           segments: const [
             ButtonSegment(value: 0, icon: Icon(Icons.menu_book_rounded), label: Text('الكتب والمخزون')),
             ButtonSegment(value: 1, icon: Icon(Icons.account_balance_wallet_rounded), label: Text('الحسابات')),
+            ButtonSegment(value: 2, icon: Icon(Icons.payments_rounded), label: Text('الصناديق')),
+            ButtonSegment(value: 3, icon: Icon(Icons.receipt_long_rounded), label: Text('مبيعات اليوم')),
           ],
           selected: {queryMode},
           onSelectionChanged: (value) {
@@ -1179,7 +1178,7 @@ class _QueriesPageState extends State<QueriesPage> {
               return Column(children: results.map((result) => ProductResultCard(result: result)).toList());
             },
           )
-        else
+        else if (queryMode == 1)
           FutureBuilder<List<Map<String, dynamic>>>(
             future: future as Future<List<Map<String, dynamic>>>,
             builder: (context, snapshot) {
@@ -1205,6 +1204,67 @@ class _QueriesPageState extends State<QueriesPage> {
                           title: Text(account['name'] as String? ?? 'بدون اسم'),
                           subtitle: Text('رقم ${account['num']} · رصيد ${account['ras'] ?? '-'}'),
                           trailing: Text('${account['owner'] ?? ''}'),
+                        ),
+                      ),
+                    )
+                    .toList(),
+              );
+            },
+          )
+        else if (queryMode == 2)
+          FutureBuilder<List<Map<String, dynamic>>>(
+            future: future as Future<List<Map<String, dynamic>>>,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState != ConnectionState.done) {
+                return const Center(child: Padding(
+                  padding: EdgeInsets.all(24),
+                  child: CircularProgressIndicator(),
+                ));
+              }
+              if (snapshot.hasError) return ErrorState(message: cleanError(snapshot.error), onRetry: submitSearch);
+              final rows = snapshot.data!;
+              final total = rows.fold<double>(0, (sum, row) => sum + ((row['ras'] as num?)?.toDouble() ?? 0));
+              return Column(
+                children: [
+                  StatTile(title: 'إجمالي الصناديق', value: total.toStringAsFixed(0), icon: Icons.payments_rounded, color: brandColor),
+                  ...rows.map((box) => Card(
+                        child: ListTile(
+                          leading: const CircleAvatar(child: Icon(Icons.point_of_sale_rounded)),
+                          title: Text(box['name'] as String? ?? 'صندوق ${box['num']}'),
+                          subtitle: Text('رقم ${box['num']}'),
+                          trailing: Text('${box['ras'] ?? 0}'),
+                        ),
+                      )),
+                ],
+              );
+            },
+          )
+        else
+          FutureBuilder<List<Map<String, dynamic>>>(
+            future: future as Future<List<Map<String, dynamic>>>,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState != ConnectionState.done) {
+                return const Center(child: Padding(
+                  padding: EdgeInsets.all(24),
+                  child: CircularProgressIndicator(),
+                ));
+              }
+              if (snapshot.hasError) {
+                return ErrorState(message: cleanError(snapshot.error), onRetry: submitSearch);
+              }
+              final results = snapshot.data!;
+              if (results.isEmpty) {
+                return const EmptyState(icon: Icons.search_off_rounded, text: 'لا توجد مبيعات اليوم');
+              }
+              return Column(
+                children: results
+                    .map(
+                      (bill) => Card(
+                        child: ListTile(
+                          leading: const CircleAvatar(child: Icon(Icons.receipt_long_rounded)),
+                          title: Text('فاتورة ${bill['bnum']} · دفتر ${bill['book']}'),
+                          subtitle: Text('حساب ${bill['accnum']} · ${bill['date']}'),
+                          trailing: Text('${bill['totalvalue'] ?? 0}'),
                         ),
                       ),
                     )
@@ -2359,36 +2419,7 @@ class _TransferDialogState extends State<TransferDialog> {
     }
     setState(() => searching = true);
     try {
-      final found = <Map<String, dynamic>>[];
-      final matNums = <int>{};
-      final numeric = int.tryParse(query);
-      if (numeric != null) matNums.add(numeric);
-      final barcodeRows = await supabase
-          .from('product_barcodes')
-          .select('mat_num')
-          .eq('barcode', query)
-          .limit(10);
-      for (final row in barcodeRows.cast<Map<String, dynamic>>()) {
-        final matNum = (row['mat_num'] as num?)?.toInt();
-        if (matNum != null) matNums.add(matNum);
-      }
-      if (matNums.isNotEmpty) {
-        final rows = await supabase
-            .from('products')
-            .select('mat_num, name, quantity')
-            .inFilter('mat_num', matNums.toList())
-            .limit(10);
-        found.addAll(rows.cast<Map<String, dynamic>>());
-      }
-      final rows = await supabase
-          .from('products')
-          .select('mat_num, name, quantity')
-          .ilike('name', '%$query%')
-          .limit(12);
-      for (final row in rows.cast<Map<String, dynamic>>()) {
-        final matNum = row['mat_num'];
-        if (!found.any((item) => item['mat_num'] == matNum)) found.add(row);
-      }
+      final found = await searchProductsLikeLegacy(query, limit: 12);
       if (mounted) {
         setState(() {
           suggestions = found;
@@ -2699,11 +2730,26 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   final message = TextEditingController();
   late Future<List<Map<String, dynamic>>> future;
   Timer? timer;
+  RealtimeChannel? channel;
 
   @override
   void initState() {
     super.initState();
     future = loadMessages();
+    channel = supabase.channel('chat-thread-${widget.thread['id']}')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_chat_messages',
+        filter: PostgresChangeFilter(
+          type: PostgresChangeFilterType.eq,
+          column: 'thread_id',
+          value: widget.thread['id'],
+        ),
+        callback: (_) {
+          if (mounted) setState(() => future = loadMessages());
+        },
+      ).subscribe();
     timer = Timer.periodic(const Duration(seconds: 4), (_) {
       if (mounted) setState(() => future = loadMessages());
     });
@@ -2712,6 +2758,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   @override
   void dispose() {
     timer?.cancel();
+    if (channel != null) supabase.removeChannel(channel!);
     message.dispose();
     super.dispose();
   }
@@ -3205,6 +3252,107 @@ Future<Map<int, BranchOption>> loadBranchesMap() async {
     // The app can still read legacy branches before ansar_branches is created.
   }
   return branches;
+}
+
+Future<List<Map<String, dynamic>>> loadAllProductsCached() async {
+  if (cachedProducts != null) return cachedProducts!;
+  final all = <Map<String, dynamic>>[];
+  var from = 0;
+  const pageSize = 1000;
+  while (true) {
+    final rows = await supabase
+        .from('products')
+        .select()
+        .range(from, from + pageSize - 1);
+    final page = rows.cast<Map<String, dynamic>>();
+    all.addAll(page);
+    if (page.length < pageSize) break;
+    from += pageSize;
+  }
+  final unique = <int, Map<String, dynamic>>{};
+  for (final product in all) {
+    final matNum = (product['mat_num'] as num?)?.toInt();
+    if (matNum != null) unique.putIfAbsent(matNum, () => product);
+  }
+  cachedProducts = unique.values.toList();
+  return cachedProducts!;
+}
+
+Future<Map<int, String>> loadAllBarcodesCached() async {
+  if (cachedBarcodes != null) return cachedBarcodes!;
+  final all = <Map<String, dynamic>>[];
+  var from = 0;
+  const pageSize = 1000;
+  while (true) {
+    final rows = await supabase
+        .from('product_barcodes')
+        .select('mat_num, barcode')
+        .range(from, from + pageSize - 1);
+    final page = rows.cast<Map<String, dynamic>>();
+    all.addAll(page);
+    if (page.length < pageSize) break;
+    from += pageSize;
+  }
+  final map = <int, String>{};
+  for (final row in all) {
+    final matNum = (row['mat_num'] as num?)?.toInt();
+    final barcode = row['barcode'] as String?;
+    if (matNum != null && barcode != null && barcode.isNotEmpty) {
+      map[matNum] = barcode;
+    }
+  }
+  cachedBarcodes = map;
+  return map;
+}
+
+Future<List<Map<String, dynamic>>> searchProductsLikeLegacy(
+  String query, {
+  required int limit,
+}) async {
+  final products = await loadAllProductsCached();
+  final barcodes = await loadAllBarcodesCached();
+  final normalized = normalizeSearch(query);
+  final words = normalized.split(RegExp(r'\s+')).where((word) => word.isNotEmpty).toList();
+  final scored = <({Map<String, dynamic> product, double score})>[];
+  for (final product in products) {
+    final score = productSearchScore(product, normalized, words, barcodes);
+    if (score > 0) scored.add((product: product, score: score));
+  }
+  scored.sort((a, b) => b.score.compareTo(a.score));
+  return scored.take(limit).map((item) => item.product).toList();
+}
+
+double productSearchScore(
+  Map<String, dynamic> product,
+  String query,
+  List<String> words,
+  Map<int, String> barcodes,
+) {
+  final matNum = (product['mat_num'] as num?)?.toInt();
+  final matText = matNum?.toString() ?? '';
+  final name = normalizeSearch(product['name'] as String? ?? '');
+  final barcode = matNum == null ? '' : (barcodes[matNum] ?? '');
+  if (query.isEmpty) return 0;
+  if (matText == query) return 120;
+  if (barcode == query) return 120;
+  if (name == query) return 110;
+  if (words.isNotEmpty && words.every(name.contains)) return 100;
+  if (matText.contains(query)) return 90;
+  if (barcode.contains(query)) return 85;
+  final matchedWords = words.where(name.contains).length;
+  if (matchedWords > 0) return 70 * matchedWords / words.length;
+  return 0;
+}
+
+String normalizeSearch(String value) {
+  return value
+      .toLowerCase()
+      .replaceAll('أ', 'ا')
+      .replaceAll('إ', 'ا')
+      .replaceAll('آ', 'ا')
+      .replaceAll('ة', 'ه')
+      .replaceAll('ى', 'ي')
+      .trim();
 }
 
 Future<List<EmployeeLite>> loadEmployeesForScope(
