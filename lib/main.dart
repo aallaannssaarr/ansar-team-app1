@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:fl_chart/fl_chart.dart';
@@ -396,11 +397,21 @@ class DashboardPage extends StatefulWidget {
 
 class _DashboardPageState extends State<DashboardPage> {
   late Future<DashboardData> future;
+  Timer? timer;
 
   @override
   void initState() {
     super.initState();
     future = loadDashboard();
+    timer = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (mounted) setState(() => future = loadDashboard());
+    });
+  }
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    super.dispose();
   }
 
   Future<DashboardData> loadDashboard() async {
@@ -473,7 +484,9 @@ class _DashboardPageState extends State<DashboardPage> {
       'check_in_at': DateTime.now().toUtc().toIso8601String(),
       'status': 'open',
     });
-    if (mounted) setState(() => future = loadDashboard());
+    if (mounted) {
+      setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadDashboard()));
+    }
   }
 
   Future<void> checkOut(Map<String, dynamic> openLog) async {
@@ -481,7 +494,9 @@ class _DashboardPageState extends State<DashboardPage> {
       'check_out_at': DateTime.now().toUtc().toIso8601String(),
       'status': 'closed',
     }).eq('id', openLog['id']);
-    if (mounted) setState(() => future = loadDashboard());
+    if (mounted) {
+      setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadDashboard()));
+    }
   }
 
   @override
@@ -1013,7 +1028,8 @@ class QueriesPage extends StatefulWidget {
 
 class _QueriesPageState extends State<QueriesPage> {
   final search = TextEditingController();
-  Future<List<ProductResult>>? future;
+  Future<Object>? future;
+  int queryMode = 0;
 
   Future<List<ProductResult>> runSearch() async {
     final value = search.text.trim();
@@ -1083,7 +1099,17 @@ class _QueriesPageState extends State<QueriesPage> {
   }
 
   void submitSearch() {
-    setState(() => future = runSearch());
+    setState(() => future = queryMode == 0 ? runSearch() : runAccountsSearch());
+  }
+
+  Future<List<Map<String, dynamic>>> runAccountsSearch() async {
+    final value = search.text.trim();
+    if (value.isEmpty) return [];
+    final numeric = int.tryParse(value);
+    final rows = numeric == null
+        ? await supabase.from('accounts').select('num, name, ras, owner').ilike('name', '%$value%').limit(40)
+        : await supabase.from('accounts').select('num, name, ras, owner').eq('num', numeric).limit(40);
+    return rows.cast<Map<String, dynamic>>();
   }
 
   @override
@@ -1091,6 +1117,21 @@ class _QueriesPageState extends State<QueriesPage> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        SegmentedButton<int>(
+          segments: const [
+            ButtonSegment(value: 0, icon: Icon(Icons.menu_book_rounded), label: Text('الكتب والمخزون')),
+            ButtonSegment(value: 1, icon: Icon(Icons.account_balance_wallet_rounded), label: Text('الحسابات')),
+          ],
+          selected: {queryMode},
+          onSelectionChanged: (value) {
+            setState(() {
+              queryMode = value.first;
+              future = null;
+              search.clear();
+            });
+          },
+        ),
+        const SizedBox(height: 12),
         Card(
           child: Padding(
             padding: const EdgeInsets.all(12),
@@ -1100,7 +1141,7 @@ class _QueriesPageState extends State<QueriesPage> {
                   child: TextField(
                     controller: search,
                     decoration: const InputDecoration(
-                      labelText: 'اسم الكتاب أو رقم المادة أو الباركود',
+                      labelText: 'اكتب كلمة البحث',
                       prefixIcon: Icon(Icons.search_rounded),
                     ),
                     onSubmitted: (_) => submitSearch(),
@@ -1118,9 +1159,9 @@ class _QueriesPageState extends State<QueriesPage> {
         const SizedBox(height: 12),
         if (future == null)
           const EmptyState(icon: Icons.manage_search_rounded, text: 'اكتب كلمة بحث لعرض الكتب والمخزون')
-        else
+        else if (queryMode == 0)
           FutureBuilder<List<ProductResult>>(
-            future: future,
+            future: future as Future<List<ProductResult>>,
             builder: (context, snapshot) {
               if (snapshot.connectionState != ConnectionState.done) {
                 return const Center(child: Padding(
@@ -1136,6 +1177,39 @@ class _QueriesPageState extends State<QueriesPage> {
                 return const EmptyState(icon: Icons.search_off_rounded, text: 'لا توجد نتائج مطابقة');
               }
               return Column(children: results.map((result) => ProductResultCard(result: result)).toList());
+            },
+          )
+        else
+          FutureBuilder<List<Map<String, dynamic>>>(
+            future: future as Future<List<Map<String, dynamic>>>,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState != ConnectionState.done) {
+                return const Center(child: Padding(
+                  padding: EdgeInsets.all(24),
+                  child: CircularProgressIndicator(),
+                ));
+              }
+              if (snapshot.hasError) {
+                return ErrorState(message: cleanError(snapshot.error), onRetry: submitSearch);
+              }
+              final results = snapshot.data!;
+              if (results.isEmpty) {
+                return const EmptyState(icon: Icons.search_off_rounded, text: 'لا توجد نتائج مطابقة');
+              }
+              return Column(
+                children: results
+                    .map(
+                      (account) => Card(
+                        child: ListTile(
+                          leading: const CircleAvatar(child: Icon(Icons.account_circle_rounded)),
+                          title: Text(account['name'] as String? ?? 'بدون اسم'),
+                          subtitle: Text('رقم ${account['num']} · رصيد ${account['ras'] ?? '-'}'),
+                          trailing: Text('${account['owner'] ?? ''}'),
+                        ),
+                      ),
+                    )
+                    .toList(),
+              );
             },
           ),
       ],
@@ -1307,7 +1381,7 @@ class _EmployeesPageState extends State<EmployeesPage> {
     } else {
       await supabase.from('ansar_employees').update(result).eq('id', employee['id']);
     }
-    setState(() => employeesFuture = loadEmployees());
+    setState(() => employeesFuture = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadEmployees()));
   }
 
   Future<void> disableEmployee(Map<String, dynamic> employee) async {
@@ -1318,7 +1392,7 @@ class _EmployeesPageState extends State<EmployeesPage> {
     );
     if (!confirmed) return;
     await supabase.from('ansar_employees').update({'is_active': false}).eq('id', employee['id']);
-    setState(() => employeesFuture = loadEmployees());
+    setState(() => employeesFuture = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadEmployees()));
   }
 
   @override
@@ -1524,7 +1598,7 @@ class _BranchesPageState extends State<BranchesPage> {
         'created_by': widget.session.id,
       });
     }
-    setState(() => future = loadBranchesMap());
+    setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadBranchesMap()));
   }
 
   Future<void> deleteBranch(BranchOption branch) async {
@@ -1540,7 +1614,7 @@ class _BranchesPageState extends State<BranchesPage> {
       'is_active': false,
       'created_by': widget.session.id,
     });
-    setState(() => future = loadBranchesMap());
+    setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadBranchesMap()));
   }
 
   @override
@@ -1731,7 +1805,7 @@ class _ProfilePageState extends State<ProfilePage> {
       final publicUrl = supabase.storage.from('ansar-avatars').getPublicUrl(path);
       await saveProfile(avatarUrl: publicUrl, avatarPath: path);
     } catch (e) {
-      setState(() => message = 'تعذر رفع الصورة: ${cleanError(e)}');
+      setState(() => message = 'تعذر رفع الصورة. نفذ ملف docs/ansar-storage-policies.sql ثم حاول مجددا. ${cleanError(e)}');
     } finally {
       if (mounted) setState(() => saving = false);
     }
@@ -1795,6 +1869,7 @@ class TransfersPage extends StatefulWidget {
 
 class _TransfersPageState extends State<TransfersPage> {
   late Future<TransferData> future;
+  bool showHistory = false;
 
   @override
   void initState() {
@@ -1811,7 +1886,7 @@ class _TransfersPageState extends State<TransfersPage> {
         .select()
         .order('created_at', ascending: false)
         .limit(60);
-    final visible = rows.where((row) {
+    final visible = rows.cast<Map<String, dynamic>>().where((row) {
       if (widget.session.isAdmin) return true;
       final fromBranch = (row['from_branch_num'] as num?)?.toInt();
       final toBranch = (row['to_branch_num'] as num?)?.toInt();
@@ -1819,6 +1894,10 @@ class _TransfersPageState extends State<TransfersPage> {
         return fromBranch == widget.session.branchNum || toBranch == widget.session.branchNum;
       }
       return row['requested_by'] == widget.session.id;
+    }).where((row) {
+      final status = row['status'] as String? ?? 'submitted';
+      final completed = {'completed', 'cancelled', 'rejected'}.contains(status);
+      return showHistory ? completed : !completed;
     }).toList();
     return TransferData(branches: branches, employees: employeeById, orders: visible);
   }
@@ -1865,10 +1944,22 @@ class _TransfersPageState extends State<TransfersPage> {
       'new_status': 'submitted',
       'note': 'تم إنشاء الطلب من التطبيق',
     });
+    await enqueueNotification(
+      title: 'مناقلة جديدة',
+      body:
+          'طلب مناقلة من ${branchLabel(data.branches, widget.session.branchNum)} إلى ${branchLabel(data.branches, result.toBranch)}',
+      data: {'type': 'transfer_created', 'order_id': inserted['id']},
+    );
+    await Future.delayed(const Duration(milliseconds: 350));
     setState(() => future = loadTransfers());
   }
 
   Future<void> updateOrderStatus(Map<String, dynamic> order) async {
+    final toBranch = (order['to_branch_num'] as num?)?.toInt();
+    if (!widget.session.isAdmin && toBranch != widget.session.branchNum) {
+      showSnack(context, 'تعديل الحالة متاح فقط لموظفي الفرع المطلوب منه المناقلة');
+      return;
+    }
     final status = await showDialog<String>(
       context: context,
       builder: (_) => StatusDialog(current: order['status'] as String? ?? 'submitted'),
@@ -1887,7 +1978,29 @@ class _TransfersPageState extends State<TransfersPage> {
       'old_status': order['status'],
       'new_status': status,
     });
+    await enqueueNotification(
+      title: 'تحديث مناقلة',
+      body: 'تم تحديث حالة المناقلة رقم ${order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
+      data: {'type': 'transfer_updated', 'order_id': order['id'], 'status': status},
+    );
+    await Future.delayed(const Duration(milliseconds: 350));
     setState(() => future = loadTransfers());
+  }
+
+  Future<void> openOrderDetails(Map<String, dynamic> order, TransferData data) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: TransferDetailsPage(
+            session: widget.session,
+            order: order,
+            branches: data.branches,
+          ),
+        ),
+      ),
+    );
+    if (mounted) setState(() => future = loadTransfers());
   }
 
   @override
@@ -1906,17 +2019,38 @@ class _TransfersPageState extends State<TransfersPage> {
         }
         final data = snapshot.data!;
         return Scaffold(
-          body: data.orders.isEmpty
-              ? const EmptyState(icon: Icons.sync_alt_rounded, text: 'لا توجد مناقلات بعد')
-              : ListView.separated(
-                  padding: const EdgeInsets.all(16),
-                  itemCount: data.orders.length,
+          body: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                child: SegmentedButton<bool>(
+                  segments: const [
+                    ButtonSegment(value: false, icon: Icon(Icons.pending_actions_rounded), label: Text('نشطة')),
+                    ButtonSegment(value: true, icon: Icon(Icons.history_rounded), label: Text('السجل')),
+                  ],
+                  selected: {showHistory},
+                  onSelectionChanged: (value) => setState(() {
+                    showHistory = value.first;
+                    future = loadTransfers();
+                  }),
+                ),
+              ),
+              Expanded(
+                child: data.orders.isEmpty
+                    ? EmptyState(
+                        icon: Icons.sync_alt_rounded,
+                        text: showHistory ? 'لا توجد مناقلات مكتملة في السجل' : 'لا توجد مناقلات نشطة',
+                      )
+                    : ListView.separated(
+                        padding: const EdgeInsets.all(16),
+                        itemCount: data.orders.length,
                   separatorBuilder: (_, __) => const Divider(height: 1),
                   itemBuilder: (context, i) {
                     final order = data.orders[i];
                     final fromBranch = (order['from_branch_num'] as num?)?.toInt() ?? 0;
                     final toBranch = (order['to_branch_num'] as num?)?.toInt() ?? 0;
                     final requester = data.employees[order['requested_by']];
+                    final canHandle = widget.session.isAdmin || toBranch == widget.session.branchNum;
                     return Card(
                       child: ListTile(
                         leading: const CircleAvatar(child: Icon(Icons.inventory_2_rounded)),
@@ -1926,15 +2060,21 @@ class _TransfersPageState extends State<TransfersPage> {
                           '${requester?.name ?? 'موظف'} · ${statusLabel(order['status'] as String? ?? '')}',
                         ),
                         isThreeLine: true,
-                        trailing: IconButton(
-                          tooltip: 'تحديث الحالة',
-                          onPressed: () => updateOrderStatus(order),
-                          icon: const Icon(Icons.edit_note_rounded),
-                        ),
+                        onTap: () => openOrderDetails(order, data),
+                        trailing: canHandle
+                            ? IconButton(
+                                tooltip: 'تحديث الحالة',
+                                onPressed: () => updateOrderStatus(order),
+                                icon: const Icon(Icons.edit_note_rounded),
+                              )
+                            : const Icon(Icons.chevron_left_rounded),
                       ),
                     );
                   },
                 ),
+              ),
+            ],
+          ),
           floatingActionButton: FloatingActionButton.extended(
             onPressed: () => createOrder(data),
             icon: const Icon(Icons.add_rounded),
@@ -1942,6 +2082,213 @@ class _TransfersPageState extends State<TransfersPage> {
           ),
         );
       },
+    );
+  }
+}
+
+class TransferDetailsPage extends StatefulWidget {
+  const TransferDetailsPage({
+    super.key,
+    required this.session,
+    required this.order,
+    required this.branches,
+  });
+
+  final EmployeeSession session;
+  final Map<String, dynamic> order;
+  final Map<int, BranchOption> branches;
+
+  @override
+  State<TransferDetailsPage> createState() => _TransferDetailsPageState();
+}
+
+class _TransferDetailsPageState extends State<TransferDetailsPage> {
+  late Future<List<Map<String, dynamic>>> future;
+
+  bool get canHandle {
+    final toBranch = (widget.order['to_branch_num'] as num?)?.toInt();
+    return widget.session.isAdmin || toBranch == widget.session.branchNum;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    future = loadItems();
+  }
+
+  Future<List<Map<String, dynamic>>> loadItems() async {
+    final items = await supabase
+        .from('ansar_transfer_order_items')
+        .select()
+        .eq('order_id', widget.order['id'])
+        .order('created_at', ascending: true);
+    final result = items.cast<Map<String, dynamic>>();
+    final matNums = result
+        .map((row) => (row['mat_num'] as num?)?.toInt())
+        .whereType<int>()
+        .toList();
+    if (matNums.isEmpty) return result;
+    final products = await supabase
+        .from('products')
+        .select('mat_num, name, quantity')
+        .inFilter('mat_num', matNums);
+    final productByMat = {
+      for (final row in products.cast<Map<String, dynamic>>())
+        (row['mat_num'] as num).toInt(): row,
+    };
+    return result
+        .map((row) => {
+              ...row,
+              'product': productByMat[(row['mat_num'] as num?)?.toInt()],
+            })
+        .toList();
+  }
+
+  Future<void> updateItem(Map<String, dynamic> item, String status) async {
+    if (!canHandle) return;
+    final requested = (item['requested_quantity'] as num?)?.toDouble() ?? 0;
+    var approved = status == 'unavailable' ? 0.0 : requested;
+    if (status == 'partially_available') {
+      final controller = TextEditingController(text: requested.toStringAsFixed(0));
+      final value = await showDialog<double>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('الكمية المتوفرة'),
+          content: TextField(
+            controller: controller,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'أدخل الكمية المتوفرة'),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, double.tryParse(controller.text.trim()) ?? 0),
+              child: const Text('حفظ'),
+            ),
+          ],
+        ),
+      );
+      if (value == null) return;
+      approved = value;
+    }
+    await supabase.from('ansar_transfer_order_items').update({
+      'item_status': status,
+      'approved_quantity': approved,
+    }).eq('id', item['id']);
+    await enqueueNotification(
+      title: 'تحديث بند مناقلة',
+      body: 'تم تحديث بند في طلب المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${itemStatusLabel(status)}',
+      data: {'type': 'transfer_item_updated', 'order_id': widget.order['id']},
+    );
+    setState(() => future = loadItems());
+  }
+
+  Future<void> changeStatus() async {
+    if (!canHandle) return;
+    final status = await showDialog<String>(
+      context: context,
+      builder: (_) => StatusDialog(current: widget.order['status'] as String? ?? 'submitted'),
+    );
+    if (status == null) return;
+    await supabase.from('ansar_transfer_orders').update({
+      'status': status,
+      'handled_by': widget.session.id,
+      if (status == 'approved') 'approved_at': DateTime.now().toUtc().toIso8601String(),
+      if (status == 'completed') 'completed_at': DateTime.now().toUtc().toIso8601String(),
+    }).eq('id', widget.order['id']);
+    await enqueueNotification(
+      title: 'تحديث مناقلة',
+      body: 'تم تحديث حالة المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
+      data: {'type': 'transfer_updated', 'order_id': widget.order['id'], 'status': status},
+    );
+    if (mounted) Navigator.pop(context);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final fromBranch = (widget.order['from_branch_num'] as num?)?.toInt() ?? 0;
+    final toBranch = (widget.order['to_branch_num'] as num?)?.toInt() ?? 0;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('مناقلة ${widget.order['order_no'] ?? ''}'),
+        actions: [
+          if (canHandle)
+            IconButton(
+              tooltip: 'تغيير الحالة',
+              onPressed: changeStatus,
+              icon: const Icon(Icons.edit_note_rounded),
+            ),
+        ],
+      ),
+      body: FutureBuilder<List<Map<String, dynamic>>>(
+        future: future,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snapshot.hasError) {
+            return ErrorState(message: cleanError(snapshot.error), onRetry: () => setState(() => future = loadItems()));
+          }
+          final items = snapshot.data!;
+          return ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              Card(
+                child: ListTile(
+                  title: Text('${branchLabel(widget.branches, fromBranch)} ← ${branchLabel(widget.branches, toBranch)}'),
+                  subtitle: Text(statusLabel(widget.order['status'] as String? ?? 'submitted')),
+                ),
+              ),
+              const SizedBox(height: 12),
+              const SectionHeader(title: 'بنود الطلب'),
+              if (items.isEmpty)
+                const EmptyState(icon: Icons.inventory_2_outlined, text: 'لا توجد بنود')
+              else
+                ...items.map((item) {
+                  final product = item['product'] as Map<String, dynamic>?;
+                  final status = item['item_status'] as String? ?? 'requested';
+                  return Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            product?['name'] as String? ?? 'مادة ${item['mat_num']}',
+                            style: const TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                          const SizedBox(height: 4),
+                          Text('المطلوب: ${item['requested_quantity']} · الحالة: ${itemStatusLabel(status)}'),
+                          if (item['note'] != null) Text('ملاحظة: ${item['note']}'),
+                          if (canHandle) ...[
+                            const SizedBox(height: 8),
+                            Wrap(
+                              spacing: 8,
+                              children: [
+                                ActionChip(
+                                  label: const Text('متوفر'),
+                                  onPressed: () => updateItem(item, 'available'),
+                                ),
+                                ActionChip(
+                                  label: const Text('جزئي'),
+                                  onPressed: () => updateItem(item, 'partially_available'),
+                                ),
+                                ActionChip(
+                                  label: const Text('غير متوفر'),
+                                  onPressed: () => updateItem(item, 'unavailable'),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  );
+                }),
+            ],
+          );
+        },
+      ),
     );
   }
 }
@@ -1963,9 +2310,15 @@ class CreateTransferResult {
 }
 
 class TransferItemDraft {
-  TransferItemDraft({required this.matNum, required this.quantity, required this.note});
+  TransferItemDraft({
+    required this.matNum,
+    required this.name,
+    required this.quantity,
+    required this.note,
+  });
 
   final int matNum;
+  final String name;
   final double quantity;
   final String note;
 }
@@ -1982,10 +2335,13 @@ class TransferDialog extends StatefulWidget {
 
 class _TransferDialogState extends State<TransferDialog> {
   final note = TextEditingController();
-  final matNum = TextEditingController();
+  final bookSearch = TextEditingController();
   final quantity = TextEditingController(text: '1');
   final itemNote = TextEditingController();
   final items = <TransferItemDraft>[];
+  List<Map<String, dynamic>> suggestions = [];
+  Map<String, dynamic>? selectedProduct;
+  bool searching = false;
   int? toBranch;
 
   @override
@@ -1995,17 +2351,77 @@ class _TransferDialogState extends State<TransferDialog> {
     if (options.isNotEmpty) toBranch = options.first;
   }
 
+  Future<void> searchBooks(String value) async {
+    final query = value.trim();
+    if (query.length < 2) {
+      setState(() => suggestions = []);
+      return;
+    }
+    setState(() => searching = true);
+    try {
+      final found = <Map<String, dynamic>>[];
+      final matNums = <int>{};
+      final numeric = int.tryParse(query);
+      if (numeric != null) matNums.add(numeric);
+      final barcodeRows = await supabase
+          .from('product_barcodes')
+          .select('mat_num')
+          .eq('barcode', query)
+          .limit(10);
+      for (final row in barcodeRows.cast<Map<String, dynamic>>()) {
+        final matNum = (row['mat_num'] as num?)?.toInt();
+        if (matNum != null) matNums.add(matNum);
+      }
+      if (matNums.isNotEmpty) {
+        final rows = await supabase
+            .from('products')
+            .select('mat_num, name, quantity')
+            .inFilter('mat_num', matNums.toList())
+            .limit(10);
+        found.addAll(rows.cast<Map<String, dynamic>>());
+      }
+      final rows = await supabase
+          .from('products')
+          .select('mat_num, name, quantity')
+          .ilike('name', '%$query%')
+          .limit(12);
+      for (final row in rows.cast<Map<String, dynamic>>()) {
+        final matNum = row['mat_num'];
+        if (!found.any((item) => item['mat_num'] == matNum)) found.add(row);
+      }
+      if (mounted) {
+        setState(() {
+          suggestions = found;
+          searching = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => searching = false);
+    }
+  }
+
+  void selectProduct(Map<String, dynamic> product) {
+    setState(() {
+      selectedProduct = product;
+      bookSearch.text = product['name'] as String? ?? '${product['mat_num']}';
+      suggestions = [];
+    });
+  }
+
   void addItem() {
-    final parsedMat = int.tryParse(matNum.text.trim());
+    final product = selectedProduct;
     final parsedQuantity = double.tryParse(quantity.text.trim());
-    if (parsedMat == null || parsedQuantity == null || parsedQuantity <= 0) return;
+    final parsedMat = (product?['mat_num'] as num?)?.toInt();
+    if (product == null || parsedMat == null || parsedQuantity == null || parsedQuantity <= 0) return;
     setState(() {
       items.add(TransferItemDraft(
         matNum: parsedMat,
+        name: product['name'] as String? ?? 'كتاب $parsedMat',
         quantity: parsedQuantity,
         note: itemNote.text.trim(),
       ));
-      matNum.clear();
+      selectedProduct = null;
+      bookSearch.clear();
       quantity.text = '1';
       itemNote.clear();
     });
@@ -2031,10 +2447,34 @@ class _TransferDialogState extends State<TransferDialog> {
             TextField(controller: note, decoration: const InputDecoration(labelText: 'ملاحظة الطلب')),
             const SizedBox(height: 12),
             TextField(
-              controller: matNum,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'رقم المادة/الكتاب'),
+              controller: bookSearch,
+              decoration: InputDecoration(
+                labelText: 'ابحث عن الكتاب من قاعدة البيانات',
+                suffixIcon: searching
+                    ? const Padding(
+                        padding: EdgeInsets.all(12),
+                        child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                      )
+                    : const Icon(Icons.manage_search_rounded),
+              ),
+              onChanged: searchBooks,
             ),
+            if (suggestions.isNotEmpty)
+              Card(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: suggestions
+                      .map(
+                        (product) => ListTile(
+                          dense: true,
+                          title: Text(product['name'] as String? ?? 'بدون اسم'),
+                          subtitle: Text('رقم ${product['mat_num']} · كمية ${product['quantity'] ?? '-'}'),
+                          onTap: () => selectProduct(product),
+                        ),
+                      )
+                      .toList(),
+                ),
+              ),
             TextField(
               controller: quantity,
               keyboardType: TextInputType.number,
@@ -2049,7 +2489,8 @@ class _TransferDialogState extends State<TransferDialog> {
             ),
             ...items.map((item) => ListTile(
                   dense: true,
-                  title: Text('مادة ${item.matNum}'),
+                  title: Text(item.name),
+                  subtitle: Text('رقم ${item.matNum}'),
                   trailing: Text('${item.quantity}'),
                 )),
           ],
@@ -2257,11 +2698,22 @@ class ChatThreadPage extends StatefulWidget {
 class _ChatThreadPageState extends State<ChatThreadPage> {
   final message = TextEditingController();
   late Future<List<Map<String, dynamic>>> future;
+  Timer? timer;
 
   @override
   void initState() {
     super.initState();
     future = loadMessages();
+    timer = Timer.periodic(const Duration(seconds: 4), (_) {
+      if (mounted) setState(() => future = loadMessages());
+    });
+  }
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    message.dispose();
+    super.dispose();
   }
 
   Future<List<Map<String, dynamic>>> loadMessages() async {
@@ -2847,6 +3299,23 @@ String statusLabel(String status) {
   }
 }
 
+String itemStatusLabel(String status) {
+  switch (status) {
+    case 'requested':
+      return 'مطلوب';
+    case 'available':
+      return 'متوفر';
+    case 'partially_available':
+      return 'متوفر جزئيا';
+    case 'unavailable':
+      return 'غير متوفر';
+    case 'cancelled':
+      return 'ملغي';
+    default:
+      return status;
+  }
+}
+
 String chatTypeLabel(String type) {
   switch (type) {
     case 'general':
@@ -2859,6 +3328,23 @@ String chatTypeLabel(String type) {
       return 'مناقلة';
     default:
       return type;
+  }
+}
+
+Future<void> enqueueNotification({
+  required String title,
+  required String body,
+  Map<String, Object?> data = const {},
+}) async {
+  try {
+    await supabase.from('ansar_notification_queue').insert({
+      'title': title,
+      'body': body,
+      'data': data,
+      'status': 'pending',
+    });
+  } catch (_) {
+    // Notifications are helpful, but core workflow should not fail if queue policies are not ready.
   }
 }
 
