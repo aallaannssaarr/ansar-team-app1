@@ -327,16 +327,31 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   late EmployeeSession session;
   int index = 0;
+  StreamSubscription<RemoteMessage>? foregroundMessages;
 
   @override
   void initState() {
     super.initState();
     session = widget.initialSession;
     registerDeviceForNotifications(session);
+    foregroundMessages = FirebaseMessaging.onMessage.listen((message) {
+      if (!mounted) return;
+      final title = message.notification?.title ?? 'إشعار جديد';
+      final body = message.notification?.body ?? '';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(body.isEmpty ? title : '$title\n$body')),
+      );
+    });
   }
 
   void updateSession(EmployeeSession value) {
     setState(() => session = value);
+  }
+
+  @override
+  void dispose() {
+    foregroundMessages?.cancel();
+    super.dispose();
   }
 
   @override
@@ -490,6 +505,16 @@ class _DashboardPageState extends State<DashboardPage> {
       'check_in_at': DateTime.now().toUtc().toIso8601String(),
       'status': 'open',
     });
+    await enqueueNotification(
+      title: 'تسجيل دخول دوام',
+      body: '${widget.session.name} سجل الدخول إلى الدوام',
+      branchNum: widget.session.branchNum,
+      data: {
+        'type': 'attendance_check_in',
+        'employee_id': widget.session.id,
+        'branch_num': widget.session.branchNum,
+      },
+    );
     if (mounted) {
       setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadDashboard()));
     }
@@ -500,6 +525,16 @@ class _DashboardPageState extends State<DashboardPage> {
       'check_out_at': DateTime.now().toUtc().toIso8601String(),
       'status': 'closed',
     }).eq('id', openLog['id']);
+    await enqueueNotification(
+      title: 'تسجيل خروج دوام',
+      body: '${widget.session.name} سجل الخروج من الدوام',
+      branchNum: widget.session.branchNum,
+      data: {
+        'type': 'attendance_check_out',
+        'employee_id': widget.session.id,
+        'branch_num': widget.session.branchNum,
+      },
+    );
     if (mounted) {
       setState(() => future = Future.delayed(const Duration(milliseconds: 350)).then((_) => loadDashboard()));
     }
@@ -2299,6 +2334,7 @@ class _TransfersPageState extends State<TransfersPage> {
       title: 'مناقلة جديدة',
       body:
           'طلب مناقلة من ${branchLabel(data.branches, widget.session.branchNum)} إلى ${branchLabel(data.branches, result.toBranch)}',
+      branchNum: result.toBranch,
       data: {'type': 'transfer_created', 'order_id': inserted['id']},
     );
     await Future.delayed(const Duration(milliseconds: 350));
@@ -2332,6 +2368,7 @@ class _TransfersPageState extends State<TransfersPage> {
     await enqueueNotification(
       title: 'تحديث مناقلة',
       body: 'تم تحديث حالة المناقلة رقم ${order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
+      branchNum: (order['from_branch_num'] as num?)?.toInt(),
       data: {'type': 'transfer_updated', 'order_id': order['id'], 'status': status},
     );
     await Future.delayed(const Duration(milliseconds: 350));
@@ -2529,6 +2566,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     await enqueueNotification(
       title: 'تحديث بند مناقلة',
       body: 'تم تحديث بند في طلب المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${itemStatusLabel(status)}',
+      branchNum: (widget.order['from_branch_num'] as num?)?.toInt(),
       data: {'type': 'transfer_item_updated', 'order_id': widget.order['id']},
     );
     setState(() => future = loadItems());
@@ -2550,6 +2588,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     await enqueueNotification(
       title: 'تحديث مناقلة',
       body: 'تم تحديث حالة المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
+      branchNum: (widget.order['from_branch_num'] as num?)?.toInt(),
       data: {'type': 'transfer_updated', 'order_id': widget.order['id'], 'status': status},
     );
     if (mounted) Navigator.pop(context);
@@ -3078,6 +3117,11 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     await supabase
         .from('ansar_chat_threads')
         .update({'updated_at': DateTime.now().toUtc().toIso8601String()}).eq('id', widget.thread['id']);
+    await enqueueChatNotification(
+      thread: widget.thread,
+      sender: widget.session,
+      body: body.length > 80 ? '${body.substring(0, 80)}...' : body,
+    );
     setState(() => future = loadMessages());
   }
 
@@ -3783,10 +3827,14 @@ String chatTypeLabel(String type) {
 Future<void> enqueueNotification({
   required String title,
   required String body,
+  String? employeeId,
+  int? branchNum,
   Map<String, Object?> data = const {},
 }) async {
   try {
     await supabase.from('ansar_notification_queue').insert({
+      if (employeeId != null) 'employee_id': employeeId,
+      if (branchNum != null) 'branch_num': branchNum,
       'title': title,
       'body': body,
       'data': data,
@@ -3795,6 +3843,74 @@ Future<void> enqueueNotification({
   } catch (_) {
     // Notifications are helpful, but core workflow should not fail if queue policies are not ready.
   }
+}
+
+Future<void> enqueueNotificationsForEmployees({
+  required Iterable<String> employeeIds,
+  required String title,
+  required String body,
+  Map<String, Object?> data = const {},
+}) async {
+  final ids = employeeIds.toSet().where((id) => id.isNotEmpty).toList();
+  if (ids.isEmpty) return;
+  try {
+    await supabase.from('ansar_notification_queue').insert(
+          ids
+              .map((id) => {
+                    'employee_id': id,
+                    'title': title,
+                    'body': body,
+                    'data': data,
+                    'status': 'pending',
+                  })
+              .toList(),
+        );
+  } catch (_) {
+    // Notifications are helpful, but core workflow should not fail if queue policies are not ready.
+  }
+}
+
+Future<void> enqueueChatNotification({
+  required Map<String, dynamic> thread,
+  required EmployeeSession sender,
+  required String body,
+}) async {
+  final threadId = thread['id'] as String?;
+  if (threadId == null) return;
+  final type = thread['thread_type'] as String? ?? 'general';
+  final title = type == 'general' ? 'رسالة جديدة في الدردشة العامة' : 'رسالة جديدة من ${sender.name}';
+  final data = {
+    'type': 'chat_message',
+    'thread_id': threadId,
+    'sender_id': sender.id,
+  };
+
+  if (type == 'general') {
+    final rows = await supabase
+        .from('ansar_employees')
+        .select('id')
+        .eq('is_active', true)
+        .neq('id', sender.id);
+    await enqueueNotificationsForEmployees(
+      employeeIds: rows.map((row) => row['id'] as String? ?? ''),
+      title: title,
+      body: body,
+      data: data,
+    );
+    return;
+  }
+
+  final participants = await supabase
+      .from('ansar_chat_participants')
+      .select('employee_id')
+      .eq('thread_id', threadId)
+      .neq('employee_id', sender.id);
+  await enqueueNotificationsForEmployees(
+    employeeIds: participants.map((row) => row['employee_id'] as String? ?? ''),
+    title: title,
+    body: body,
+    data: data,
+  );
 }
 
 Future<void> registerDeviceForNotifications(EmployeeSession session) async {
