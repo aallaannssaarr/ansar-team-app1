@@ -23,6 +23,9 @@ Future<void> main() async {
 final supabase = Supabase.instance.client;
 List<Map<String, dynamic>>? cachedProducts;
 Map<int, String>? cachedBarcodes;
+String? lastNotificationTokenPreview;
+String? lastNotificationRegistrationError;
+DateTime? lastNotificationRegistrationAt;
 
 const brandColor = Color(0xff087568);
 const accentColor = Color(0xffc9952f);
@@ -1719,7 +1722,7 @@ class _ManagementPageState extends State<ManagementPage> {
               ? EmployeesPage(session: widget.session)
               : tab == 1
                   ? BranchesPage(session: widget.session)
-                  : const NotificationDiagnosticsPage(),
+                  : NotificationDiagnosticsPage(session: widget.session),
         ),
       ],
     );
@@ -2122,7 +2125,9 @@ class _BranchDialogState extends State<BranchDialog> {
 }
 
 class NotificationDiagnosticsPage extends StatefulWidget {
-  const NotificationDiagnosticsPage({super.key});
+  const NotificationDiagnosticsPage({super.key, required this.session});
+
+  final EmployeeSession session;
 
   @override
   State<NotificationDiagnosticsPage> createState() => _NotificationDiagnosticsPageState();
@@ -2131,6 +2136,7 @@ class NotificationDiagnosticsPage extends StatefulWidget {
 class _NotificationDiagnosticsPageState extends State<NotificationDiagnosticsPage> {
   late Future<NotificationDiagnosticsData> future;
   bool sending = false;
+  bool registering = false;
 
   @override
   void initState() {
@@ -2162,6 +2168,17 @@ class _NotificationDiagnosticsPageState extends State<NotificationDiagnosticsPag
     if (mounted) {
       setState(() {
         sending = false;
+        future = loadDiagnostics();
+      });
+    }
+  }
+
+  Future<void> registerThisDevice() async {
+    setState(() => registering = true);
+    await registerDeviceForNotifications(widget.session);
+    if (mounted) {
+      setState(() {
+        registering = false;
         future = loadDiagnostics();
       });
     }
@@ -2206,6 +2223,34 @@ class _NotificationDiagnosticsPageState extends State<NotificationDiagnosticsPag
                   ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
                   : const Icon(Icons.send_rounded),
               label: const Text('تشغيل مرسل الإشعارات الآن'),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: registering ? null : registerThisDevice,
+              icon: registering
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.app_registration_rounded),
+              label: const Text('تسجيل هذا الجهاز للإشعارات'),
+            ),
+            const SizedBox(height: 8),
+            Card(
+              child: ListTile(
+                leading: Icon(
+                  lastNotificationRegistrationError == null ? Icons.check_circle_rounded : Icons.error_rounded,
+                  color: lastNotificationRegistrationError == null ? Colors.green : Colors.red,
+                ),
+                title: const Text('حالة تسجيل هذا الجهاز'),
+                subtitle: Text(
+                  [
+                    lastNotificationRegistrationError ??
+                        (lastNotificationTokenPreview == null
+                            ? 'لم يتم الحصول على رمز الجهاز بعد'
+                            : 'مسجل: $lastNotificationTokenPreview'),
+                    if (lastNotificationRegistrationAt != null)
+                      'آخر محاولة: ${formatDateTime(lastNotificationRegistrationAt!)}',
+                  ].join('\n'),
+                ),
+              ),
             ),
             const SizedBox(height: 16),
             Text('آخر الأجهزة', style: Theme.of(context).textTheme.titleMedium),
@@ -4082,38 +4127,44 @@ Future<void> enqueueChatNotification({
 Future<void> registerDeviceForNotifications(EmployeeSession session) async {
   try {
     final messaging = FirebaseMessaging.instance;
-    await messaging.requestPermission(alert: true, badge: true, sound: true);
+    lastNotificationRegistrationError = null;
+    await messaging.setAutoInitEnabled(true);
+    final settings = await messaging.requestPermission(alert: true, badge: true, sound: true);
+    if (settings.authorizationStatus == AuthorizationStatus.denied) {
+      throw Exception('تم رفض إذن الإشعارات من إعدادات الهاتف');
+    }
     final token = await messaging.getToken();
-    if (token == null || token.isEmpty) return;
+    if (token == null || token.isEmpty) {
+      throw Exception('لم يعط Firebase رمزاً لهذا الجهاز');
+    }
 
-    await supabase.from('ansar_device_tokens').upsert(
-      {
-        'employee_id': session.id,
-        'platform': Platform.isAndroid ? 'android' : (Platform.isIOS ? 'ios' : 'web'),
-        'token': token,
-        'device_name': Platform.operatingSystem,
-        'is_active': true,
-        'last_seen_at': DateTime.now().toUtc().toIso8601String(),
-      },
-      onConflict: 'token',
-    );
+    await saveDeviceToken(session, token);
 
     FirebaseMessaging.instance.onTokenRefresh.listen((newToken) async {
-      await supabase.from('ansar_device_tokens').upsert(
-        {
-          'employee_id': session.id,
-          'platform': Platform.isAndroid ? 'android' : (Platform.isIOS ? 'ios' : 'web'),
-          'token': newToken,
-          'device_name': Platform.operatingSystem,
-          'is_active': true,
-          'last_seen_at': DateTime.now().toUtc().toIso8601String(),
-        },
-        onConflict: 'token',
-      );
+      await saveDeviceToken(session, newToken);
     });
-  } catch (_) {
+  } catch (error) {
+    lastNotificationRegistrationError = cleanError(error);
+    lastNotificationRegistrationAt = DateTime.now();
     // Push setup should never block login or daily work.
   }
+}
+
+Future<void> saveDeviceToken(EmployeeSession session, String token) async {
+  await supabase.from('ansar_device_tokens').upsert(
+    {
+      'employee_id': session.id,
+      'platform': Platform.isAndroid ? 'android' : (Platform.isIOS ? 'ios' : 'web'),
+      'token': token,
+      'device_name': '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+      'is_active': true,
+      'last_seen_at': DateTime.now().toUtc().toIso8601String(),
+    },
+    onConflict: 'token',
+  );
+  lastNotificationTokenPreview = token.length <= 12 ? token : '${token.substring(0, 6)}...${token.substring(token.length - 6)}';
+  lastNotificationRegistrationError = null;
+  lastNotificationRegistrationAt = DateTime.now();
 }
 
 String cleanError(Object? error) {
