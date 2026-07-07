@@ -489,6 +489,7 @@ class DashboardPage extends StatefulWidget {
 class _DashboardPageState extends State<DashboardPage> {
   late Future<DashboardData> future;
   Timer? timer;
+  bool attendanceBusy = false;
 
   @override
   void initState() {
@@ -569,42 +570,52 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<void> checkIn() async {
-    await supabase.from('ansar_attendance_logs').insert({
-      'employee_id': widget.session.id,
-      'branch_num': widget.session.branchNum,
-      'check_in_at': DateTime.now().toUtc().toIso8601String(),
-      'status': 'open',
-    });
-    unawaited(enqueueNotification(
-      title: 'تسجيل دخول دوام',
-      body: '${widget.session.name} سجل الدخول إلى الدوام',
-      data: {
-        'type': 'attendance_check_in',
+    setState(() => attendanceBusy = true);
+    try {
+      await supabase.from('ansar_attendance_logs').insert({
         'employee_id': widget.session.id,
         'branch_num': widget.session.branchNum,
-      },
-    ));
-    if (mounted) {
-      setState(() => future = loadDashboard());
+        'check_in_at': DateTime.now().toUtc().toIso8601String(),
+        'status': 'open',
+      });
+      unawaited(enqueueNotification(
+        title: 'تسجيل دخول دوام',
+        body: '${widget.session.name} سجل الدخول إلى الدوام',
+        data: {
+          'type': 'attendance_check_in',
+          'employee_id': widget.session.id,
+          'branch_num': widget.session.branchNum,
+        },
+      ));
+      if (mounted) setState(() => future = loadDashboard());
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => attendanceBusy = false);
     }
   }
 
   Future<void> checkOut(Map<String, dynamic> openLog) async {
-    await supabase.from('ansar_attendance_logs').update({
-      'check_out_at': DateTime.now().toUtc().toIso8601String(),
-      'status': 'closed',
-    }).eq('id', openLog['id']);
-    unawaited(enqueueNotification(
-      title: 'تسجيل خروج دوام',
-      body: '${widget.session.name} سجل الخروج من الدوام',
-      data: {
-        'type': 'attendance_check_out',
-        'employee_id': widget.session.id,
-        'branch_num': widget.session.branchNum,
-      },
-    ));
-    if (mounted) {
-      setState(() => future = loadDashboard());
+    setState(() => attendanceBusy = true);
+    try {
+      await supabase.from('ansar_attendance_logs').update({
+        'check_out_at': DateTime.now().toUtc().toIso8601String(),
+        'status': 'closed',
+      }).eq('id', openLog['id']);
+      unawaited(enqueueNotification(
+        title: 'تسجيل خروج دوام',
+        body: '${widget.session.name} سجل الخروج من الدوام',
+        data: {
+          'type': 'attendance_check_out',
+          'employee_id': widget.session.id,
+          'branch_num': widget.session.branchNum,
+        },
+      ));
+      if (mounted) setState(() => future = loadDashboard());
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => attendanceBusy = false);
     }
   }
 
@@ -666,17 +677,21 @@ class _DashboardPageState extends State<DashboardPage> {
                         children: [
                           Expanded(
                             child: FilledButton.icon(
-                              onPressed: isWorking ? null : checkIn,
-                              icon: const Icon(Icons.login_rounded),
-                              label: const Text('دخول'),
+                              onPressed: isWorking || attendanceBusy ? null : checkIn,
+                              icon: attendanceBusy && !isWorking
+                                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                                  : const Icon(Icons.login_rounded),
+                              label: Text(attendanceBusy && !isWorking ? 'جاري الدخول' : 'دخول'),
                             ),
                           ),
                           const SizedBox(width: 10),
                           Expanded(
                             child: OutlinedButton.icon(
-                              onPressed: isWorking ? () => checkOut(data.openLog!) : null,
-                              icon: const Icon(Icons.logout_rounded),
-                              label: const Text('خروج'),
+                              onPressed: isWorking && !attendanceBusy ? () => checkOut(data.openLog!) : null,
+                              icon: attendanceBusy && isWorking
+                                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                                  : const Icon(Icons.logout_rounded),
+                              label: Text(attendanceBusy && isWorking ? 'جاري الخروج' : 'خروج'),
                             ),
                           ),
                         ],
@@ -1796,6 +1811,7 @@ class EmployeesPage extends StatefulWidget {
 
 class _EmployeesPageState extends State<EmployeesPage> {
   late Future<EmployeesData> employeesFuture;
+  bool employeeBusy = false;
 
   @override
   void initState() {
@@ -1829,16 +1845,23 @@ class _EmployeesPageState extends State<EmployeesPage> {
     );
     if (result == null) return;
 
-    if (employee == null) {
-      await supabase.from('ansar_employees').insert({
-        ...result,
-        'created_by': widget.session.id,
-        'is_active': true,
-      });
-    } else {
-      await supabase.from('ansar_employees').update(result).eq('id', employee['id']);
+    setState(() => employeeBusy = true);
+    try {
+      if (employee == null) {
+        await supabase.from('ansar_employees').insert({
+          ...result,
+          'created_by': widget.session.id,
+          'is_active': true,
+        });
+      } else {
+        await supabase.from('ansar_employees').update(result).eq('id', employee['id']);
+      }
+      if (mounted) setState(() => employeesFuture = loadEmployees());
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => employeeBusy = false);
     }
-    setState(() => employeesFuture = loadEmployees());
   }
 
   Future<void> disableEmployee(Map<String, dynamic> employee) async {
@@ -1848,8 +1871,15 @@ class _EmployeesPageState extends State<EmployeesPage> {
       message: 'سيتم إخفاء الموظف وتعطيل دخوله مع الحفاظ على سجلات الدوام القديمة.',
     );
     if (!confirmed) return;
-    await supabase.from('ansar_employees').update({'is_active': false}).eq('id', employee['id']);
-    setState(() => employeesFuture = loadEmployees());
+    setState(() => employeeBusy = true);
+    try {
+      await supabase.from('ansar_employees').update({'is_active': false}).eq('id', employee['id']);
+      if (mounted) setState(() => employeesFuture = loadEmployees());
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => employeeBusy = false);
+    }
   }
 
   @override
@@ -1884,7 +1914,7 @@ class _EmployeesPageState extends State<EmployeesPage> {
                 title: Text(employee['display_name'] ?? employee['full_name'] ?? ''),
                 subtitle: Text('${branchLabel(data.branches, branchNum)} · ${employee['username']}'),
                 trailing: PopupMenuButton<String>(
-                  onSelected: (value) {
+                  onSelected: employeeBusy ? null : (value) {
                     if (value == 'edit') {
                       openEmployeeDialog(branches: data.branches, employee: employee);
                     } else if (value == 'disable') {
@@ -1904,9 +1934,11 @@ class _EmployeesPageState extends State<EmployeesPage> {
             },
           ),
           floatingActionButton: FloatingActionButton.extended(
-            onPressed: () => openEmployeeDialog(branches: data.branches),
-            icon: const Icon(Icons.add_rounded),
-            label: const Text('موظف'),
+            onPressed: employeeBusy ? null : () => openEmployeeDialog(branches: data.branches),
+            icon: employeeBusy
+                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.add_rounded),
+            label: Text(employeeBusy ? 'جاري الحفظ' : 'موظف'),
           ),
         );
       },
@@ -2028,6 +2060,7 @@ class BranchesPage extends StatefulWidget {
 
 class _BranchesPageState extends State<BranchesPage> {
   late Future<Map<int, BranchOption>> future;
+  bool branchBusy = false;
 
   @override
   void initState() {
@@ -2041,21 +2074,28 @@ class _BranchesPageState extends State<BranchesPage> {
       builder: (_) => BranchDialog(branch: branch),
     );
     if (result == null) return;
-    if (branch == null) {
-      await supabase.from('ansar_branches').upsert({
-        ...result,
-        'is_active': true,
-        'created_by': widget.session.id,
-      });
-    } else {
-      await supabase.from('ansar_branches').upsert({
-        'sto_num': branch.number,
-        'name': result['name'],
-        'is_active': true,
-        'created_by': widget.session.id,
-      });
+    setState(() => branchBusy = true);
+    try {
+      if (branch == null) {
+        await supabase.from('ansar_branches').upsert({
+          ...result,
+          'is_active': true,
+          'created_by': widget.session.id,
+        });
+      } else {
+        await supabase.from('ansar_branches').upsert({
+          'sto_num': branch.number,
+          'name': result['name'],
+          'is_active': true,
+          'created_by': widget.session.id,
+        });
+      }
+      if (mounted) setState(() => future = loadAppBranchesMap());
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => branchBusy = false);
     }
-    setState(() => future = loadAppBranchesMap());
   }
 
   Future<void> deleteBranch(BranchOption branch) async {
@@ -2065,13 +2105,20 @@ class _BranchesPageState extends State<BranchesPage> {
       message: 'لا تحذف الفرع إذا كان مرتبطا بموظفين أو سجلات. الأفضل تعديله عند الحاجة.',
     );
     if (!confirmed) return;
-    await supabase.from('ansar_branches').upsert({
-      'sto_num': branch.number,
-      'name': branch.name,
-      'is_active': false,
-      'created_by': widget.session.id,
-    });
-    setState(() => future = loadAppBranchesMap());
+    setState(() => branchBusy = true);
+    try {
+      await supabase.from('ansar_branches').upsert({
+        'sto_num': branch.number,
+        'name': branch.name,
+        'is_active': false,
+        'created_by': widget.session.id,
+      });
+      if (mounted) setState(() => future = loadAppBranchesMap());
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => branchBusy = false);
+    }
   }
 
   @override
@@ -2103,7 +2150,7 @@ class _BranchesPageState extends State<BranchesPage> {
                       title: Text(branch.name),
                       subtitle: Text('رقم الفرع ${branch.number}'),
                       trailing: PopupMenuButton<String>(
-                        onSelected: (value) {
+                        onSelected: branchBusy ? null : (value) {
                           if (value == 'edit') openBranchDialog(branch);
                           if (value == 'delete') deleteBranch(branch);
                         },
@@ -2116,9 +2163,11 @@ class _BranchesPageState extends State<BranchesPage> {
                   },
                 ),
           floatingActionButton: FloatingActionButton.extended(
-            onPressed: () => openBranchDialog(),
-            icon: const Icon(Icons.add_business_rounded),
-            label: const Text('فرع'),
+            onPressed: branchBusy ? null : () => openBranchDialog(),
+            icon: branchBusy
+                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.add_business_rounded),
+            label: Text(branchBusy ? 'جاري الحفظ' : 'فرع'),
           ),
         );
       },
@@ -2564,6 +2613,7 @@ class TransfersPage extends StatefulWidget {
 class _TransfersPageState extends State<TransfersPage> {
   late Future<TransferData> future;
   bool showHistory = false;
+  bool transferBusy = false;
 
   @override
   void initState() {
@@ -2609,42 +2659,49 @@ class _TransfersPageState extends State<TransfersPage> {
       ),
     );
     if (result == null) return;
-    final inserted = await supabase
-        .from('ansar_transfer_orders')
-        .insert({
-          'from_branch_num': widget.session.branchNum,
-          'to_branch_num': result.toBranch,
-          'requested_by': widget.session.id,
-          'status': 'submitted',
-          'requester_note': emptyToNull(result.note),
-          'submitted_at': DateTime.now().toUtc().toIso8601String(),
-        })
-        .select('id')
-        .single();
-    await supabase.from('ansar_transfer_order_items').insert(
-          result.items
-              .map((item) => {
-                    'order_id': inserted['id'],
-                    'mat_num': item.matNum,
-                    'requested_quantity': item.quantity,
-                    'note': emptyToNull(item.note),
-                  })
-              .toList(),
-        );
-    await supabase.from('ansar_order_events').insert({
-      'order_id': inserted['id'],
-      'employee_id': widget.session.id,
-      'event_type': 'created',
-      'new_status': 'submitted',
-      'note': 'تم إنشاء الطلب من التطبيق',
-    });
-    unawaited(enqueueNotification(
-      title: 'مناقلة جديدة',
-      body:
-          'طلب مناقلة من ${branchLabel(data.branches, widget.session.branchNum)} إلى ${branchLabel(data.branches, result.toBranch)}',
-      data: {'type': 'transfer_created', 'order_id': inserted['id']},
-    ));
-    if (mounted) setState(() => future = loadTransfers());
+    setState(() => transferBusy = true);
+    try {
+      final inserted = await supabase
+          .from('ansar_transfer_orders')
+          .insert({
+            'from_branch_num': widget.session.branchNum,
+            'to_branch_num': result.toBranch,
+            'requested_by': widget.session.id,
+            'status': 'submitted',
+            'requester_note': emptyToNull(result.note),
+            'submitted_at': DateTime.now().toUtc().toIso8601String(),
+          })
+          .select('id')
+          .single();
+      await supabase.from('ansar_transfer_order_items').insert(
+            result.items
+                .map((item) => {
+                      'order_id': inserted['id'],
+                      'mat_num': item.matNum,
+                      'requested_quantity': item.quantity,
+                      'note': emptyToNull(item.note),
+                    })
+                .toList(),
+          );
+      await supabase.from('ansar_order_events').insert({
+        'order_id': inserted['id'],
+        'employee_id': widget.session.id,
+        'event_type': 'created',
+        'new_status': 'submitted',
+        'note': 'تم إنشاء الطلب من التطبيق',
+      });
+      unawaited(enqueueNotification(
+        title: 'مناقلة جديدة',
+        body:
+            'طلب مناقلة من ${branchLabel(data.branches, widget.session.branchNum)} إلى ${branchLabel(data.branches, result.toBranch)}',
+        data: {'type': 'transfer_created', 'order_id': inserted['id']},
+      ));
+      if (mounted) setState(() => future = loadTransfers());
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => transferBusy = false);
+    }
   }
 
   Future<void> updateOrderStatus(Map<String, dynamic> order) async {
@@ -2658,25 +2715,32 @@ class _TransfersPageState extends State<TransfersPage> {
       builder: (_) => StatusDialog(current: order['status'] as String? ?? 'submitted'),
     );
     if (status == null) return;
-    await supabase.from('ansar_transfer_orders').update({
-      'status': status,
-      'handled_by': widget.session.id,
-      if (status == 'approved') 'approved_at': DateTime.now().toUtc().toIso8601String(),
-      if (status == 'completed') 'completed_at': DateTime.now().toUtc().toIso8601String(),
-    }).eq('id', order['id']);
-    await supabase.from('ansar_order_events').insert({
-      'order_id': order['id'],
-      'employee_id': widget.session.id,
-      'event_type': 'status_changed',
-      'old_status': order['status'],
-      'new_status': status,
-    });
-    unawaited(enqueueNotification(
-      title: 'تحديث مناقلة',
-      body: 'تم تحديث حالة المناقلة رقم ${order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
-      data: {'type': 'transfer_updated', 'order_id': order['id'], 'status': status},
-    ));
-    if (mounted) setState(() => future = loadTransfers());
+    setState(() => transferBusy = true);
+    try {
+      await supabase.from('ansar_transfer_orders').update({
+        'status': status,
+        'handled_by': widget.session.id,
+        if (status == 'approved') 'approved_at': DateTime.now().toUtc().toIso8601String(),
+        if (status == 'completed') 'completed_at': DateTime.now().toUtc().toIso8601String(),
+      }).eq('id', order['id']);
+      await supabase.from('ansar_order_events').insert({
+        'order_id': order['id'],
+        'employee_id': widget.session.id,
+        'event_type': 'status_changed',
+        'old_status': order['status'],
+        'new_status': status,
+      });
+      unawaited(enqueueNotification(
+        title: 'تحديث مناقلة',
+        body: 'تم تحديث حالة المناقلة رقم ${order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
+        data: {'type': 'transfer_updated', 'order_id': order['id'], 'status': status},
+      ));
+      if (mounted) setState(() => future = loadTransfers());
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => transferBusy = false);
+    }
   }
 
   Future<void> openOrderDetails(Map<String, dynamic> order, TransferData data) async {
@@ -2756,8 +2820,10 @@ class _TransfersPageState extends State<TransfersPage> {
                         trailing: canHandle
                             ? IconButton(
                                 tooltip: 'تحديث الحالة',
-                                onPressed: () => updateOrderStatus(order),
-                                icon: const Icon(Icons.edit_note_rounded),
+                                onPressed: transferBusy ? null : () => updateOrderStatus(order),
+                                icon: transferBusy
+                                    ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                                    : const Icon(Icons.edit_note_rounded),
                               )
                             : const Icon(Icons.chevron_left_rounded),
                       ),
@@ -2768,9 +2834,11 @@ class _TransfersPageState extends State<TransfersPage> {
             ],
           ),
           floatingActionButton: FloatingActionButton.extended(
-            onPressed: () => createOrder(data),
-            icon: const Icon(Icons.add_rounded),
-            label: const Text('مناقلة'),
+            onPressed: transferBusy ? null : () => createOrder(data),
+            icon: transferBusy
+                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.add_rounded),
+            label: Text(transferBusy ? 'جاري الحفظ' : 'مناقلة'),
           ),
         );
       },
@@ -3227,6 +3295,7 @@ class ChatPage extends StatefulWidget {
 
 class _ChatPageState extends State<ChatPage> {
   late Future<List<Map<String, dynamic>>> future;
+  bool threadBusy = false;
 
   @override
   void initState() {
@@ -3276,27 +3345,34 @@ class _ChatPageState extends State<ChatPage> {
     );
     if (result == null) return;
 
-    final inserted = await supabase
-        .from('ansar_chat_threads')
-        .insert({
-          'title': result.title,
-          'thread_type': result.employeeIds.length == 1 ? 'direct' : 'group',
-          'created_by': widget.session.id,
-        })
-        .select('id')
-        .single();
-    final threadId = inserted['id'];
-    final participantIds = {widget.session.id, ...result.employeeIds};
-    await supabase.from('ansar_chat_participants').insert(
-          participantIds
-              .map((employeeId) => {
-                    'thread_id': threadId,
-                    'employee_id': employeeId,
-                    'role': employeeId == widget.session.id ? 'admin' : 'member',
-                  })
-              .toList(),
-        );
-    setState(() => future = loadThreads());
+    setState(() => threadBusy = true);
+    try {
+      final inserted = await supabase
+          .from('ansar_chat_threads')
+          .insert({
+            'title': result.title,
+            'thread_type': result.employeeIds.length == 1 ? 'direct' : 'group',
+            'created_by': widget.session.id,
+          })
+          .select('id')
+          .single();
+      final threadId = inserted['id'];
+      final participantIds = {widget.session.id, ...result.employeeIds};
+      await supabase.from('ansar_chat_participants').insert(
+            participantIds
+                .map((employeeId) => {
+                      'thread_id': threadId,
+                      'employee_id': employeeId,
+                      'role': employeeId == widget.session.id ? 'admin' : 'member',
+                    })
+                .toList(),
+          );
+      if (mounted) setState(() => future = loadThreads());
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => threadBusy = false);
+    }
   }
 
   @override
@@ -3338,9 +3414,11 @@ class _ChatPageState extends State<ChatPage> {
                   },
                 ),
           floatingActionButton: FloatingActionButton.extended(
-            onPressed: createThread,
-            icon: const Icon(Icons.add_comment_rounded),
-            label: const Text('محادثة'),
+            onPressed: threadBusy ? null : createThread,
+            icon: threadBusy
+                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.add_comment_rounded),
+            label: Text(threadBusy ? 'جاري الحفظ' : 'محادثة'),
           ),
         );
       },
@@ -3363,6 +3441,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   late Future<List<Map<String, dynamic>>> future;
   Timer? timer;
   RealtimeChannel? channel;
+  bool sendingMessage = false;
 
   @override
   void initState() {
@@ -3408,23 +3487,31 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
 
   Future<void> sendMessage() async {
     final body = message.text.trim();
-    if (body.isEmpty) return;
+    if (body.isEmpty || sendingMessage) return;
     message.clear();
-    await supabase.from('ansar_chat_messages').insert({
-      'thread_id': widget.thread['id'],
-      'sender_id': widget.session.id,
-      'body': body,
-      'message_type': 'text',
-    });
-    await supabase
-        .from('ansar_chat_threads')
-        .update({'updated_at': DateTime.now().toUtc().toIso8601String()}).eq('id', widget.thread['id']);
-    setState(() => future = loadMessages());
-    unawaited(enqueueChatNotification(
-      thread: widget.thread,
-      sender: widget.session,
-      body: body.length > 80 ? '${body.substring(0, 80)}...' : body,
-    ));
+    setState(() => sendingMessage = true);
+    try {
+      await supabase.from('ansar_chat_messages').insert({
+        'thread_id': widget.thread['id'],
+        'sender_id': widget.session.id,
+        'body': body,
+        'message_type': 'text',
+      });
+      await supabase
+          .from('ansar_chat_threads')
+          .update({'updated_at': DateTime.now().toUtc().toIso8601String()}).eq('id', widget.thread['id']);
+      if (mounted) setState(() => future = loadMessages());
+      unawaited(enqueueChatNotification(
+        thread: widget.thread,
+        sender: widget.session,
+        body: body.length > 80 ? '${body.substring(0, 80)}...' : body,
+      ));
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+      message.text = body;
+    } finally {
+      if (mounted) setState(() => sendingMessage = false);
+    }
   }
 
   Future<void> deleteMessage(Map<String, dynamic> row) async {
@@ -3523,8 +3610,10 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                   ),
                   const SizedBox(width: 8),
                   IconButton.filled(
-                    onPressed: sendMessage,
-                    icon: const Icon(Icons.send_rounded),
+                    onPressed: sendingMessage ? null : sendMessage,
+                    icon: sendingMessage
+                        ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.send_rounded),
                   ),
                 ],
               ),
