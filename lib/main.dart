@@ -372,9 +372,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (!mounted) return;
       final title = message.notification?.title ?? 'إشعار جديد';
       final body = message.notification?.body ?? '';
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(body.isEmpty ? title : '$title\n$body')),
-      );
+      showSnack(context, body.isEmpty ? title : '$title\n$body');
     });
   }
 
@@ -422,9 +420,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         if (!mounted) return;
         final title = row['title'] as String? ?? 'إشعار جديد';
         final body = row['body'] as String? ?? '';
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(body.isEmpty ? title : '$title\n$body')),
-        );
+        showSnack(context, body.isEmpty ? title : '$title\n$body');
       }
     } catch (_) {
       // In-app alerts are a fallback path; they should not interrupt normal use.
@@ -512,23 +508,41 @@ class DashboardPage extends StatefulWidget {
 
 class _DashboardPageState extends State<DashboardPage> {
   late Future<DashboardData> future;
+  DashboardData? latestDashboard;
   Timer? timer;
+  RealtimeChannel? attendanceChannel;
   bool attendanceBusy = false;
   bool movementsExpanded = false;
 
   @override
   void initState() {
     super.initState();
-    future = loadDashboard();
-    timer = Timer.periodic(const Duration(seconds: 10), (_) {
-      if (mounted) setState(() => future = loadDashboard());
+    future = loadAndRememberDashboard();
+    attendanceChannel = supabase.channel('dashboard-attendance')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_attendance_logs',
+        callback: (_) {
+          if (mounted) setState(() => future = loadAndRememberDashboard());
+        },
+      ).subscribe();
+    timer = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (mounted) setState(() => future = loadAndRememberDashboard());
     });
   }
 
   @override
   void dispose() {
     timer?.cancel();
+    if (attendanceChannel != null) supabase.removeChannel(attendanceChannel!);
     super.dispose();
+  }
+
+  Future<DashboardData> loadAndRememberDashboard() async {
+    final loaded = await loadDashboard();
+    latestDashboard = loaded;
+    return loaded;
   }
 
   Future<DashboardData> loadDashboard() async {
@@ -644,7 +658,7 @@ class _DashboardPageState extends State<DashboardPage> {
           'branch_num': widget.session.branchNum,
         },
       ));
-      if (mounted) setState(() => future = loadDashboard());
+      if (mounted) setState(() => future = loadAndRememberDashboard());
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -668,7 +682,7 @@ class _DashboardPageState extends State<DashboardPage> {
           'branch_num': widget.session.branchNum,
         },
       ));
-      if (mounted) setState(() => future = loadDashboard());
+      if (mounted) setState(() => future = loadAndRememberDashboard());
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -680,20 +694,21 @@ class _DashboardPageState extends State<DashboardPage> {
   Widget build(BuildContext context) {
     return RefreshIndicator(
       onRefresh: () {
-        final refreshed = loadDashboard();
+        final refreshed = loadAndRememberDashboard();
         setState(() => future = refreshed);
         return refreshed.then((_) {});
       },
       child: FutureBuilder<DashboardData>(
         future: future,
+        initialData: latestDashboard,
         builder: (context, snapshot) {
-          if (snapshot.connectionState != ConnectionState.done) {
+          if (snapshot.connectionState != ConnectionState.done && !snapshot.hasData) {
             return const Center(child: CircularProgressIndicator());
           }
-          if (snapshot.hasError) {
+          if (snapshot.hasError && !snapshot.hasData) {
             return ErrorState(
               message: cleanError(snapshot.error),
-              onRetry: () => setState(() => future = loadDashboard()),
+              onRetry: () => setState(() => future = loadAndRememberDashboard()),
             );
           }
 
@@ -801,7 +816,7 @@ class _DashboardPageState extends State<DashboardPage> {
                     children: [
                       IconButton(
                         tooltip: 'تحديث',
-                        onPressed: () => setState(() => future = loadDashboard()),
+                        onPressed: () => setState(() => future = loadAndRememberDashboard()),
                         icon: const Icon(Icons.refresh_rounded),
                       ),
                       Icon(movementsExpanded ? Icons.expand_less_rounded : Icons.expand_more_rounded),
@@ -1236,6 +1251,7 @@ class _QueriesPageState extends State<QueriesPage> {
   late final TextEditingController startDate;
   late final TextEditingController endDate;
   Future<Object>? future;
+  Timer? queryDebounce;
   int queryMode = 0;
   String selectedSalesBooks = 'all';
 
@@ -1251,6 +1267,7 @@ class _QueriesPageState extends State<QueriesPage> {
 
   @override
   void dispose() {
+    queryDebounce?.cancel();
     search.dispose();
     startDate.dispose();
     endDate.dispose();
@@ -1305,6 +1322,18 @@ class _QueriesPageState extends State<QueriesPage> {
       if (queryMode == 2) future = runCashSummary();
       if (queryMode == 3) future = runDailySales();
     });
+  }
+
+  void queueSearch() {
+    queryDebounce?.cancel();
+    final value = search.text.trim();
+    if (queryMode != 0 && queryMode != 1) return;
+    final minLength = queryMode == 0 ? 2 : 1;
+    if (value.length < minLength) {
+      setState(() => future = null);
+      return;
+    }
+    queryDebounce = Timer(const Duration(milliseconds: 320), submitSearch);
   }
 
   Future<List<Map<String, dynamic>>> runAccountsSearch() async {
@@ -1386,6 +1415,7 @@ class _QueriesPageState extends State<QueriesPage> {
         _QueryModeTabs(
           selected: queryMode,
           onChanged: (value) {
+            queryDebounce?.cancel();
             setState(() {
               queryMode = value;
               future = null;
@@ -1408,6 +1438,7 @@ class _QueriesPageState extends State<QueriesPage> {
                         labelText: 'اكتب كلمة البحث',
                         prefixIcon: Icon(Icons.search_rounded),
                       ),
+                      onChanged: (_) => queueSearch(),
                       onSubmitted: (_) => submitSearch(),
                     ),
                   ),
@@ -1854,39 +1885,41 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
               if (items.isEmpty)
                 const EmptyState(icon: Icons.inventory_2_outlined, text: 'لا توجد بنود')
               else
-                ...items.map((item) {
-                  final itemSto = parseStoNum(item['remarki']);
-                  final itemDiscount = discountDisplay(item);
-                  return Card(
-                      child: Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            Text(
-                              item['product_name'] as String? ?? 'مادة ${item['matnum']}',
-                              style: const TextStyle(fontWeight: FontWeight.bold),
-                            ),
-                            const SizedBox(height: 8),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 8,
-                              children: [
-                                InfoChip(icon: Icons.numbers_rounded, label: 'كمية ${formatMoneyValue(item['quantity'])}'),
-                                InfoChip(icon: Icons.sell_rounded, label: 'سعر ${formatMoneyValue(item['price'])}'),
-                                InfoChip(icon: Icons.percent_rounded, label: 'حسم $itemDiscount'),
-                                InfoChip(icon: Icons.calculate_rounded, label: 'قيمة ${formatMoneyValue(item['value'])}'),
-                                InfoChip(
-                                  icon: Icons.warehouse_rounded,
-                                  label: itemSto == null ? 'مستودع غير محدد' : branchLabel(data.branches, itemSto),
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(10),
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: DataTable(
+                        headingRowColor: WidgetStatePropertyAll(brandColor.withOpacity(0.08)),
+                        columns: const [
+                          DataColumn(label: Text('المادة')),
+                          DataColumn(label: Text('الكمية')),
+                          DataColumn(label: Text('السعر')),
+                          DataColumn(label: Text('الحسم')),
+                          DataColumn(label: Text('القيمة')),
+                          DataColumn(label: Text('المستودع')),
+                        ],
+                        rows: items.map((item) {
+                          final itemSto = parseStoNum(item['remarki']);
+                          return DataRow(
+                            cells: [
+                              DataCell(SizedBox(
+                                width: 190,
+                                child: Text(item['product_name'] as String? ?? 'مادة ${item['matnum']}'),
+                              )),
+                              DataCell(Text(formatMoneyValue(item['quantity']))),
+                              DataCell(Text(formatMoneyValue(item['price']))),
+                              DataCell(Text(discountDisplay(item))),
+                              DataCell(Text(formatMoneyValue(item['value']))),
+                              DataCell(Text(itemSto == null ? '-' : branchLabel(data.branches, itemSto))),
+                            ],
+                          );
+                        }).toList(),
                       ),
-                    );
-                }),
+                    ),
+                  ),
+                ),
             ],
           );
         },
@@ -2706,6 +2739,18 @@ class _ProfilePageState extends State<ProfilePage> {
     jobTitle = TextEditingController(text: widget.session.jobTitle ?? '');
   }
 
+  @override
+  void didUpdateWidget(covariant ProfilePage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.session.data != widget.session.data) {
+      name.text = widget.session.name;
+      username.text = widget.session.username;
+      phone.text = widget.session.phone ?? '';
+      email.text = widget.session.email ?? '';
+      jobTitle.text = widget.session.jobTitle ?? '';
+    }
+  }
+
   Future<void> saveProfile({String? avatarUrl, String? avatarPath}) async {
     setState(() {
       saving = true;
@@ -2729,7 +2774,7 @@ class _ProfilePageState extends State<ProfilePage> {
           .select()
           .limit(1);
       if (rows.isNotEmpty) widget.onSessionChanged(EmployeeSession(rows.first));
-      setState(() => message = 'تم حفظ بياناتك');
+      if (mounted) showSnack(context, 'تم حفظ بياناتك');
     } catch (e) {
       setState(() => message = cleanError(e));
     } finally {
@@ -2759,7 +2804,7 @@ class _ProfilePageState extends State<ProfilePage> {
       final publicUrl = supabase.storage.from('ansar-avatars').getPublicUrl(path);
       await saveProfile(avatarUrl: publicUrl, avatarPath: path);
     } catch (e) {
-      setState(() => message = 'تعذر رفع الصورة. نفذ ملف docs/ansar-storage-policies.sql ثم حاول مجددا. ${cleanError(e)}');
+      setState(() => message = 'تعذر رفع الصورة. تأكد من تفعيل تخزين الصور ثم حاول مجددا.');
     } finally {
       if (mounted) setState(() => saving = false);
     }
@@ -2833,9 +2878,13 @@ class _ProfilePageState extends State<ProfilePage> {
         ),
         const SizedBox(height: 10),
         TextField(controller: name, decoration: const InputDecoration(labelText: 'الاسم')),
+        const SizedBox(height: 8),
         TextField(controller: username, decoration: const InputDecoration(labelText: 'اسم المستخدم')),
+        const SizedBox(height: 8),
         TextField(controller: jobTitle, decoration: const InputDecoration(labelText: 'المسمى الوظيفي')),
+        const SizedBox(height: 8),
         TextField(controller: phone, decoration: const InputDecoration(labelText: 'الهاتف')),
+        const SizedBox(height: 8),
         TextField(controller: email, decoration: const InputDecoration(labelText: 'البريد')),
         if (message != null) ...[
           const SizedBox(height: 12),
@@ -3757,11 +3806,23 @@ class _TransferDialogState extends State<TransferDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('طلب مناقلة'),
+      insetPadding: const EdgeInsets.all(10),
+      title: Row(
+        children: [
+          const Icon(Icons.sync_alt_rounded, color: brandColor),
+          const SizedBox(width: 8),
+          const Expanded(child: Text('طلب مناقلة جديد')),
+          IconButton(
+            tooltip: 'إغلاق',
+            onPressed: () => Navigator.pop(context),
+            icon: const Icon(Icons.close_rounded),
+          ),
+        ],
+      ),
       content: SizedBox(
-        width: 680,
+        width: MediaQuery.sizeOf(context).width,
         child: ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.76),
+          constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.82),
           child: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -3867,13 +3928,29 @@ class _TransferDialogState extends State<TransferDialog> {
                 if (items.isEmpty)
                   const EmptyState(icon: Icons.playlist_add_rounded, text: 'أضف كتابا واحدا على الأقل')
                 else
-                  ...items.map((item) => ListTile(
+                  ...items.asMap().entries.map((entry) {
+                    final index = entry.key;
+                    final item = entry.value;
+                    return Card(
+                      child: ListTile(
                         dense: true,
                         leading: const Icon(Icons.check_circle_outline_rounded, color: brandColor),
                         title: Text(item.name),
                         subtitle: Text('رقم ${item.matNum}${item.note.isEmpty ? '' : ' · ${item.note}'}'),
-                        trailing: Text('${item.quantity}'),
-                      )),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(formatMoneyValue(item.quantity)),
+                            IconButton(
+                              tooltip: 'حذف البند',
+                              onPressed: () => setState(() => items.removeAt(index)),
+                              icon: const Icon(Icons.delete_outline_rounded),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  }),
               ],
             ),
           ),
@@ -4091,6 +4168,7 @@ class ChatThreadPage extends StatefulWidget {
 class _ChatThreadPageState extends State<ChatThreadPage> {
   final message = TextEditingController();
   late Future<List<Map<String, dynamic>>> future;
+  List<Map<String, dynamic>>? latestMessages;
   Timer? timer;
   RealtimeChannel? channel;
   bool sendingMessage = false;
@@ -4098,7 +4176,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   @override
   void initState() {
     super.initState();
-    future = loadMessages();
+    future = loadAndRememberMessages();
     channel = supabase.channel('chat-thread-${widget.thread['id']}')
       ..onPostgresChanges(
         event: PostgresChangeEvent.all,
@@ -4110,11 +4188,11 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
           value: widget.thread['id'],
         ),
         callback: (_) {
-          if (mounted) setState(() => future = loadMessages());
+          if (mounted) setState(() => future = loadAndRememberMessages());
         },
       ).subscribe();
-    timer = Timer.periodic(const Duration(seconds: 4), (_) {
-      if (mounted) setState(() => future = loadMessages());
+    timer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (mounted) setState(() => future = loadAndRememberMessages());
     });
   }
 
@@ -4126,6 +4204,12 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     super.dispose();
   }
 
+  Future<List<Map<String, dynamic>>> loadAndRememberMessages() async {
+    final loaded = await loadMessages();
+    latestMessages = loaded;
+    return loaded;
+  }
+
   Future<List<Map<String, dynamic>>> loadMessages() async {
     final rows = await supabase
         .from('ansar_chat_messages')
@@ -4134,7 +4218,19 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
         .isFilter('deleted_at', null)
         .order('created_at', ascending: true)
         .limit(120);
-    return rows.cast<Map<String, dynamic>>();
+    final messages = rows.cast<Map<String, dynamic>>();
+    final senderIds = messages.map((row) => row['sender_id'] as String?).whereType<String>().toSet().toList();
+    final employeeRows = senderIds.isEmpty
+        ? <Map<String, dynamic>>[]
+        : await supabase
+            .from('ansar_employees')
+            .select('id, display_name, full_name, username')
+            .inFilter('id', senderIds);
+    final names = {
+      for (final row in employeeRows.cast<Map<String, dynamic>>())
+        row['id'] as String: (row['display_name'] ?? row['full_name'] ?? row['username'] ?? 'موظف') as String,
+    };
+    return messages.map((row) => {...row, 'sender_name': names[row['sender_id']] ?? 'موظف'}).toList();
   }
 
   Future<void> sendMessage() async {
@@ -4152,7 +4248,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       await supabase
           .from('ansar_chat_threads')
           .update({'updated_at': DateTime.now().toUtc().toIso8601String()}).eq('id', widget.thread['id']);
-      if (mounted) setState(() => future = loadMessages());
+      if (mounted) setState(() => future = loadAndRememberMessages());
       unawaited(enqueueChatNotification(
         thread: widget.thread,
         sender: widget.session,
@@ -4171,7 +4267,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     await supabase
         .from('ansar_chat_messages')
         .update({'deleted_at': DateTime.now().toUtc().toIso8601String()}).eq('id', row['id']);
-    setState(() => future = loadMessages());
+    setState(() => future = loadAndRememberMessages());
   }
 
   @override
@@ -4182,7 +4278,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
         actions: [
           IconButton(
             tooltip: 'تحديث',
-            onPressed: () => setState(() => future = loadMessages()),
+            onPressed: () => setState(() => future = loadAndRememberMessages()),
             icon: const Icon(Icons.refresh_rounded),
           ),
         ],
@@ -4192,14 +4288,15 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
           Expanded(
             child: FutureBuilder<List<Map<String, dynamic>>>(
               future: future,
+              initialData: latestMessages,
               builder: (context, snapshot) {
-                if (snapshot.connectionState != ConnectionState.done) {
+                if (snapshot.connectionState != ConnectionState.done && !snapshot.hasData) {
                   return const Center(child: CircularProgressIndicator());
                 }
-                if (snapshot.hasError) {
+                if (snapshot.hasError && !snapshot.hasData) {
                   return ErrorState(
                     message: cleanError(snapshot.error),
-                    onRetry: () => setState(() => future = loadMessages()),
+                    onRetry: () => setState(() => future = loadAndRememberMessages()),
                   );
                 }
                 final messages = snapshot.data!;
@@ -4212,6 +4309,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                   itemBuilder: (context, i) {
                     final row = messages[i];
                     final mine = row['sender_id'] == widget.session.id;
+                    final senderName = mine ? 'أنت' : row['sender_name'] as String? ?? 'موظف';
                     return Align(
                       alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
                       child: ConstrainedBox(
@@ -4225,6 +4323,15 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
+                                  Text(
+                                    senderName,
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.bold,
+                                      color: mine ? brandColor : Colors.black54,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 4),
                                   Text(row['body'] as String? ?? ''),
                                   const SizedBox(height: 5),
                                   Text(
@@ -5104,6 +5211,7 @@ Future<void> kickNotificationSender() async {
 bool isNotificationForSession(Map<String, dynamic> row, EmployeeSession session) {
   final data = row['data'];
   if (data is Map && data['sender_id'] == session.id) return false;
+  if (data is Map && data['employee_id'] == session.id) return false;
 
   final employeeId = row['employee_id'] as String?;
   if (employeeId != null && employeeId.isNotEmpty) return employeeId == session.id;
@@ -5246,7 +5354,14 @@ Future<void> saveDeviceToken(EmployeeSession session, String token) async {
 }
 
 String cleanError(Object? error) {
-  return error.toString().replaceFirst('Exception: ', '');
+  final text = error.toString().replaceFirst('Exception: ', '');
+  if (text.contains('setState() callback argument returned a Future')) {
+    return 'تم تنفيذ العملية، وسيتم تحديث الصفحة تلقائيا';
+  }
+  if (text.length > 220) {
+    return 'تعذر تنفيذ العملية الآن. حاول مرة أخرى.';
+  }
+  return text;
 }
 
 String formatTime(DateTime value) {
@@ -5352,7 +5467,24 @@ String? emptyToNull(String value) {
 }
 
 void showSnack(BuildContext context, String message) {
-  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  final cleaned = cleanError(message);
+  if (cleaned.trim().isEmpty) return;
+  ScaffoldMessenger.of(context)
+    ..hideCurrentSnackBar()
+    ..showSnackBar(
+      SnackBar(
+        content: Text(cleaned, style: const TextStyle(color: inkColor)),
+        backgroundColor: panelSurface,
+        behavior: SnackBarBehavior.floating,
+        elevation: 2,
+        margin: const EdgeInsets.all(14),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+          side: BorderSide(color: brandColor.withOpacity(0.18)),
+        ),
+        duration: const Duration(seconds: 2),
+      ),
+    );
 }
 
 Future<bool> confirmDialog(
