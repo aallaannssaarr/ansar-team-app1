@@ -77,7 +77,12 @@ serve(async () => {
 });
 
 async function getTargetTokens(item: QueueItem): Promise<DeviceToken[]> {
-  const senderId = typeof item.data?.sender_id === "string" ? item.data.sender_id : null;
+  const senderId =
+    typeof item.data?.sender_id === "string"
+      ? item.data.sender_id
+      : typeof item.data?.employee_id === "string"
+        ? item.data.employee_id
+        : null;
 
   if (item.employee_id) {
     return (await loadTokens()).filter((token) => token.employee_id === item.employee_id && token.employee_id !== senderId);

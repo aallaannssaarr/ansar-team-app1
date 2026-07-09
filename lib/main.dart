@@ -370,6 +370,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     startInAppNotificationMonitor();
     foregroundMessages = FirebaseMessaging.onMessage.listen((message) {
       if (!mounted) return;
+      if (message.data['sender_id'] == session.id || message.data['employee_id'] == session.id) return;
       final title = message.notification?.title ?? 'إشعار جديد';
       final body = message.notification?.body ?? '';
       showSnack(context, body.isEmpty ? title : '$title\n$body');
@@ -512,6 +513,7 @@ class _DashboardPageState extends State<DashboardPage> {
   Timer? timer;
   RealtimeChannel? attendanceChannel;
   bool attendanceBusy = false;
+  bool dashboardRefreshing = false;
   bool movementsExpanded = false;
 
   @override
@@ -524,11 +526,15 @@ class _DashboardPageState extends State<DashboardPage> {
         schema: 'public',
         table: 'ansar_attendance_logs',
         callback: (_) {
-          if (mounted) setState(() => future = loadAndRememberDashboard());
+          if (mounted) setState(() {
+            future = loadAndRememberDashboard();
+          });
         },
       ).subscribe();
-    timer = Timer.periodic(const Duration(seconds: 3), (_) {
-      if (mounted) setState(() => future = loadAndRememberDashboard());
+    timer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (mounted) setState(() {
+        future = loadAndRememberDashboard();
+      });
     });
   }
 
@@ -543,6 +549,20 @@ class _DashboardPageState extends State<DashboardPage> {
     final loaded = await loadDashboard();
     latestDashboard = loaded;
     return loaded;
+  }
+
+  Future<void> refreshDashboard() async {
+    if (dashboardRefreshing) return;
+    final refreshed = loadAndRememberDashboard();
+    setState(() {
+      dashboardRefreshing = true;
+      future = refreshed;
+    });
+    try {
+      await refreshed;
+    } finally {
+      if (mounted) setState(() => dashboardRefreshing = false);
+    }
   }
 
   Future<DashboardData> loadDashboard() async {
@@ -658,7 +678,9 @@ class _DashboardPageState extends State<DashboardPage> {
           'branch_num': widget.session.branchNum,
         },
       ));
-      if (mounted) setState(() => future = loadAndRememberDashboard());
+      if (mounted) setState(() {
+        future = loadAndRememberDashboard();
+      });
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -682,7 +704,9 @@ class _DashboardPageState extends State<DashboardPage> {
           'branch_num': widget.session.branchNum,
         },
       ));
-      if (mounted) setState(() => future = loadAndRememberDashboard());
+      if (mounted) setState(() {
+        future = loadAndRememberDashboard();
+      });
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -695,7 +719,9 @@ class _DashboardPageState extends State<DashboardPage> {
     return RefreshIndicator(
       onRefresh: () {
         final refreshed = loadAndRememberDashboard();
-        setState(() => future = refreshed);
+        setState(() {
+          future = refreshed;
+        });
         return refreshed.then((_) {});
       },
       child: FutureBuilder<DashboardData>(
@@ -708,7 +734,9 @@ class _DashboardPageState extends State<DashboardPage> {
           if (snapshot.hasError && !snapshot.hasData) {
             return ErrorState(
               message: cleanError(snapshot.error),
-              onRetry: () => setState(() => future = loadAndRememberDashboard()),
+              onRetry: () => setState(() {
+                future = loadAndRememberDashboard();
+              }),
             );
           }
 
@@ -816,8 +844,10 @@ class _DashboardPageState extends State<DashboardPage> {
                     children: [
                       IconButton(
                         tooltip: 'تحديث',
-                        onPressed: () => setState(() => future = loadAndRememberDashboard()),
-                        icon: const Icon(Icons.refresh_rounded),
+                        onPressed: refreshDashboard,
+                        icon: dashboardRefreshing
+                            ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                            : const Icon(Icons.refresh_rounded),
                       ),
                       Icon(movementsExpanded ? Icons.expand_less_rounded : Icons.expand_more_rounded),
                     ],
@@ -996,13 +1026,20 @@ class _ReportsPageState extends State<ReportsPage> {
   int? selectedBranch;
   String? selectedEmployeeId;
   late Future<ReportData> future;
+  ReportData? latestReport;
 
   @override
   void initState() {
     super.initState();
     selectedBranch = widget.session.isAdmin ? null : widget.session.branchNum;
     selectedEmployeeId = widget.session.isAdmin || widget.session.isBranchManager ? null : widget.session.id;
-    future = loadReports();
+    future = loadAndRememberReports();
+  }
+
+  Future<ReportData> loadAndRememberReports() async {
+    final loaded = await loadReports();
+    latestReport = loaded;
+    return loaded;
   }
 
   Future<ReportData> loadReports() async {
@@ -1081,21 +1118,32 @@ class _ReportsPageState extends State<ReportsPage> {
   }
 
   void reload() {
-    setState(() => future = loadReports());
+    setState(() {
+      future = loadAndRememberReports();
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<ReportData>(
       future: future,
+      initialData: latestReport,
       builder: (context, snapshot) {
-        if (snapshot.connectionState != ConnectionState.done) {
+        if (snapshot.connectionState != ConnectionState.done && !snapshot.hasData) {
           return const Center(child: CircularProgressIndicator());
         }
-        if (snapshot.hasError) {
+        if (snapshot.hasError && !snapshot.hasData) {
           return ErrorState(message: cleanError(snapshot.error), onRetry: reload);
         }
         final data = snapshot.data!;
+        final topEmployee = data.durations.isEmpty ? null : data.durations.first;
+        final selectedBranchName = selectedBranch == null ? 'كل الفروع' : branchLabel(data.branches, selectedBranch!);
+        var selectedEmployeeName =
+            widget.session.isAdmin || widget.session.isBranchManager ? 'كل الموظفين' : widget.session.name;
+        if (selectedEmployeeId != null) {
+          final matches = data.employees.where((employee) => employee.id == selectedEmployeeId).toList();
+          selectedEmployeeName = matches.isEmpty ? 'موظف محدد' : matches.first.name;
+        }
         return ListView(
           padding: const EdgeInsets.all(16),
           children: [
@@ -1108,6 +1156,7 @@ class _ReportsPageState extends State<ReportsPage> {
                       children: [
                         Expanded(
                           child: DropdownButtonFormField<int>(
+                            key: ValueKey('days-$days'),
                             initialValue: days,
                             decoration: const InputDecoration(labelText: 'الفترة'),
                             items: const [
@@ -1132,6 +1181,7 @@ class _ReportsPageState extends State<ReportsPage> {
                     if (widget.session.isAdmin) ...[
                       const SizedBox(height: 10),
                       DropdownButtonFormField<int?>(
+                        key: ValueKey('branch-${selectedBranch ?? 'all'}'),
                         initialValue: selectedBranch,
                         decoration: const InputDecoration(labelText: 'الفرع'),
                         items: [
@@ -1153,6 +1203,7 @@ class _ReportsPageState extends State<ReportsPage> {
                     if (widget.session.isAdmin || widget.session.isBranchManager) ...[
                       const SizedBox(height: 10),
                       DropdownButtonFormField<String?>(
+                        key: ValueKey('employee-${selectedEmployeeId ?? 'all'}-${data.employees.length}'),
                         initialValue: selectedEmployeeId,
                         decoration: const InputDecoration(labelText: 'الموظف'),
                         items: [
@@ -1170,6 +1221,27 @@ class _ReportsPageState extends State<ReportsPage> {
                         },
                       ),
                     ],
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Card(
+              color: brandColor.withOpacity(0.07),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    InfoChip(icon: Icons.date_range_rounded, label: 'آخر $days يوم'),
+                    InfoChip(icon: Icons.storefront_rounded, label: selectedBranchName),
+                    InfoChip(icon: Icons.person_search_rounded, label: selectedEmployeeName),
+                    if (topEmployee != null)
+                      InfoChip(
+                        icon: Icons.emoji_events_rounded,
+                        label: 'الأطول دواما: ${topEmployee.employee.name} (${topEmployee.hours.toStringAsFixed(1)} ساعة)',
+                      ),
                   ],
                 ),
               ),
@@ -1727,7 +1799,9 @@ class _AccountStatementPageState extends State<AccountStatementPage> {
           ),
           const SizedBox(height: 10),
           FilledButton.icon(
-            onPressed: () => setState(() => future = loadEntries()),
+            onPressed: () => setState(() {
+              future = loadEntries();
+            }),
             icon: const Icon(Icons.search_rounded),
             label: const Text('عرض الكشف'),
           ),
@@ -1738,7 +1812,14 @@ class _AccountStatementPageState extends State<AccountStatementPage> {
               if (snapshot.connectionState != ConnectionState.done) {
                 return const Center(child: Padding(padding: EdgeInsets.all(24), child: CircularProgressIndicator()));
               }
-              if (snapshot.hasError) return ErrorState(message: cleanError(snapshot.error), onRetry: () => setState(() => future = loadEntries()));
+              if (snapshot.hasError) {
+                return ErrorState(
+                  message: cleanError(snapshot.error),
+                  onRetry: () => setState(() {
+                    future = loadEntries();
+                  }),
+                );
+              }
               final rows = snapshot.data!;
               if (rows.isEmpty) return const EmptyState(icon: Icons.receipt_long_rounded, text: 'لا توجد حركات ضمن الفترة');
               var running = 0.0;
@@ -1822,7 +1903,14 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
           if (snapshot.connectionState != ConnectionState.done) {
             return const Center(child: CircularProgressIndicator());
           }
-          if (snapshot.hasError) return ErrorState(message: cleanError(snapshot.error), onRetry: () => setState(() => future = loadItems()));
+          if (snapshot.hasError) {
+            return ErrorState(
+              message: cleanError(snapshot.error),
+              onRetry: () => setState(() {
+                future = loadItems();
+              }),
+            );
+          }
           final data = snapshot.data!;
           final items = data.items;
           final payment = paymentLabelFromRemark(widget.bill['remark']);
@@ -1887,36 +1975,55 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
               else
                 Card(
                   child: Padding(
-                    padding: const EdgeInsets.all(10),
-                    child: SingleChildScrollView(
-                      scrollDirection: Axis.horizontal,
-                      child: DataTable(
-                        headingRowColor: WidgetStatePropertyAll(brandColor.withOpacity(0.08)),
-                        columns: const [
-                          DataColumn(label: Text('المادة')),
-                          DataColumn(label: Text('الكمية')),
-                          DataColumn(label: Text('السعر')),
-                          DataColumn(label: Text('الحسم')),
-                          DataColumn(label: Text('القيمة')),
-                          DataColumn(label: Text('المستودع')),
-                        ],
-                        rows: items.map((item) {
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text('بنود الفاتورة', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                        const Divider(height: 18),
+                        ...items.asMap().entries.map((entry) {
+                          final index = entry.key;
+                          final item = entry.value;
                           final itemSto = parseStoNum(item['remarki']);
-                          return DataRow(
-                            cells: [
-                              DataCell(SizedBox(
-                                width: 190,
-                                child: Text(item['product_name'] as String? ?? 'مادة ${item['matnum']}'),
-                              )),
-                              DataCell(Text(formatMoneyValue(item['quantity']))),
-                              DataCell(Text(formatMoneyValue(item['price']))),
-                              DataCell(Text(discountDisplay(item))),
-                              DataCell(Text(formatMoneyValue(item['value']))),
-                              DataCell(Text(itemSto == null ? '-' : branchLabel(data.branches, itemSto))),
-                            ],
+                          return Padding(
+                            padding: EdgeInsets.only(bottom: index == items.length - 1 ? 0 : 12),
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                color: softSurface,
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: Colors.black12),
+                              ),
+                              child: Padding(
+                                padding: const EdgeInsets.all(10),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      item['product_name'] as String? ?? 'مادة ${item['matnum']}',
+                                      style: const TextStyle(fontWeight: FontWeight.bold),
+                                    ),
+                                    const SizedBox(height: 8),
+                                    Wrap(
+                                      spacing: 8,
+                                      runSpacing: 8,
+                                      children: [
+                                        InfoChip(icon: Icons.numbers_rounded, label: 'الكمية ${formatMoneyValue(item['quantity'])}'),
+                                        InfoChip(icon: Icons.sell_rounded, label: 'السعر ${formatMoneyValue(item['price'])}'),
+                                        InfoChip(icon: Icons.percent_rounded, label: 'الحسم ${discountDisplay(item)}'),
+                                        InfoChip(icon: Icons.summarize_rounded, label: 'القيمة ${formatMoneyValue(item['value'])}'),
+                                        InfoChip(
+                                          icon: Icons.warehouse_rounded,
+                                          label: itemSto == null ? 'مستودع غير محدد' : branchLabel(data.branches, itemSto),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
                           );
-                        }).toList(),
-                      ),
+                        }),
+                      ],
                     ),
                   ),
                 ),
@@ -1975,6 +2082,13 @@ class ProductResultCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final product = result.product;
     final matNum = product['mat_num'];
+    final prices = [
+      ('سعر الجرد', product['jard_price']),
+      ('السعر القائم', product['regular_price']),
+      ('سعر المكتبات', product['price1']),
+      ('سعر المعاهد', product['price2']),
+      ('سعر المفرق', product['price3']),
+    ].where((item) => hasVisiblePrice(item.$2)).toList();
     return Card(
       child: ExpansionTile(
         leading: const CircleAvatar(child: Icon(Icons.menu_book_rounded)),
@@ -1982,17 +2096,22 @@ class ProductResultCard extends StatelessWidget {
         subtitle: Text('رقم المادة $matNum · إجمالي الكمية ${formatMoneyValue(product['quantity'])}'),
         childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
         children: [
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              PriceChip(label: 'سعر الجرد', value: product['jard_price']),
-              PriceChip(label: 'السعر القائم', value: product['regular_price']),
-              PriceChip(label: 'سعر المكتبات', value: product['price1']),
-              PriceChip(label: 'سعر المعاهد', value: product['price2']),
-              PriceChip(label: 'سعر المفرق', value: product['price3']),
-            ],
-          ),
+          if (prices.isNotEmpty)
+            Card(
+              color: softSurface,
+              child: Column(
+                children: prices
+                    .map(
+                      (price) => ListTile(
+                        dense: true,
+                        leading: const Icon(Icons.sell_rounded, color: brandColor),
+                        title: Text(price.$1),
+                        trailing: Text(formatMoneyValue(price.$2), style: const TextStyle(fontWeight: FontWeight.bold)),
+                      ),
+                    )
+                    .toList(),
+              ),
+            ),
           const SizedBox(height: 10),
           if (result.stock.isEmpty)
             const Align(
@@ -2000,22 +2119,42 @@ class ProductResultCard extends StatelessWidget {
               child: Text('لا توجد كميات حسب الفروع', style: TextStyle(color: Colors.black54)),
             )
           else
-            ...result.stock.take(10).map(
+            ...result.stock.map(
                   (stock) => ListTile(
                     dense: true,
                     contentPadding: EdgeInsets.zero,
                     leading: Icon(
-                      stock.quantity > 0 ? Icons.storefront_rounded : Icons.storefront_outlined,
-                      color: stock.quantity > 0 ? brandColor : Colors.black38,
+                      stock.quantity < 0
+                          ? Icons.warning_rounded
+                          : stock.quantity > 0
+                              ? Icons.storefront_rounded
+                              : Icons.storefront_outlined,
+                      color: stock.quantity < 0
+                          ? Colors.red
+                          : stock.quantity > 0
+                              ? brandColor
+                              : Colors.black38,
                     ),
                     title: Text(stock.branchName),
-                    trailing: Text(formatMoneyValue(stock.quantity)),
+                    trailing: Text(
+                      formatMoneyValue(stock.quantity),
+                      style: TextStyle(
+                        color: stock.quantity < 0 ? Colors.red : inkColor,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
                   ),
                 ),
         ],
       ),
     );
   }
+}
+
+bool hasVisiblePrice(Object? value) {
+  if (value == null) return false;
+  final number = (value as num?)?.toDouble() ?? double.tryParse('$value');
+  return number != null && number.abs() > 0.001;
 }
 
 class PriceChip extends StatelessWidget {
@@ -2042,6 +2181,31 @@ class InfoChip extends StatelessWidget {
       avatar: Icon(icon, size: 16),
       label: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
       materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    );
+  }
+}
+
+class StatusPill extends StatelessWidget {
+  const StatusPill({super.key, required this.label, required this.color});
+
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: color.withOpacity(0.25)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        child: Text(
+          label,
+          style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w700),
+        ),
+      ),
     );
   }
 }
@@ -2142,7 +2306,9 @@ class _EmployeesPageState extends State<EmployeesPage> {
       } else {
         await supabase.from('ansar_employees').update(result).eq('id', employee['id']);
       }
-      if (mounted) setState(() => employeesFuture = loadEmployees());
+      if (mounted) setState(() {
+        employeesFuture = loadEmployees();
+      });
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -2160,7 +2326,9 @@ class _EmployeesPageState extends State<EmployeesPage> {
     setState(() => employeeBusy = true);
     try {
       await supabase.from('ansar_employees').update({'is_active': false}).eq('id', employee['id']);
-      if (mounted) setState(() => employeesFuture = loadEmployees());
+      if (mounted) setState(() {
+        employeesFuture = loadEmployees();
+      });
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -2179,7 +2347,9 @@ class _EmployeesPageState extends State<EmployeesPage> {
         if (snapshot.hasError) {
           return ErrorState(
             message: cleanError(snapshot.error),
-            onRetry: () => setState(() => employeesFuture = loadEmployees()),
+            onRetry: () => setState(() {
+              employeesFuture = loadEmployees();
+            }),
           );
         }
         final data = snapshot.data!;
@@ -2376,7 +2546,9 @@ class _BranchesPageState extends State<BranchesPage> {
           'created_by': widget.session.id,
         });
       }
-      if (mounted) setState(() => future = loadAppBranchesMap());
+      if (mounted) setState(() {
+        future = loadAppBranchesMap();
+      });
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -2399,7 +2571,9 @@ class _BranchesPageState extends State<BranchesPage> {
         'is_active': false,
         'created_by': widget.session.id,
       });
-      if (mounted) setState(() => future = loadAppBranchesMap());
+      if (mounted) setState(() {
+        future = loadAppBranchesMap();
+      });
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -2418,7 +2592,9 @@ class _BranchesPageState extends State<BranchesPage> {
         if (snapshot.hasError) {
           return ErrorState(
             message: cleanError(snapshot.error),
-            onRetry: () => setState(() => future = loadAppBranchesMap()),
+            onRetry: () => setState(() {
+              future = loadAppBranchesMap();
+            }),
           );
         }
         final branches = snapshot.data!.values.toList();
@@ -2586,7 +2762,9 @@ class _NotificationDiagnosticsPageState extends State<NotificationDiagnosticsPag
         if (snapshot.hasError) {
           return ErrorState(
             message: cleanError(snapshot.error),
-            onRetry: () => setState(() => future = loadDiagnostics()),
+            onRetry: () => setState(() {
+              future = loadDiagnostics();
+            }),
           );
         }
 
@@ -2771,8 +2949,7 @@ class _ProfilePageState extends State<ProfilePage> {
           .from('ansar_employees')
           .update(update)
           .eq('id', widget.session.id)
-          .select()
-          .limit(1);
+          .select();
       if (rows.isNotEmpty) widget.onSessionChanged(EmployeeSession(rows.first));
       if (mounted) showSnack(context, 'تم حفظ بياناتك');
     } catch (e) {
@@ -2966,11 +3143,16 @@ class _TransfersPageState extends State<TransfersPage> {
       showSnack(context, 'أضف فرعين على الأقل قبل إنشاء مناقلة');
       return;
     }
-    final result = await showDialog<CreateTransferResult>(
-      context: context,
-      builder: (_) => TransferDialog(
-        session: widget.session,
-        branches: data.branches,
+    final result = await Navigator.of(context).push<CreateTransferResult>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: TransferDialog(
+            session: widget.session,
+            branches: data.branches,
+          ),
+        ),
       ),
     );
     if (result == null) return;
@@ -3009,9 +3191,11 @@ class _TransfersPageState extends State<TransfersPage> {
         title: 'مناقلة جديدة',
         body:
             'طلب مناقلة من ${branchLabel(data.branches, widget.session.branchNum)} إلى ${branchLabel(data.branches, result.toBranch)}',
-        data: {'type': 'transfer_created', 'order_id': inserted['id']},
+        data: {'type': 'transfer_created', 'order_id': inserted['id'], 'sender_id': widget.session.id},
       ));
-      if (mounted) setState(() => future = loadTransfers());
+      if (mounted) setState(() {
+        future = loadTransfers();
+      });
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -3048,9 +3232,11 @@ class _TransfersPageState extends State<TransfersPage> {
       unawaited(enqueueNotification(
         title: 'تحديث مناقلة',
         body: 'تم تحديث حالة المناقلة رقم ${order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
-        data: {'type': 'transfer_updated', 'order_id': order['id'], 'status': status},
+        data: {'type': 'transfer_updated', 'order_id': order['id'], 'status': status, 'sender_id': widget.session.id},
       ));
-      if (mounted) setState(() => future = loadTransfers());
+      if (mounted) setState(() {
+        future = loadTransfers();
+      });
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -3071,7 +3257,9 @@ class _TransfersPageState extends State<TransfersPage> {
         ),
       ),
     );
-    if (mounted) setState(() => future = loadTransfers());
+    if (mounted) setState(() {
+      future = loadTransfers();
+    });
   }
 
   @override
@@ -3085,7 +3273,9 @@ class _TransfersPageState extends State<TransfersPage> {
         if (snapshot.hasError) {
           return ErrorState(
             message: cleanError(snapshot.error),
-            onRetry: () => setState(() => future = loadTransfers()),
+            onRetry: () => setState(() {
+              future = loadTransfers();
+            }),
           );
         }
         final data = snapshot.data!;
@@ -3102,7 +3292,9 @@ class _TransfersPageState extends State<TransfersPage> {
                 onStatusChanged: (value) => setState(() => statusFilter = value),
                 onFromChanged: (value) => setState(() => fromBranchFilter = value),
                 onToChanged: (value) => setState(() => toBranchFilter = value),
-                onRefresh: () => setState(() => future = loadTransfers()),
+                onRefresh: () => setState(() {
+                  future = loadTransfers();
+                }),
               ),
               Expanded(
                 child: visibleOrders.isEmpty
@@ -3122,27 +3314,65 @@ class _TransfersPageState extends State<TransfersPage> {
                     final canHandle = widget.session.isAdmin || toBranch == widget.session.branchNum;
                     final status = order['status'] as String? ?? 'submitted';
                     return Card(
-                      child: ListTile(
-                        leading: CircleAvatar(
-                          backgroundColor: transferStatusColor(status).withOpacity(0.12),
-                          child: Icon(transferStatusIcon(status), color: transferStatusColor(status)),
-                        ),
-                        title: Text('طلب رقم ${order['order_no'] ?? '-'}'),
-                        subtitle: Text(
-                          '${branchLabel(data.branches, fromBranch)} ← ${branchLabel(data.branches, toBranch)}\n'
-                          '${requester?.name ?? 'موظف'} · ${statusLabel(status)}',
-                        ),
-                        isThreeLine: true,
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(8),
                         onTap: () => openOrderDetails(order, data),
-                        trailing: canHandle
-                            ? IconButton(
-                                tooltip: 'تحديث الحالة',
-                                onPressed: transferBusy ? null : () => updateOrderStatus(order),
-                                icon: transferBusy
-                                    ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                                    : const Icon(Icons.edit_note_rounded),
-                              )
-                            : const Icon(Icons.chevron_left_rounded),
+                        child: Padding(
+                          padding: const EdgeInsets.all(12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  CircleAvatar(
+                                    backgroundColor: transferStatusColor(status).withOpacity(0.12),
+                                    child: Icon(transferStatusIcon(status), color: transferStatusColor(status)),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Text(
+                                      'طلب رقم ${order['order_no'] ?? '-'}',
+                                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                                    ),
+                                  ),
+                                  StatusPill(
+                                    label: statusLabel(status),
+                                    color: transferStatusColor(status),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 10),
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  InfoChip(icon: Icons.call_made_rounded, label: branchLabel(data.branches, fromBranch)),
+                                  InfoChip(icon: Icons.call_received_rounded, label: branchLabel(data.branches, toBranch)),
+                                  InfoChip(icon: Icons.person_rounded, label: requester?.name ?? 'موظف'),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              Row(
+                                children: [
+                                  TextButton.icon(
+                                    onPressed: () => openOrderDetails(order, data),
+                                    icon: const Icon(Icons.visibility_rounded),
+                                    label: const Text('التفاصيل'),
+                                  ),
+                                  const Spacer(),
+                                  if (canHandle)
+                                    IconButton.filledTonal(
+                                      tooltip: 'تحديث الحالة',
+                                      onPressed: transferBusy ? null : () => updateOrderStatus(order),
+                                      icon: transferBusy
+                                          ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                                          : const Icon(Icons.edit_note_rounded),
+                                    ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
                     );
                   },
@@ -3238,28 +3468,8 @@ class _TransferFilters extends StatelessWidget {
           const SizedBox(height: 8),
           Row(
             children: [
-              Expanded(
-                child: DropdownButtonFormField<int?>(
-                  initialValue: fromBranchFilter,
-                  decoration: const InputDecoration(
-                    labelText: 'من فرع',
-                    prefixIcon: Icon(Icons.call_made_rounded),
-                  ),
-                  items: branchItems,
-                  onChanged: onFromChanged,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: DropdownButtonFormField<int?>(
-                  initialValue: toBranchFilter,
-                  decoration: const InputDecoration(
-                    labelText: 'إلى فرع',
-                    prefixIcon: Icon(Icons.call_received_rounded),
-                  ),
-                  items: branchItems,
-                  onChanged: onToChanged,
-                ),
+              const Expanded(
+                child: Text('فلترة المناقلات', style: TextStyle(fontWeight: FontWeight.bold)),
               ),
               IconButton(
                 tooltip: 'تحديث',
@@ -3267,6 +3477,27 @@ class _TransferFilters extends StatelessWidget {
                 icon: const Icon(Icons.refresh_rounded),
               ),
             ],
+          ),
+          DropdownButtonFormField<int?>(
+            key: ValueKey('from-${fromBranchFilter ?? 'all'}'),
+            initialValue: fromBranchFilter,
+            decoration: const InputDecoration(
+              labelText: 'من فرع',
+              prefixIcon: Icon(Icons.call_made_rounded),
+            ),
+            items: branchItems,
+            onChanged: onFromChanged,
+          ),
+          const SizedBox(height: 8),
+          DropdownButtonFormField<int?>(
+            key: ValueKey('to-${toBranchFilter ?? 'all'}'),
+            initialValue: toBranchFilter,
+            decoration: const InputDecoration(
+              labelText: 'إلى فرع',
+              prefixIcon: Icon(Icons.call_received_rounded),
+            ),
+            items: branchItems,
+            onChanged: onToChanged,
           ),
         ],
       ),
@@ -3292,7 +3523,9 @@ class TransferDetailsPage extends StatefulWidget {
 
 class _TransferDetailsPageState extends State<TransferDetailsPage> {
   late Future<TransferDetailsData> future;
+  TransferDetailsData? latestDetails;
   bool sharingPdf = false;
+  String? itemBusyId;
 
   bool get canHandle {
     final toBranch = (widget.order['to_branch_num'] as num?)?.toInt();
@@ -3302,7 +3535,13 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
   @override
   void initState() {
     super.initState();
-    future = loadItems();
+    future = loadAndRememberItems();
+  }
+
+  Future<TransferDetailsData> loadAndRememberItems() async {
+    final loaded = await loadItems();
+    latestDetails = loaded;
+    return loaded;
   }
 
   Future<TransferDetailsData> loadItems() async {
@@ -3375,24 +3614,35 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       if (value == null) return;
       approved = value;
     }
-    await supabase.from('ansar_transfer_order_items').update({
-      'item_status': status,
-      'approved_quantity': approved,
-    }).eq('id', item['id']);
-    await supabase.from('ansar_order_events').insert({
-      'order_id': widget.order['id'],
-      'employee_id': widget.session.id,
-      'event_type': 'item_changed',
-      'old_status': item['item_status'],
-      'new_status': status,
-      'note': 'بند ${(item['product'] as Map<String, dynamic>?)?['name'] ?? item['mat_num']} - الكمية المتوفرة $approved',
-    });
-    unawaited(enqueueNotification(
-      title: 'تحديث بند مناقلة',
-      body: 'تم تحديث بند في طلب المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${itemStatusLabel(status)}',
-      data: {'type': 'transfer_item_updated', 'order_id': widget.order['id']},
-    ));
-    setState(() => future = loadItems());
+    setState(() => itemBusyId = '${item['id']}');
+    try {
+      await supabase.from('ansar_transfer_order_items').update({
+        'item_status': status,
+        'approved_quantity': approved,
+      }).eq('id', item['id']);
+      await supabase.from('ansar_order_events').insert({
+        'order_id': widget.order['id'],
+        'employee_id': widget.session.id,
+        'event_type': 'item_changed',
+        'old_status': item['item_status'],
+        'new_status': status,
+        'note': 'بند ${(item['product'] as Map<String, dynamic>?)?['name'] ?? item['mat_num']} - الكمية المتوفرة $approved',
+      });
+      unawaited(enqueueNotification(
+        title: 'تحديث بند مناقلة',
+        body: 'تم تحديث بند في طلب المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${itemStatusLabel(status)}',
+        data: {'type': 'transfer_item_updated', 'order_id': widget.order['id'], 'sender_id': widget.session.id},
+      ));
+      item['item_status'] = status;
+      item['approved_quantity'] = approved;
+      if (mounted) setState(() {
+        future = loadAndRememberItems();
+      });
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => itemBusyId = null);
+    }
   }
 
   Future<void> changeStatus() async {
@@ -3418,7 +3668,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     unawaited(enqueueNotification(
       title: 'تحديث مناقلة',
       body: 'تم تحديث حالة المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
-      data: {'type': 'transfer_updated', 'order_id': widget.order['id'], 'status': status},
+      data: {'type': 'transfer_updated', 'order_id': widget.order['id'], 'status': status, 'sender_id': widget.session.id},
     ));
     if (mounted) Navigator.pop(context);
   }
@@ -3441,8 +3691,15 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
   Future<Uint8List> buildTransferPdf(TransferDetailsData data) async {
     final fromBranch = (widget.order['from_branch_num'] as num?)?.toInt() ?? 0;
     final toBranch = (widget.order['to_branch_num'] as num?)?.toInt() ?? 0;
-    final font = await PdfGoogleFonts.cairoRegular();
-    final bold = await PdfGoogleFonts.cairoBold();
+    late final pw.Font font;
+    late final pw.Font bold;
+    try {
+      font = await PdfGoogleFonts.cairoRegular();
+      bold = await PdfGoogleFonts.cairoBold();
+    } catch (_) {
+      font = pw.Font.helvetica();
+      bold = pw.Font.helveticaBold();
+    }
     final theme = pw.ThemeData.withFont(base: font, bold: bold);
     final document = pw.Document(theme: theme);
     final headers = ['الكتاب', 'المطلوب', 'المتوفر', 'الحالة', 'ملاحظة'];
@@ -3541,12 +3798,18 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       ),
       body: FutureBuilder<TransferDetailsData>(
         future: future,
+        initialData: latestDetails,
         builder: (context, snapshot) {
-          if (snapshot.connectionState != ConnectionState.done) {
+          if (snapshot.connectionState != ConnectionState.done && !snapshot.hasData) {
             return const Center(child: CircularProgressIndicator());
           }
-          if (snapshot.hasError) {
-            return ErrorState(message: cleanError(snapshot.error), onRetry: () => setState(() => future = loadItems()));
+          if (snapshot.hasError && !snapshot.hasData) {
+            return ErrorState(
+              message: cleanError(snapshot.error),
+              onRetry: () => setState(() {
+                future = loadAndRememberItems();
+              }),
+            );
           }
           final details = snapshot.data!;
           final items = details.items;
@@ -3554,15 +3817,32 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
             padding: const EdgeInsets.all(16),
             children: [
               Card(
-                child: ListTile(
-                  title: Text('${branchLabel(widget.branches, fromBranch)} ← ${branchLabel(widget.branches, toBranch)}'),
-                  subtitle: Text(statusLabel(widget.order['status'] as String? ?? 'submitted')),
-                  trailing: OutlinedButton.icon(
-                    onPressed: sharingPdf ? null : () => sharePdf(details),
-                    icon: sharingPdf
-                        ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                        : const Icon(Icons.picture_as_pdf_rounded),
-                    label: const Text('PDF'),
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          InfoChip(icon: Icons.call_made_rounded, label: branchLabel(widget.branches, fromBranch)),
+                          InfoChip(icon: Icons.call_received_rounded, label: branchLabel(widget.branches, toBranch)),
+                          StatusPill(
+                            label: statusLabel(widget.order['status'] as String? ?? 'submitted'),
+                            color: transferStatusColor(widget.order['status'] as String? ?? 'submitted'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      OutlinedButton.icon(
+                        onPressed: sharingPdf ? null : () => sharePdf(details),
+                        icon: sharingPdf
+                            ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                            : const Icon(Icons.picture_as_pdf_rounded),
+                        label: const Text('مشاركة PDF'),
+                      ),
+                    ],
                   ),
                 ),
               ),
@@ -3574,6 +3854,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                 ...items.map((item) {
                   final product = item['product'] as Map<String, dynamic>?;
                   final status = item['item_status'] as String? ?? 'requested';
+                  final busy = itemBusyId == '${item['id']}';
                   return Card(
                     child: Padding(
                       padding: const EdgeInsets.all(12),
@@ -3600,23 +3881,26 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                           if (item['note'] != null) Text('ملاحظة: ${item['note']}'),
                           if (canHandle) ...[
                             const SizedBox(height: 8),
-                            Wrap(
-                              spacing: 8,
-                              children: [
-                                ActionChip(
-                                  label: const Text('متوفر'),
-                                  onPressed: () => updateItem(item, 'available'),
-                                ),
-                                ActionChip(
-                                  label: const Text('جزئي'),
-                                  onPressed: () => updateItem(item, 'partially_available'),
-                                ),
-                                ActionChip(
-                                  label: const Text('غير متوفر'),
-                                  onPressed: () => updateItem(item, 'unavailable'),
-                                ),
-                              ],
-                            ),
+                            if (busy)
+                              const LinearProgressIndicator(minHeight: 2)
+                            else
+                              Wrap(
+                                spacing: 8,
+                                children: [
+                                  ActionChip(
+                                    label: const Text('متوفر'),
+                                    onPressed: () => updateItem(item, 'available'),
+                                  ),
+                                  ActionChip(
+                                    label: const Text('جزئي'),
+                                    onPressed: () => updateItem(item, 'partially_available'),
+                                  ),
+                                  ActionChip(
+                                    label: const Text('غير متوفر'),
+                                    onPressed: () => updateItem(item, 'unavailable'),
+                                  ),
+                                ],
+                              ),
                           ],
                         ],
                       ),
@@ -3805,13 +4089,11 @@ class _TransferDialogState extends State<TransferDialog> {
 
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
-      insetPadding: const EdgeInsets.all(10),
-      title: Row(
-        children: [
-          const Icon(Icons.sync_alt_rounded, color: brandColor),
-          const SizedBox(width: 8),
-          const Expanded(child: Text('طلب مناقلة جديد')),
+    final canSubmit = toBranch != null && items.isNotEmpty;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('طلب مناقلة جديد'),
+        actions: [
           IconButton(
             tooltip: 'إغلاق',
             onPressed: () => Navigator.pop(context),
@@ -3819,155 +4101,203 @@ class _TransferDialogState extends State<TransferDialog> {
           ),
         ],
       ),
-      content: SizedBox(
-        width: MediaQuery.sizeOf(context).width,
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.82),
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                DropdownButtonFormField<int>(
-                  initialValue: toBranch,
-                  decoration: const InputDecoration(
-                    labelText: 'الفرع المطلوب منه',
-                    prefixIcon: Icon(Icons.storefront_rounded),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 100),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  DropdownButtonFormField<int>(
+                    initialValue: toBranch,
+                    decoration: const InputDecoration(
+                      labelText: 'الفرع المطلوب منه',
+                      prefixIcon: Icon(Icons.storefront_rounded),
+                    ),
+                    items: widget.branches.values
+                        .where((branch) => branch.number != widget.session.branchNum)
+                        .map((branch) => DropdownMenuItem(value: branch.number, child: Text(branch.label)))
+                        .toList(),
+                    onChanged: (value) => setState(() => toBranch = value),
                   ),
-                  items: widget.branches.values
-                      .where((branch) => branch.number != widget.session.branchNum)
-                      .map((branch) => DropdownMenuItem(value: branch.number, child: Text(branch.label)))
-                      .toList(),
-                  onChanged: (value) => setState(() => toBranch = value),
-                ),
-                TextField(controller: note, decoration: const InputDecoration(labelText: 'ملاحظة الطلب')),
-                const SizedBox(height: 12),
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: softSurface,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.black12),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: note,
+                    minLines: 1,
+                    maxLines: 3,
+                    decoration: const InputDecoration(
+                      labelText: 'ملاحظة الطلب',
+                      prefixIcon: Icon(Icons.notes_rounded),
+                    ),
                   ),
-                  child: Column(
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          const SectionHeader(title: 'إضافة الكتب'),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  TextField(
+                    controller: bookSearch,
+                    decoration: InputDecoration(
+                      labelText: 'ابحث عن الكتاب',
+                      helperText: cacheLoading
+                          ? 'يتم تجهيز فهرس الكتب لأول مرة'
+                          : productsCount > 0
+                              ? 'جاهز للبحث السريع داخل $productsCount كتاب'
+                              : null,
+                      prefixIcon: const Icon(Icons.menu_book_rounded),
+                      suffixIcon: searching || cacheLoading
+                          ? const Padding(
+                              padding: EdgeInsets.all(12),
+                              child: SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              ),
+                            )
+                          : const Icon(Icons.manage_search_rounded),
+                    ),
+                    onChanged: queueSearch,
+                  ),
+                  if (suggestions.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Container(
+                      constraints: const BoxConstraints(maxHeight: 260),
+                      decoration: BoxDecoration(
+                        color: softSurface,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.black12),
+                      ),
+                      child: ListView.separated(
+                        shrinkWrap: true,
+                        itemCount: suggestions.length,
+                        separatorBuilder: (_, __) => const Divider(height: 1),
+                        itemBuilder: (context, index) {
+                          final product = suggestions[index];
+                          return ListTile(
+                            dense: true,
+                            leading: const Icon(Icons.menu_book_rounded),
+                            title: Text(product['name'] as String? ?? 'بدون اسم'),
+                            subtitle: Text('رقم ${product['mat_num']} · كمية ${product['quantity'] ?? '-'}'),
+                            onTap: () => selectProduct(product),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 10),
+                  Row(
                     children: [
-                      TextField(
-                        controller: bookSearch,
-                        decoration: InputDecoration(
-                          labelText: 'ابحث عن الكتاب من قاعدة البيانات',
-                          helperText: cacheLoading
-                              ? 'يتم تجهيز فهرس الكتب لأول مرة'
-                              : productsCount > 0
-                                  ? 'جاهز للبحث السريع داخل $productsCount كتاب'
-                                  : null,
-                          suffixIcon: searching || cacheLoading
-                              ? const Padding(
-                                  padding: EdgeInsets.all(12),
-                                  child: SizedBox(
-                                    width: 16,
-                                    height: 16,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
-                                  ),
-                                )
-                              : const Icon(Icons.manage_search_rounded),
+                      Expanded(
+                        child: TextField(
+                          controller: quantity,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(labelText: 'الكمية'),
                         ),
-                        onChanged: queueSearch,
                       ),
-                      if (suggestions.isNotEmpty)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 8),
-                          child: Card(
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: suggestions
-                                  .map(
-                                    (product) => ListTile(
-                                      dense: true,
-                                      leading: const Icon(Icons.menu_book_rounded),
-                                      title: Text(product['name'] as String? ?? 'بدون اسم'),
-                                      subtitle: Text('رقم ${product['mat_num']} · كمية ${product['quantity'] ?? '-'}'),
-                                      onTap: () => selectProduct(product),
-                                    ),
-                                  )
-                                  .toList(),
-                            ),
-                          ),
-                        ),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: TextField(
-                              controller: quantity,
-                              keyboardType: TextInputType.number,
-                              decoration: const InputDecoration(labelText: 'الكمية'),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            flex: 2,
-                            child: TextField(
-                              controller: itemNote,
-                              decoration: const InputDecoration(labelText: 'ملاحظة البند'),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Align(
-                        alignment: Alignment.centerLeft,
-                        child: OutlinedButton.icon(
-                          onPressed: addItem,
-                          icon: const Icon(Icons.add_rounded),
-                          label: const Text('إضافة بند'),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        flex: 2,
+                        child: TextField(
+                          controller: itemNote,
+                          decoration: const InputDecoration(labelText: 'ملاحظة البند'),
                         ),
                       ),
                     ],
                   ),
-                ),
-                const SizedBox(height: 12),
-                if (items.isEmpty)
-                  const EmptyState(icon: Icons.playlist_add_rounded, text: 'أضف كتابا واحدا على الأقل')
-                else
-                  ...items.asMap().entries.map((entry) {
-                    final index = entry.key;
-                    final item = entry.value;
-                    return Card(
-                      child: ListTile(
-                        dense: true,
-                        leading: const Icon(Icons.check_circle_outline_rounded, color: brandColor),
-                        title: Text(item.name),
-                        subtitle: Text('رقم ${item.matNum}${item.note.isEmpty ? '' : ' · ${item.note}'}'),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
+                  const SizedBox(height: 10),
+                  OutlinedButton.icon(
+                    onPressed: addItem,
+                    icon: const Icon(Icons.add_rounded),
+                    label: const Text('إضافة بند'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          SectionHeader(title: 'بنود الطلب (${items.length})'),
+          if (items.isEmpty)
+            const EmptyState(icon: Icons.playlist_add_rounded, text: 'أضف كتابا واحدا على الأقل')
+          else
+            ...items.asMap().entries.map((entry) {
+              final index = entry.key;
+              final item = entry.value;
+              return Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Icon(Icons.check_circle_outline_rounded, color: brandColor),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(formatMoneyValue(item.quantity)),
-                            IconButton(
-                              tooltip: 'حذف البند',
-                              onPressed: () => setState(() => items.removeAt(index)),
-                              icon: const Icon(Icons.delete_outline_rounded),
+                            Text(item.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 4),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 6,
+                              children: [
+                                InfoChip(icon: Icons.tag_rounded, label: 'رقم ${item.matNum}'),
+                                InfoChip(icon: Icons.numbers_rounded, label: 'الكمية ${formatMoneyValue(item.quantity)}'),
+                                if (item.note.isNotEmpty) InfoChip(icon: Icons.notes_rounded, label: item.note),
+                              ],
                             ),
                           ],
                         ),
                       ),
-                    );
-                  }),
-              ],
-            ),
+                      IconButton(
+                        tooltip: 'حذف البند',
+                        onPressed: () => setState(() => items.removeAt(index)),
+                        icon: const Icon(Icons.delete_outline_rounded),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }),
+        ],
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('إلغاء'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 2,
+                child: FilledButton.icon(
+                  onPressed: canSubmit
+                      ? () => Navigator.pop(
+                            context,
+                            CreateTransferResult(toBranch: toBranch!, note: note.text.trim(), items: items),
+                          )
+                      : null,
+                  icon: const Icon(Icons.send_rounded),
+                  label: const Text('إرسال الطلب'),
+                ),
+              ),
+            ],
           ),
         ),
       ),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
-        FilledButton(
-          onPressed: toBranch == null || items.isEmpty
-              ? null
-              : () => Navigator.pop(
-                    context,
-                    CreateTransferResult(toBranch: toBranch!, note: note.text.trim(), items: items),
-                  ),
-          child: const Text('إرسال'),
-        ),
-      ],
     );
   }
 }
@@ -4062,7 +4392,9 @@ class _ChatPageState extends State<ChatPage> {
         ),
       ),
     );
-    if (mounted) setState(() => future = loadThreads());
+    if (mounted) setState(() {
+      future = loadThreads();
+    });
   }
 
   Future<void> createThread() async {
@@ -4096,7 +4428,9 @@ class _ChatPageState extends State<ChatPage> {
                     })
                 .toList(),
           );
-      if (mounted) setState(() => future = loadThreads());
+      if (mounted) setState(() {
+        future = loadThreads();
+      });
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -4115,7 +4449,9 @@ class _ChatPageState extends State<ChatPage> {
         if (snapshot.hasError) {
           return ErrorState(
             message: cleanError(snapshot.error),
-            onRetry: () => setState(() => future = loadThreads()),
+            onRetry: () => setState(() {
+              future = loadThreads();
+            }),
           );
         }
         final threads = snapshot.data!;
@@ -4188,11 +4524,15 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
           value: widget.thread['id'],
         ),
         callback: (_) {
-          if (mounted) setState(() => future = loadAndRememberMessages());
+          if (mounted) setState(() {
+            future = loadAndRememberMessages();
+          });
         },
       ).subscribe();
-    timer = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (mounted) setState(() => future = loadAndRememberMessages());
+    timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {
+        future = loadAndRememberMessages();
+      });
     });
   }
 
@@ -4248,7 +4588,9 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       await supabase
           .from('ansar_chat_threads')
           .update({'updated_at': DateTime.now().toUtc().toIso8601String()}).eq('id', widget.thread['id']);
-      if (mounted) setState(() => future = loadAndRememberMessages());
+      if (mounted) setState(() {
+        future = loadAndRememberMessages();
+      });
       unawaited(enqueueChatNotification(
         thread: widget.thread,
         sender: widget.session,
@@ -4267,7 +4609,9 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     await supabase
         .from('ansar_chat_messages')
         .update({'deleted_at': DateTime.now().toUtc().toIso8601String()}).eq('id', row['id']);
-    setState(() => future = loadAndRememberMessages());
+    setState(() {
+      future = loadAndRememberMessages();
+    });
   }
 
   @override
@@ -4278,7 +4622,9 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
         actions: [
           IconButton(
             tooltip: 'تحديث',
-            onPressed: () => setState(() => future = loadAndRememberMessages()),
+            onPressed: () => setState(() {
+              future = loadAndRememberMessages();
+            }),
             icon: const Icon(Icons.refresh_rounded),
           ),
         ],
@@ -4296,7 +4642,9 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                 if (snapshot.hasError && !snapshot.hasData) {
                   return ErrorState(
                     message: cleanError(snapshot.error),
-                    onRetry: () => setState(() => future = loadAndRememberMessages()),
+                    onRetry: () => setState(() {
+                      future = loadAndRememberMessages();
+                    }),
                   );
                 }
                 final messages = snapshot.data!;
@@ -4938,6 +5286,8 @@ double productSearchScore(
   if (matText == query) return 120;
   if (barcode == query) return 120;
   if (name == query) return 110;
+  if (name.startsWith(query)) return 108;
+  if (name.contains(query)) return 106;
   if (words.isNotEmpty && words.every(name.contains)) return 100;
   if (matText.contains(query)) return 90;
   if (barcode.contains(query)) return 85;
@@ -5356,7 +5706,7 @@ Future<void> saveDeviceToken(EmployeeSession session, String token) async {
 String cleanError(Object? error) {
   final text = error.toString().replaceFirst('Exception: ', '');
   if (text.contains('setState() callback argument returned a Future')) {
-    return 'تم تنفيذ العملية، وسيتم تحديث الصفحة تلقائيا';
+    return '';
   }
   if (text.length > 220) {
     return 'تعذر تنفيذ العملية الآن. حاول مرة أخرى.';
