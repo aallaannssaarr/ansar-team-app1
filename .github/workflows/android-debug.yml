@@ -78,6 +78,9 @@ jobs:
           PY
           dart run flutter_launcher_icons
 
+      - name: Run automated tests
+        run: flutter test
+
       - name: Analyze
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
