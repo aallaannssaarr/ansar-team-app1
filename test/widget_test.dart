@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 Widget _testShell(Widget child) {
   return MaterialApp(
+    theme: buildAnsarTheme(),
     home: Directionality(
       textDirection: TextDirection.rtl,
       child: Scaffold(body: child),
@@ -111,5 +112,32 @@ void main() {
     expect(find.text('فرع حمص'), findsOneWidget);
     expect(find.text('مفتوح'), findsOneWidget);
     expect(find.textContaining('2 موظفين'), findsOneWidget);
+  });
+
+  testWidgets('top bar fits mobile width with profile and notifications', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final session = EmployeeSession({
+      'id': '1',
+      'display_name': 'إبراهيم عسكر',
+      'username': 'ibrahim1',
+      'branch_num': 1,
+      'role': 'employee',
+    });
+
+    await tester.pumpWidget(
+      _testShell(
+        AnsarTopBar(
+          session: session,
+          onAction: (_) {},
+          onNotificationTap: () {},
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('فريق الأنصار'), findsOneWidget);
+    expect(find.byIcon(Icons.notifications_none_rounded), findsOneWidget);
   });
 }
