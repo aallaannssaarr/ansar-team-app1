@@ -8,7 +8,7 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:intl/intl.dart';
+import 'package:intl/intl.dart' as intl;
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
@@ -8510,7 +8510,7 @@ String formatMoneyValue(Object? value) {
   if (value == null) return '-';
   final number = (value as num?)?.toDouble() ?? double.tryParse('$value');
   if (number == null) return '$value';
-  return NumberFormat('#,##0.##', 'en_US').format(number);
+  return intl.NumberFormat('#,##0.##', 'en_US').format(number);
 }
 
 List<List<T>> chunkList<T>(List<T> values, int size) {
