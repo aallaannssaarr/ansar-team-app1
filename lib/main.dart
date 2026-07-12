@@ -280,6 +280,7 @@ class EmployeeLite {
     required this.branchNum,
     required this.role,
     required this.isActive,
+    this.avatarUrl,
   });
 
   final String id;
@@ -288,6 +289,7 @@ class EmployeeLite {
   final int branchNum;
   final String role;
   final bool isActive;
+  final String? avatarUrl;
 
   factory EmployeeLite.fromRow(Map<String, dynamic> row) {
     return EmployeeLite(
@@ -297,6 +299,7 @@ class EmployeeLite {
       branchNum: (row['branch_num'] as num?)?.toInt() ?? 0,
       role: row['role'] as String? ?? 'employee',
       isActive: row['is_active'] != false,
+      avatarUrl: row['avatar_url'] as String?,
     );
   }
 
@@ -308,6 +311,7 @@ class EmployeeLite {
       branchNum: session.branchNum,
       role: session.role,
       isActive: true,
+      avatarUrl: session.avatarUrl,
     );
   }
 }
@@ -1108,7 +1112,6 @@ class _DashboardPageState extends State<DashboardPage> {
   Timer? timer;
   RealtimeChannel? attendanceChannel;
   bool attendanceBusy = false;
-  bool dashboardRefreshing = false;
   bool movementsExpanded = false;
 
   @override
@@ -1150,25 +1153,11 @@ class _DashboardPageState extends State<DashboardPage> {
     return loaded;
   }
 
-  Future<void> refreshDashboard() async {
-    if (dashboardRefreshing) return;
-    final refreshed = loadAndRememberDashboard();
-    setState(() {
-      dashboardRefreshing = true;
-      future = refreshed;
-    });
-    try {
-      await refreshed;
-    } finally {
-      if (mounted) setState(() => dashboardRefreshing = false);
-    }
-  }
-
   Future<DashboardData> loadDashboard() async {
     final branches = await loadAppBranchesMap();
     final employeeRows = await supabase
         .from('ansar_employees')
-        .select('id, display_name, full_name, username, branch_num, role, is_active')
+        .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url')
         .eq('is_active', true);
     final employees = employeeRows.cast<Map<String, dynamic>>().map(EmployeeLite.fromRow).toList();
     final employeeById = {for (final employee in employees) employee.id: employee};
@@ -1335,15 +1324,7 @@ class _DashboardPageState extends State<DashboardPage> {
 
   @override
   Widget build(BuildContext context) {
-    return RefreshIndicator(
-      onRefresh: () {
-        final refreshed = loadAndRememberDashboard();
-        setState(() {
-          future = refreshed;
-        });
-        return refreshed.then((_) {});
-      },
-      child: FutureBuilder<DashboardData>(
+    return FutureBuilder<DashboardData>(
         future: future,
         initialData: latestDashboard,
         builder: (context, snapshot) {
@@ -1376,18 +1357,10 @@ class _DashboardPageState extends State<DashboardPage> {
                     children: [
                       Row(
                         children: [
-                          Container(
-                            width: 58,
-                            height: 58,
-                            decoration: BoxDecoration(
-                              color: isWorking ? successSurface : const Color(0xfff0f3f2),
-                              shape: BoxShape.circle,
-                            ),
-                            child: Icon(
-                              isWorking ? Icons.person_rounded : Icons.person_outline_rounded,
-                              color: isWorking ? brandColor : mutedInk,
-                              size: 30,
-                            ),
+                          EmployeeAvatar(
+                            name: widget.session.name,
+                            imageUrl: widget.session.avatarUrl,
+                            radius: 29,
                           ),
                           const SizedBox(width: 14),
                           Expanded(
@@ -1470,8 +1443,6 @@ class _DashboardPageState extends State<DashboardPage> {
               DashboardViewSwitch(
                 showMovements: movementsExpanded,
                 onChanged: (value) => setState(() => movementsExpanded = value),
-                refreshing: dashboardRefreshing,
-                onRefresh: refreshDashboard,
               ),
               const SizedBox(height: 12),
               AnimatedSwitcher(
@@ -1550,7 +1521,6 @@ class _DashboardPageState extends State<DashboardPage> {
             ],
           );
         },
-      ),
     );
   }
 }
@@ -1560,59 +1530,41 @@ class DashboardViewSwitch extends StatelessWidget {
     super.key,
     required this.showMovements,
     required this.onChanged,
-    required this.refreshing,
-    required this.onRefresh,
   });
 
   final bool showMovements;
   final ValueChanged<bool> onChanged;
-  final bool refreshing;
-  final VoidCallback onRefresh;
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Expanded(
-          child: Container(
-            height: 54,
-            padding: const EdgeInsets.all(4),
-            decoration: BoxDecoration(
-              color: panelSurface,
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: borderColor),
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: DashboardSwitchItem(
-                    selected: !showMovements,
-                    icon: Icons.apartment_rounded,
-                    label: 'الفروع',
-                    onTap: () => onChanged(false),
-                  ),
-                ),
-                Expanded(
-                  child: DashboardSwitchItem(
-                    selected: showMovements,
-                    icon: Icons.swap_horiz_rounded,
-                    label: 'الحركات',
-                    onTap: () => onChanged(true),
-                  ),
-                ),
-              ],
+    return Container(
+      height: 54,
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: panelSurface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: borderColor),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: DashboardSwitchItem(
+              selected: !showMovements,
+              icon: Icons.apartment_rounded,
+              label: 'الفروع',
+              onTap: () => onChanged(false),
             ),
           ),
-        ),
-        const SizedBox(width: 8),
-        IconButton.outlined(
-          tooltip: 'تحديث',
-          onPressed: refreshing ? null : onRefresh,
-          icon: refreshing
-              ? const SizedBox(width: 19, height: 19, child: CircularProgressIndicator(strokeWidth: 2))
-              : const Icon(Icons.refresh_rounded),
-        ),
-      ],
+          Expanded(
+            child: DashboardSwitchItem(
+              selected: showMovements,
+              icon: Icons.swap_horiz_rounded,
+              label: 'الحركات',
+              onTap: () => onChanged(true),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1773,7 +1725,7 @@ class _BranchTodayPageState extends State<BranchTodayPage> {
     final nextDay = dayStart.add(const Duration(days: 1));
     final employeeRows = await supabase
         .from('ansar_employees')
-        .select('id, display_name, full_name, username, branch_num, role, is_active');
+        .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url');
     final employees = employeeRows.cast<Map<String, dynamic>>().map(EmployeeLite.fromRow).toList();
     final employeesById = {for (final employee in employees) employee.id: employee};
 
@@ -1954,15 +1906,7 @@ class BranchTodayHeader extends StatelessWidget {
           children: [
             Row(
               children: [
-                Container(
-                  width: 48,
-                  height: 48,
-                  decoration: BoxDecoration(
-                    color: statusColor.withValues(alpha: 0.12),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Icon(Icons.storefront_rounded, color: statusColor),
-                ),
+                BranchLogo(branchName: branchName, size: 64),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Column(
@@ -2043,7 +1987,7 @@ class BranchActiveEmployeeTile extends StatelessWidget {
     final worked = employeeDay.workedUntil(DateTime.now(), dayStart);
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-      leading: EmployeeAvatar(name: employeeDay.employee.name),
+      leading: EmployeeAvatar(name: employeeDay.employee.name, imageUrl: employeeDay.employee.avatarUrl),
       title: Text(employeeDay.employee.name, style: const TextStyle(fontWeight: FontWeight.w800)),
       subtitle: Text('دخل الساعة ${formatTime(openEntry.checkIn)}', style: const TextStyle(color: mutedInk)),
       trailing: StatusPill(label: formatDurationCompact(worked), color: successColor),
@@ -2070,7 +2014,7 @@ class BranchEmployeeDayCard extends StatelessWidget {
           children: [
             Row(
               children: [
-                EmployeeAvatar(name: employeeDay.employee.name),
+                EmployeeAvatar(name: employeeDay.employee.name, imageUrl: employeeDay.employee.avatarUrl),
                 const SizedBox(width: 10),
                 Expanded(
                   child: Column(
@@ -5045,7 +4989,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     final events = eventsRows.cast<Map<String, dynamic>>();
     final employeesRows = await supabase
         .from('ansar_employees')
-        .select('id, display_name, full_name, username, branch_num, role, is_active');
+        .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url');
     final employees = {
       for (final row in employeesRows.cast<Map<String, dynamic>>())
         row['id'] as String: EmployeeLite.fromRow(row),
@@ -6499,6 +6443,37 @@ class MovementTile extends StatelessWidget {
   }
 }
 
+class BranchLogo extends StatelessWidget {
+  const BranchLogo({super.key, required this.branchName, this.size = 44});
+
+  final String branchName;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final asset = branchLogoAsset(branchName);
+    final fallback = Icon(Icons.storefront_rounded, color: brandColor, size: size * 0.48);
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: borderColor),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: asset == null
+          ? fallback
+          : Image.asset(
+              asset,
+              fit: BoxFit.contain,
+              cacheWidth: (size * 5).round(),
+              errorBuilder: (_, __, ___) => fallback,
+            ),
+    );
+  }
+}
+
 class BranchStatusCard extends StatelessWidget {
   const BranchStatusCard({super.key, required this.branch, required this.onTap});
 
@@ -6524,19 +6499,7 @@ class BranchStatusCard extends StatelessWidget {
               Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Container(
-                    width: 36,
-                    height: 36,
-                    decoration: BoxDecoration(
-                      color: color.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Icon(
-                      open ? Icons.storefront_rounded : Icons.storefront_outlined,
-                      color: color,
-                      size: 20,
-                    ),
-                  ),
+                  BranchLogo(branchName: branch.branchName, size: 42),
                   const SizedBox(width: 9),
                   Expanded(
                     child: Text(
@@ -7010,7 +6973,7 @@ Future<List<EmployeeLite>> loadEmployeesForScope(
 }) async {
   var query = supabase
       .from('ansar_employees')
-      .select('id, display_name, full_name, username, branch_num, role, is_active');
+      .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url');
   if (!includeInactive) query = query.eq('is_active', true);
   if (!session.isAdmin && session.isBranchManager) {
     query = query.eq('branch_num', session.branchNum);
@@ -7411,10 +7374,21 @@ String cleanError(Object? error) {
   return text;
 }
 
+String? branchLogoAsset(String branchName) {
+  final normalized = branchName.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (normalized.contains('طريق الشام')) return 'assets/branches/homs_sham_road.png';
+  if (normalized.contains('إدلب') || normalized.contains('ادلب')) return 'assets/branches/idlib.png';
+  if (normalized.contains('دمشق')) return 'assets/branches/damascus.png';
+  if (normalized.contains('الباب')) return 'assets/branches/albab.png';
+  if (normalized.contains('حمص')) return 'assets/branches/homs.png';
+  return null;
+}
+
 String formatTime(DateTime value) {
-  final hour = value.hour.toString().padLeft(2, '0');
+  final hour = value.hour % 12 == 0 ? 12 : value.hour % 12;
   final minute = value.minute.toString().padLeft(2, '0');
-  return '$hour:$minute';
+  final period = value.hour < 12 ? 'ص' : 'م';
+  return '$hour:$minute $period';
 }
 
 String formatDateTime(DateTime value) {

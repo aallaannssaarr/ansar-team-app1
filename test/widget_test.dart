@@ -151,6 +151,14 @@ void main() {
     expect(formatDurationCompact(duration), '4 س 30 د');
   });
 
+  test('times use the Arabic 12 hour clock and branch logos map safely', () {
+    expect(formatTime(DateTime(2026, 7, 12, 0, 5)), '12:05 ص');
+    expect(formatTime(DateTime(2026, 7, 12, 16, 45)), '4:45 م');
+    expect(branchLogoAsset('فرع حمص - طريق الشام'), 'assets/branches/homs_sham_road.png');
+    expect(branchLogoAsset('فرع إدلب'), 'assets/branches/idlib.png');
+    expect(branchLogoAsset('فرع جديد'), isNull);
+  });
+
   testWidgets('top bar fits mobile width with profile and notifications', (tester) async {
     await tester.binding.setSurfaceSize(const Size(390, 844));
     addTearDown(() => tester.binding.setSurfaceSize(null));
