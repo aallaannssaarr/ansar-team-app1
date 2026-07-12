@@ -1,0 +1,10 @@
+Copyright 2010-2022 The Amiri Project Authors (https://github.com/aliftype/amiri).
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+This license is available at https://openfontlicense.org/.
+
+Permission is granted to use, study, copy, merge, embed, modify, redistribute,
+and sell modified and unmodified copies of the Font Software, provided the
+font is not sold by itself and remains distributed under the SIL Open Font
+License Version 1.1. The Font Software is provided "AS IS", without warranty
+of any kind.

@@ -6,6 +6,7 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
@@ -446,6 +447,7 @@ class ReportData {
   ReportData({
     required this.branches,
     required this.employees,
+    required this.availableEmployees,
     required this.durations,
     required this.dailyHours,
     required this.totalHours,
@@ -455,13 +457,17 @@ class ReportData {
 
   final Map<int, BranchOption> branches;
   final List<EmployeeLite> employees;
+  final List<EmployeeLite> availableEmployees;
   final List<EmployeeDuration> durations;
   final Map<String, double> dailyHours;
   final double totalHours;
   final int openLogs;
   final int closedLogs;
 
-  double get averageHours => closedLogs == 0 ? 0 : totalHours / closedLogs;
+  double get averageHours {
+    final sessions = closedLogs + openLogs;
+    return sessions == 0 ? 0 : totalHours / sessions;
+  }
 }
 
 class LoginPage extends StatefulWidget {
@@ -2244,6 +2250,8 @@ class _ReportsPageState extends State<ReportsPage> {
     if (selectedBranch != null) {
       employees = employees.where((employee) => employee.branchNum == selectedBranch).toList();
     }
+    final availableEmployees = List<EmployeeLite>.from(employees)
+      ..sort((a, b) => a.name.compareTo(b.name));
     if (selectedEmployeeId != null) {
       employees = employees.where((employee) => employee.id == selectedEmployeeId).toList();
     }
@@ -2276,7 +2284,7 @@ class _ReportsPageState extends State<ReportsPage> {
       final hours = checkOut.difference(checkIn).inMinutes / 60;
       if (hours <= 0 || hours > 24) continue;
 
-      final dayKey = shortDate(checkIn);
+      final dayKey = formatDateKey(checkIn);
       totalHours += hours;
       dailyHours[dayKey] = (dailyHours[dayKey] ?? 0) + hours;
       hoursByEmployee[employeeId] = (hoursByEmployee[employeeId] ?? 0) + hours;
@@ -2305,6 +2313,7 @@ class _ReportsPageState extends State<ReportsPage> {
     return ReportData(
       branches: branches,
       employees: employees,
+      availableEmployees: availableEmployees,
       durations: durations,
       dailyHours: dailyHours,
       totalHours: totalHours,
@@ -2344,108 +2353,41 @@ class _ReportsPageState extends State<ReportsPage> {
           key: const PageStorageKey('reports-list'),
           padding: pagePadding,
           children: [
-            PageHeading(
+            const PageHeading(
               title: 'التقارير',
               subtitle: 'حلّل الدوام والحضور حسب الفترة والفرع والموظف',
               icon: Icons.insert_chart_outlined_rounded,
-              action: IconButton.outlined(
-                tooltip: 'تحديث التقارير',
-                onPressed: reload,
-                icon: const Icon(Icons.refresh_rounded),
-              ),
             ),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const Text('نطاق التقرير', style: TextStyle(fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 12),
-                    DropdownButtonFormField<int>(
-                      key: ValueKey('days-$days'),
-                      initialValue: days,
-                      decoration: const InputDecoration(
-                        labelText: 'الفترة',
-                        prefixIcon: Icon(Icons.date_range_outlined),
-                      ),
-                      items: const [
-                        DropdownMenuItem(value: 7, child: Text('آخر 7 أيام')),
-                        DropdownMenuItem(value: 30, child: Text('آخر 30 يوم')),
-                        DropdownMenuItem(value: 90, child: Text('آخر 90 يوم')),
-                      ],
-                      onChanged: (value) {
-                        days = value ?? 30;
-                        reload();
-                      },
-                    ),
-                    if (widget.session.isAdmin) ...[
-                      const SizedBox(height: 10),
-                      DropdownButtonFormField<int?>(
-                        key: ValueKey('branch-${selectedBranch ?? 'all'}'),
-                        initialValue: selectedBranch,
-                        decoration: const InputDecoration(labelText: 'الفرع'),
-                        items: [
-                          const DropdownMenuItem<int?>(value: null, child: Text('كل الفروع')),
-                          ...data.branches.values.map(
-                            (branch) => DropdownMenuItem<int?>(
-                              value: branch.number,
-                              child: Text(branch.label),
-                            ),
-                          ),
-                        ],
-                        onChanged: (value) {
-                          selectedBranch = value;
-                          selectedEmployeeId = null;
-                          reload();
-                        },
-                      ),
-                    ],
-                    if (widget.session.isAdmin || widget.session.isBranchManager) ...[
-                      const SizedBox(height: 10),
-                      DropdownButtonFormField<String?>(
-                        key: ValueKey('employee-${selectedEmployeeId ?? 'all'}-${data.employees.length}'),
-                        initialValue: selectedEmployeeId,
-                        decoration: const InputDecoration(labelText: 'الموظف'),
-                        items: [
-                          const DropdownMenuItem<String?>(value: null, child: Text('كل الموظفين')),
-                          ...data.employees.map(
-                            (employee) => DropdownMenuItem<String?>(
-                              value: employee.id,
-                              child: Text(employee.name),
-                            ),
-                          ),
-                        ],
-                        onChanged: (value) {
-                          selectedEmployeeId = value;
-                          reload();
-                        },
-                      ),
-                    ],
-                  ],
-                ),
-              ),
+            ReportFilterPanel(
+              days: days,
+              branches: data.branches,
+              employees: data.availableEmployees,
+              selectedBranch: selectedBranch,
+              selectedEmployeeId: selectedEmployeeId,
+              showBranchFilter: widget.session.isAdmin,
+              showEmployeeFilter: widget.session.isAdmin || widget.session.isBranchManager,
+              onDaysChanged: (value) {
+                days = value;
+                reload();
+              },
+              onBranchChanged: (value) {
+                selectedBranch = value;
+                selectedEmployeeId = null;
+                reload();
+              },
+              onEmployeeChanged: (value) {
+                selectedEmployeeId = value;
+                reload();
+              },
             ),
             const SizedBox(height: 12),
-            Card(
-              color: brandColor.withValues(alpha: 0.07),
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    InfoChip(icon: Icons.date_range_rounded, label: 'آخر $days يوم'),
-                    InfoChip(icon: Icons.storefront_rounded, label: selectedBranchName),
-                    InfoChip(icon: Icons.person_search_rounded, label: selectedEmployeeName),
-                    if (topEmployee != null)
-                      InfoChip(
-                        icon: Icons.emoji_events_rounded,
-                        label: 'الأطول دواما: ${topEmployee.employee.name} (${topEmployee.hours.toStringAsFixed(1)} ساعة)',
-                      ),
-                  ],
-                ),
-              ),
+            ReportInsightCard(
+              days: days,
+              branchName: selectedBranchName,
+              employeeName: selectedEmployeeName,
+              topEmployee: topEmployee,
+              dailyHours: data.dailyHours,
+              employeesWithHours: data.durations.length,
             ),
             const SizedBox(height: 12),
             Row(
@@ -2477,7 +2419,7 @@ class _ReportsPageState extends State<ReportsPage> {
                     title: 'سجلات مغلقة',
                     value: '${data.closedLogs}',
                     icon: Icons.done_all_rounded,
-                    color: const Color(0xff5b6f95),
+                    color: successColor,
                   ),
                 ),
                 const SizedBox(width: 10),
@@ -2486,7 +2428,7 @@ class _ReportsPageState extends State<ReportsPage> {
                     title: 'دوام مفتوح',
                     value: '${data.openLogs}',
                     icon: Icons.pending_actions_rounded,
-                    color: const Color(0xffa14d3a),
+                    color: dangerColor,
                   ),
                 ),
               ],
@@ -2496,7 +2438,7 @@ class _ReportsPageState extends State<ReportsPage> {
             if (data.dailyHours.isEmpty)
               const EmptyState(icon: Icons.bar_chart_rounded, text: 'لا توجد بيانات للفترة المحددة')
             else
-              SizedBox(height: 230, child: DailyHoursChart(values: data.dailyHours)),
+              SizedBox(height: 280, child: DailyHoursChart(values: data.dailyHours)),
             const SizedBox(height: 16),
             const SectionHeader(title: 'ترتيب الموظفين'),
             if (data.durations.isEmpty)
@@ -2515,6 +2457,302 @@ class _ReportsPageState extends State<ReportsPage> {
           ],
         );
       },
+    );
+  }
+}
+
+class ReportFilterPanel extends StatelessWidget {
+  const ReportFilterPanel({
+    super.key,
+    required this.days,
+    required this.branches,
+    required this.employees,
+    required this.selectedBranch,
+    required this.selectedEmployeeId,
+    required this.showBranchFilter,
+    required this.showEmployeeFilter,
+    required this.onDaysChanged,
+    required this.onBranchChanged,
+    required this.onEmployeeChanged,
+  });
+
+  final int days;
+  final Map<int, BranchOption> branches;
+  final List<EmployeeLite> employees;
+  final int? selectedBranch;
+  final String? selectedEmployeeId;
+  final bool showBranchFilter;
+  final bool showEmployeeFilter;
+  final ValueChanged<int> onDaysChanged;
+  final ValueChanged<int?> onBranchChanged;
+  final ValueChanged<String?> onEmployeeChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final branchOptions = branches.values.toList()..sort((a, b) => a.name.compareTo(b.name));
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(15),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.tune_rounded, color: brandColor),
+                SizedBox(width: 8),
+                Text('نطاق التقرير', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+              ],
+            ),
+            const SizedBox(height: 13),
+            Row(
+              children: [
+                for (final value in const [7, 30, 60]) ...[
+                  Expanded(
+                    child: ReportPeriodOption(
+                      days: value,
+                      selected: days == value,
+                      onTap: () => onDaysChanged(value),
+                    ),
+                  ),
+                  if (value != 60) const SizedBox(width: 7),
+                ],
+              ],
+            ),
+            if (showBranchFilter) ...[
+              const SizedBox(height: 12),
+              DropdownButtonFormField<int?>(
+                key: ValueKey('branch-${selectedBranch ?? 'all'}'),
+                initialValue: selectedBranch,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                  labelText: 'الفرع',
+                  prefixIcon: Icon(Icons.storefront_rounded),
+                ),
+                items: [
+                  const DropdownMenuItem<int?>(value: null, child: Text('كل الفروع')),
+                  ...branchOptions.map(
+                    (branch) => DropdownMenuItem<int?>(
+                      value: branch.number,
+                      child: Text(branch.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    ),
+                  ),
+                ],
+                onChanged: onBranchChanged,
+              ),
+            ],
+            if (showEmployeeFilter) ...[
+              const SizedBox(height: 10),
+              DropdownButtonFormField<String?>(
+                key: ValueKey('employee-${selectedEmployeeId ?? 'all'}-${employees.length}'),
+                initialValue: selectedEmployeeId,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                  labelText: 'الموظف',
+                  prefixIcon: Icon(Icons.badge_outlined),
+                ),
+                items: [
+                  const DropdownMenuItem<String?>(value: null, child: Text('كل الموظفين')),
+                  ...employees.map(
+                    (employee) => DropdownMenuItem<String?>(
+                      value: employee.id,
+                      child: Text(employee.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    ),
+                  ),
+                ],
+                onChanged: onEmployeeChanged,
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ReportPeriodOption extends StatelessWidget {
+  const ReportPeriodOption({super.key, required this.days, required this.selected, required this.onTap});
+
+  final int days;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: selected ? brandColor : softSurface,
+      borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          height: 48,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: selected ? brandColor : borderColor),
+          ),
+          child: Text(
+            days == 7 ? '7 أيام' : '$days يوم',
+            style: TextStyle(
+              color: selected ? Colors.white : inkColor,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ReportInsightCard extends StatelessWidget {
+  const ReportInsightCard({
+    super.key,
+    required this.days,
+    required this.branchName,
+    required this.employeeName,
+    required this.topEmployee,
+    required this.dailyHours,
+    required this.employeesWithHours,
+  });
+
+  final int days;
+  final String branchName;
+  final String employeeName;
+  final EmployeeDuration? topEmployee;
+  final Map<String, double> dailyHours;
+  final int employeesWithHours;
+
+  @override
+  Widget build(BuildContext context) {
+    MapEntry<String, double>? busiestDay;
+    for (final entry in dailyHours.entries) {
+      if (busiestDay == null || entry.value > busiestDay.value) busiestDay = entry;
+    }
+    return Card(
+      color: brandColor.withValues(alpha: 0.07),
+      child: Padding(
+        padding: const EdgeInsets.all(15),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Wrap(
+              spacing: 7,
+              runSpacing: 7,
+              children: [
+                InfoChip(icon: Icons.date_range_rounded, label: 'آخر $days يوم'),
+                InfoChip(icon: Icons.storefront_rounded, label: branchName),
+                InfoChip(icon: Icons.person_search_rounded, label: employeeName),
+              ],
+            ),
+            const SizedBox(height: 14),
+            if (topEmployee == null)
+              const Text('لا توجد ساعات دوام ضمن النطاق المحدد', style: TextStyle(color: mutedInk))
+            else
+              Row(
+                children: [
+                  Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      EmployeeAvatar(
+                        name: topEmployee!.employee.name,
+                        imageUrl: topEmployee!.employee.avatarUrl,
+                        radius: 27,
+                      ),
+                      const Positioned(
+                        left: -4,
+                        bottom: -3,
+                        child: CircleAvatar(
+                          radius: 11,
+                          backgroundColor: accentColor,
+                          child: Icon(Icons.emoji_events_rounded, size: 13, color: Colors.white),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('الأطول دواماً', style: TextStyle(color: mutedInk, fontSize: 12)),
+                        const SizedBox(height: 3),
+                        Text(topEmployee!.employee.name, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+                        Text('${topEmployee!.days} أيام حضور', style: const TextStyle(color: mutedInk, fontSize: 11)),
+                      ],
+                    ),
+                  ),
+                  StatusPill(label: '${topEmployee!.hours.toStringAsFixed(1)} س', color: brandColor),
+                ],
+              ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Expanded(
+                  child: ReportMiniInsight(
+                    icon: Icons.calendar_month_rounded,
+                    label: 'اليوم الأعلى',
+                    value: busiestDay == null
+                        ? '-'
+                        : '${reportDayLabel(busiestDay.key)} · ${busiestDay.value.toStringAsFixed(1)} س',
+                    color: accentColor,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: ReportMiniInsight(
+                    icon: Icons.groups_rounded,
+                    label: 'موظفون بسجلات',
+                    value: '$employeesWithHours',
+                    color: successColor,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ReportMiniInsight extends StatelessWidget {
+  const ReportMiniInsight({
+    super.key,
+    required this.icon,
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: panelSurface.withValues(alpha: 0.84),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: borderColor),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: color, size: 20),
+          const SizedBox(width: 7),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: mutedInk, fontSize: 10)),
+                Text(value, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 12)),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -4473,6 +4711,9 @@ class TransfersPage extends StatefulWidget {
 
 class _TransfersPageState extends State<TransfersPage> {
   late Future<TransferData> future;
+  TransferData? latestTransfers;
+  RealtimeChannel? transferChannel;
+  Timer? transferTimer;
   String statusFilter = 'active';
   int? fromBranchFilter;
   int? toBranchFilter;
@@ -4481,8 +4722,42 @@ class _TransfersPageState extends State<TransfersPage> {
   @override
   void initState() {
     super.initState();
-    future = loadTransfers();
+    future = loadAndRememberTransfers();
+    transferChannel = supabase.channel('transfers-live')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_transfer_orders',
+        callback: (_) => refreshTransfers(),
+      )
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_transfer_order_items',
+        callback: (_) => refreshTransfers(),
+      ).subscribe();
+    transferTimer = Timer.periodic(const Duration(seconds: 30), (_) => refreshTransfers());
     unawaited(warmProductSearchCache());
+  }
+
+  @override
+  void dispose() {
+    transferTimer?.cancel();
+    if (transferChannel != null) supabase.removeChannel(transferChannel!);
+    super.dispose();
+  }
+
+  void refreshTransfers() {
+    if (!mounted) return;
+    setState(() {
+      future = loadAndRememberTransfers();
+    });
+  }
+
+  Future<TransferData> loadAndRememberTransfers() async {
+    final loaded = await loadTransfers();
+    latestTransfers = loaded;
+    return loaded;
   }
 
   Future<TransferData> loadTransfers() async {
@@ -4496,8 +4771,8 @@ class _TransfersPageState extends State<TransfersPage> {
         .limit(60);
     final visible = rows.cast<Map<String, dynamic>>().where((row) {
       if (widget.session.isAdmin) return true;
-      final fromBranch = (row['from_branch_num'] as num?)?.toInt();
-      final toBranch = (row['to_branch_num'] as num?)?.toInt();
+      final fromBranch = nullableIntValue(row['from_branch_num']);
+      final toBranch = nullableIntValue(row['to_branch_num']);
       if (widget.session.isBranchManager) {
         return fromBranch == widget.session.branchNum || toBranch == widget.session.branchNum;
       }
@@ -4509,8 +4784,8 @@ class _TransfersPageState extends State<TransfersPage> {
   List<Map<String, dynamic>> filteredOrders(List<Map<String, dynamic>> orders) {
     return orders.where((order) {
       final status = order['status'] as String? ?? 'submitted';
-      final fromBranch = (order['from_branch_num'] as num?)?.toInt();
-      final toBranch = (order['to_branch_num'] as num?)?.toInt();
+      final fromBranch = nullableIntValue(order['from_branch_num']);
+      final toBranch = nullableIntValue(order['to_branch_num']);
       final active = !{'completed', 'cancelled', 'rejected'}.contains(status);
       final statusMatches = statusFilter == 'all' ||
           (statusFilter == 'active' ? active : status == statusFilter);
@@ -4577,7 +4852,7 @@ class _TransfersPageState extends State<TransfersPage> {
       ));
       if (mounted) {
         setState(() {
-          future = loadTransfers();
+          future = loadAndRememberTransfers();
         });
       }
     } catch (error) {
@@ -4588,7 +4863,7 @@ class _TransfersPageState extends State<TransfersPage> {
   }
 
   Future<void> updateOrderStatus(Map<String, dynamic> order) async {
-    final toBranch = (order['to_branch_num'] as num?)?.toInt();
+    final toBranch = nullableIntValue(order['to_branch_num']);
     if (!widget.session.isAdmin && toBranch != widget.session.branchNum) {
       showSnack(context, 'تعديل الحالة متاح فقط لموظفي الفرع المطلوب منه المناقلة');
       return;
@@ -4620,7 +4895,7 @@ class _TransfersPageState extends State<TransfersPage> {
       ));
       if (mounted) {
         setState(() {
-          future = loadTransfers();
+          future = loadAndRememberTransfers();
         });
       }
     } catch (error) {
@@ -4645,7 +4920,7 @@ class _TransfersPageState extends State<TransfersPage> {
     );
     if (mounted) {
       setState(() {
-        future = loadTransfers();
+        future = loadAndRememberTransfers();
       });
     }
   }
@@ -4654,17 +4929,19 @@ class _TransfersPageState extends State<TransfersPage> {
   Widget build(BuildContext context) {
     return FutureBuilder<TransferData>(
       future: future,
+      initialData: latestTransfers,
       builder: (context, snapshot) {
-        if (snapshot.connectionState != ConnectionState.done) {
+        if (snapshot.connectionState != ConnectionState.done && !snapshot.hasData) {
           return const Center(child: CircularProgressIndicator());
         }
-        if (snapshot.hasError) {
+        if (snapshot.hasError && !snapshot.hasData) {
           return ErrorState(
             message: cleanError(snapshot.error),
-            onRetry: () => setState(() {
-              future = loadTransfers();
-            }),
+            onRetry: refreshTransfers,
           );
+        }
+        if (!snapshot.hasData) {
+          return ErrorState(message: 'تعذر تحميل المناقلات الآن', onRetry: refreshTransfers);
         }
         final data = snapshot.data!;
         final visibleOrders = filteredOrders(data.orders);
@@ -4677,11 +4954,6 @@ class _TransfersPageState extends State<TransfersPage> {
                   title: 'المناقلات',
                   subtitle: '${visibleOrders.length} طلب ضمن العرض الحالي',
                   icon: Icons.swap_horiz_rounded,
-                  action: IconButton.outlined(
-                    tooltip: 'تحديث المناقلات',
-                    onPressed: () => setState(() => future = loadTransfers()),
-                    icon: const Icon(Icons.refresh_rounded),
-                  ),
                 ),
               ),
               _TransferFilters(
@@ -4693,9 +4965,6 @@ class _TransfersPageState extends State<TransfersPage> {
                 onStatusChanged: (value) => setState(() => statusFilter = value),
                 onFromChanged: (value) => setState(() => fromBranchFilter = value),
                 onToChanged: (value) => setState(() => toBranchFilter = value),
-                onRefresh: () => setState(() {
-                  future = loadTransfers();
-                }),
               ),
               Expanded(
                 child: visibleOrders.isEmpty
@@ -4710,8 +4979,8 @@ class _TransfersPageState extends State<TransfersPage> {
                   separatorBuilder: (_, __) => const Divider(height: 1),
                   itemBuilder: (context, i) {
                     final order = visibleOrders[i];
-                    final fromBranch = (order['from_branch_num'] as num?)?.toInt() ?? 0;
-                    final toBranch = (order['to_branch_num'] as num?)?.toInt() ?? 0;
+                    final fromBranch = intValue(order['from_branch_num']);
+                    final toBranch = intValue(order['to_branch_num']);
                     final requester = data.employees[order['requested_by']];
                     final canHandle = widget.session.isAdmin || toBranch == widget.session.branchNum;
                     final status = order['status'] as String? ?? 'submitted';
@@ -4805,7 +5074,6 @@ class _TransferFilters extends StatelessWidget {
     required this.onStatusChanged,
     required this.onFromChanged,
     required this.onToChanged,
-    required this.onRefresh,
   });
 
   final Map<int, BranchOption> branches;
@@ -4816,7 +5084,6 @@ class _TransferFilters extends StatelessWidget {
   final ValueChanged<String> onStatusChanged;
   final ValueChanged<int?> onFromChanged;
   final ValueChanged<int?> onToChanged;
-  final VoidCallback onRefresh;
 
   int statusCount(String filter) {
     return orders.where((order) {
@@ -4830,6 +5097,8 @@ class _TransferFilters extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final safeFromFilter = fromBranchFilter != null && branches.containsKey(fromBranchFilter) ? fromBranchFilter : null;
+    final safeToFilter = toBranchFilter != null && branches.containsKey(toBranchFilter) ? toBranchFilter : null;
     final branchItems = [
       const DropdownMenuItem<int?>(value: null, child: Text('كل الفروع')),
       ...branches.values.map((branch) => DropdownMenuItem<int?>(
@@ -4873,21 +5142,17 @@ class _TransferFilters extends StatelessWidget {
               leading: const Icon(Icons.tune_rounded, color: brandColor),
               title: const Text('تصفية حسب الفروع', style: TextStyle(fontWeight: FontWeight.w800)),
               subtitle: Text(
-                fromBranchFilter == null && toBranchFilter == null
+                safeFromFilter == null && safeToFilter == null
                     ? 'كل الفروع'
                     : 'تم تطبيق تصفية مخصصة',
                 style: const TextStyle(color: mutedInk, fontSize: 12),
               ),
-              trailing: IconButton(
-                tooltip: 'تحديث',
-                onPressed: onRefresh,
-                icon: const Icon(Icons.refresh_rounded),
-              ),
               childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 14),
               children: [
                 DropdownButtonFormField<int?>(
-                  key: ValueKey('from-${fromBranchFilter ?? 'all'}'),
-                  initialValue: fromBranchFilter,
+                  key: ValueKey('from-${safeFromFilter ?? 'all'}'),
+                  initialValue: safeFromFilter,
+                  isExpanded: true,
                   decoration: const InputDecoration(
                     labelText: 'من فرع',
                     prefixIcon: Icon(Icons.call_made_rounded),
@@ -4897,8 +5162,9 @@ class _TransferFilters extends StatelessWidget {
                 ),
                 const SizedBox(height: 8),
                 DropdownButtonFormField<int?>(
-                  key: ValueKey('to-${toBranchFilter ?? 'all'}'),
-                  initialValue: toBranchFilter,
+                  key: ValueKey('to-${safeToFilter ?? 'all'}'),
+                  initialValue: safeToFilter,
+                  isExpanded: true,
                   decoration: const InputDecoration(
                     labelText: 'إلى فرع',
                     prefixIcon: Icon(Icons.call_received_rounded),
@@ -4934,11 +5200,14 @@ class TransferDetailsPage extends StatefulWidget {
 class _TransferDetailsPageState extends State<TransferDetailsPage> {
   late Future<TransferDetailsData> future;
   TransferDetailsData? latestDetails;
+  RealtimeChannel? detailsChannel;
+  Timer? detailsTimer;
   bool sharingPdf = false;
+  bool statusBusy = false;
   String? itemBusyId;
 
   bool get canHandle {
-    final toBranch = (widget.order['to_branch_num'] as num?)?.toInt();
+    final toBranch = nullableIntValue(widget.order['to_branch_num']);
     return widget.session.isAdmin || toBranch == widget.session.branchNum;
   }
 
@@ -4946,6 +5215,59 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
   void initState() {
     super.initState();
     future = loadAndRememberItems();
+    detailsChannel = supabase.channel('transfer-details-${widget.order['id']}')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_transfer_orders',
+        filter: PostgresChangeFilter(
+          type: PostgresChangeFilterType.eq,
+          column: 'id',
+          value: widget.order['id'],
+        ),
+        callback: (payload) {
+          final updated = payload.newRecord;
+          if (updated.isNotEmpty) widget.order.addAll(updated);
+          refreshDetails();
+        },
+      )
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_transfer_order_items',
+        filter: PostgresChangeFilter(
+          type: PostgresChangeFilterType.eq,
+          column: 'order_id',
+          value: widget.order['id'],
+        ),
+        callback: (_) => refreshDetails(),
+      )
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_order_events',
+        filter: PostgresChangeFilter(
+          type: PostgresChangeFilterType.eq,
+          column: 'order_id',
+          value: widget.order['id'],
+        ),
+        callback: (_) => refreshDetails(),
+      ).subscribe();
+    detailsTimer = Timer.periodic(const Duration(seconds: 30), (_) => refreshDetails());
+  }
+
+  @override
+  void dispose() {
+    detailsTimer?.cancel();
+    if (detailsChannel != null) supabase.removeChannel(detailsChannel!);
+    super.dispose();
+  }
+
+  void refreshDetails() {
+    if (!mounted) return;
+    setState(() {
+      future = loadAndRememberItems();
+    });
   }
 
   Future<TransferDetailsData> loadAndRememberItems() async {
@@ -4961,24 +5283,22 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
         .eq('order_id', widget.order['id'])
         .order('created_at', ascending: true);
     final result = items.cast<Map<String, dynamic>>();
-    final matNums = result
-        .map((row) => (row['mat_num'] as num?)?.toInt())
-        .whereType<int>()
-        .toList();
+    final matNums = result.map((row) => nullableIntValue(row['mat_num'])).whereType<int>().toList();
     final products = matNums.isEmpty
         ? <Map<String, dynamic>>[]
         : await supabase
             .from('products')
             .select('mat_num, name, quantity')
             .inFilter('mat_num', matNums);
-    final productByMat = {
-      for (final row in products.cast<Map<String, dynamic>>())
-        (row['mat_num'] as num).toInt(): row,
-    };
+    final productByMat = <int, Map<String, dynamic>>{};
+    for (final row in products.cast<Map<String, dynamic>>()) {
+      final matNum = nullableIntValue(row['mat_num']);
+      if (matNum != null) productByMat[matNum] = row;
+    }
     final enrichedItems = result
         .map((row) => {
               ...row,
-              'product': productByMat[(row['mat_num'] as num?)?.toInt()],
+              'product': productByMat[nullableIntValue(row['mat_num'])],
             })
         .toList();
     final eventsRows = await supabase
@@ -4999,7 +5319,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
 
   Future<void> updateItem(Map<String, dynamic> item, String status) async {
     if (!canHandle) return;
-    final requested = (item['requested_quantity'] as num?)?.toDouble() ?? 0;
+    final requested = doubleValue(item['requested_quantity']);
     var approved = status == 'unavailable' ? 0.0 : requested;
     if (status == 'partially_available') {
       final controller = TextEditingController(text: requested.toStringAsFixed(0));
@@ -5022,7 +5342,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
         ),
       );
       if (value == null) return;
-      approved = value;
+      approved = value.clamp(0, requested).toDouble();
     }
     setState(() => itemBusyId = '${item['id']}');
     try {
@@ -5058,31 +5378,40 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
   }
 
   Future<void> changeStatus() async {
-    if (!canHandle) return;
+    if (!canHandle || statusBusy) return;
     final status = await showDialog<String>(
       context: context,
       builder: (_) => StatusDialog(current: widget.order['status'] as String? ?? 'submitted'),
     );
     if (status == null) return;
-    await supabase.from('ansar_transfer_orders').update({
-      'status': status,
-      'handled_by': widget.session.id,
-      if (status == 'approved') 'approved_at': DateTime.now().toUtc().toIso8601String(),
-      if (status == 'completed') 'completed_at': DateTime.now().toUtc().toIso8601String(),
-    }).eq('id', widget.order['id']);
-    await supabase.from('ansar_order_events').insert({
-      'order_id': widget.order['id'],
-      'employee_id': widget.session.id,
-      'event_type': 'status_changed',
-      'old_status': widget.order['status'],
-      'new_status': status,
-    });
-    unawaited(enqueueNotification(
-      title: 'تحديث مناقلة',
-      body: 'تم تحديث حالة المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
-      data: {'type': 'transfer_updated', 'order_id': widget.order['id'], 'status': status, 'sender_id': widget.session.id},
-    ));
-    if (mounted) Navigator.pop(context);
+    final oldStatus = widget.order['status'];
+    setState(() => statusBusy = true);
+    try {
+      await supabase.from('ansar_transfer_orders').update({
+        'status': status,
+        'handled_by': widget.session.id,
+        if (status == 'approved') 'approved_at': DateTime.now().toUtc().toIso8601String(),
+        if (status == 'completed') 'completed_at': DateTime.now().toUtc().toIso8601String(),
+      }).eq('id', widget.order['id']);
+      await supabase.from('ansar_order_events').insert({
+        'order_id': widget.order['id'],
+        'employee_id': widget.session.id,
+        'event_type': 'status_changed',
+        'old_status': oldStatus,
+        'new_status': status,
+      });
+      unawaited(enqueueNotification(
+        title: 'تحديث مناقلة',
+        body: 'تم تحديث حالة المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
+        data: {'type': 'transfer_updated', 'order_id': widget.order['id'], 'status': status, 'sender_id': widget.session.id},
+      ));
+      widget.order['status'] = status;
+      refreshDetails();
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => statusBusy = false);
+    }
   }
 
   Future<void> sharePdf(TransferDetailsData data) async {
@@ -5091,7 +5420,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       final bytes = await buildTransferPdf(data);
       await Printing.sharePdf(
         bytes: bytes,
-        filename: 'transfer-${widget.order['order_no'] ?? widget.order['id']}.pdf',
+        filename: 'ansar-transfer-${widget.order['order_no'] ?? widget.order['id']}.pdf',
       );
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
@@ -5101,90 +5430,161 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
   }
 
   Future<Uint8List> buildTransferPdf(TransferDetailsData data) async {
-    final fromBranch = (widget.order['from_branch_num'] as num?)?.toInt() ?? 0;
-    final toBranch = (widget.order['to_branch_num'] as num?)?.toInt() ?? 0;
-    late final pw.Font font;
-    late final pw.Font bold;
-    try {
-      font = await PdfGoogleFonts.cairoRegular();
-      bold = await PdfGoogleFonts.cairoBold();
-    } catch (_) {
-      font = pw.Font.helvetica();
-      bold = pw.Font.helveticaBold();
-    }
-    final theme = pw.ThemeData.withFont(base: font, bold: bold);
+    final fromBranch = intValue(widget.order['from_branch_num']);
+    final toBranch = intValue(widget.order['to_branch_num']);
+    final fontBytes = await rootBundle.load('assets/fonts/Amiri-Regular.ttf');
+    final logoBytes = await rootBundle.load('assets/logo.png');
+    final font = pw.Font.ttf(fontBytes);
+    final logo = pw.MemoryImage(
+      logoBytes.buffer.asUint8List(logoBytes.offsetInBytes, logoBytes.lengthInBytes),
+    );
+    final theme = pw.ThemeData.withFont(base: font, bold: font);
     final document = pw.Document(theme: theme);
-    final headers = ['الكتاب', 'المطلوب', 'المتوفر', 'الحالة', 'ملاحظة'];
-    final rows = data.items.map((item) {
+    final fromName = branchLabel(widget.branches, fromBranch);
+    final toName = branchLabel(widget.branches, toBranch);
+    final headers = ['#', 'الكتاب', 'الرقم', 'المطلوب', 'المتوفر', 'الحالة', 'الملاحظة'];
+    final rows = data.items.asMap().entries.map((entry) {
+      final item = entry.value;
       final product = item['product'] as Map<String, dynamic>?;
-      final requested = item['requested_quantity']?.toString() ?? '-';
-      final approved = item['approved_quantity']?.toString() ?? '-';
+      final requested = formatMoneyValue(item['requested_quantity']);
+      final approved = item['approved_quantity'] == null ? '-' : formatMoneyValue(item['approved_quantity']);
       final status = itemStatusLabel(item['item_status'] as String? ?? 'requested');
       return [
-        product?['name'] as String? ?? 'مادة ${item['mat_num']}',
+        '${entry.key + 1}',
+        product?['name']?.toString() ?? 'مادة ${item['mat_num']}',
+        '${item['mat_num'] ?? '-'}',
         requested,
         approved,
         status,
         item['note']?.toString() ?? '',
       ];
     }).toList();
+    final eventRows = data.events.map((event) {
+      final employee = data.employees['${event['employee_id']}'];
+      return [
+        eventLabel(event),
+        employee?.name ?? 'موظف',
+        formatEventTime(event['created_at']),
+      ];
+    }).toList();
     document.addPage(
       pw.MultiPage(
         textDirection: pw.TextDirection.rtl,
-        pageTheme: const pw.PageTheme(
-          margin: pw.EdgeInsets.all(28),
+        pageTheme: pw.PageTheme(
+          pageFormat: PdfPageFormat.a4.landscape,
+          margin: const pw.EdgeInsets.all(24),
+        ),
+        footer: (context) => pw.Align(
+          alignment: pw.Alignment.centerLeft,
+          child: pw.Text(
+            'صفحة ${context.pageNumber} من ${context.pagesCount}',
+            style: const pw.TextStyle(fontSize: 9, color: PdfColors.grey600),
+          ),
         ),
         build: (context) => [
           pw.Row(
-            mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
             children: [
-              pw.Text('فريق الأنصار', style: const pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
-              pw.Text('تقرير مناقلة', style: const pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+              pw.Container(
+                width: 52,
+                height: 52,
+                padding: const pw.EdgeInsets.all(4),
+                decoration: pw.BoxDecoration(
+                  border: pw.Border.all(color: PdfColors.grey300),
+                  borderRadius: pw.BorderRadius.circular(6),
+                ),
+                child: pw.Image(logo, fit: pw.BoxFit.contain),
+              ),
+              pw.SizedBox(width: 12),
+              pw.Expanded(
+                child: pw.Column(
+                  crossAxisAlignment: pw.CrossAxisAlignment.start,
+                  children: [
+                    pw.Text('فريق الأنصار', style: const pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold)),
+                    pw.Text(
+                      'طلب مناقلة من $fromName إلى $toName',
+                      style: const pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold, color: PdfColor.fromInt(0xff087568)),
+                    ),
+                  ],
+                ),
+              ),
+              pw.Container(
+                padding: const pw.EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: pw.BoxDecoration(
+                  color: const PdfColor.fromInt(0xffe7f4f1),
+                  borderRadius: pw.BorderRadius.circular(5),
+                ),
+                child: pw.Text(
+                  statusLabel(widget.order['status'] as String? ?? 'submitted'),
+                  style: const pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColor.fromInt(0xff087568)),
+                ),
+              ),
             ],
           ),
-          pw.SizedBox(height: 16),
+          pw.SizedBox(height: 14),
           pw.Container(
             padding: const pw.EdgeInsets.all(12),
             decoration: pw.BoxDecoration(
-              border: pw.Border.all(color: PdfColors.grey400),
-              borderRadius: pw.BorderRadius.circular(8),
+              color: PdfColors.grey100,
+              border: pw.Border.all(color: PdfColors.grey300),
+              borderRadius: pw.BorderRadius.circular(6),
             ),
-            child: pw.Column(
-              crossAxisAlignment: pw.CrossAxisAlignment.start,
+            child: pw.Wrap(
+              spacing: 26,
+              runSpacing: 6,
               children: [
                 pw.Text('رقم الطلب: ${widget.order['order_no'] ?? '-'}'),
-                pw.Text('من: ${branchLabel(widget.branches, fromBranch)}'),
-                pw.Text('إلى: ${branchLabel(widget.branches, toBranch)}'),
-                pw.Text('الحالة: ${statusLabel(widget.order['status'] as String? ?? 'submitted')}'),
                 pw.Text('تاريخ التقرير: ${formatDateTime(DateTime.now())}'),
+                pw.Text('عدد البنود: ${data.items.length}'),
+                if (widget.order['requester_note'] != null)
+                  pw.Text('ملاحظة الطلب: ${widget.order['requester_note']}'),
               ],
             ),
           ),
-          pw.SizedBox(height: 18),
+          pw.SizedBox(height: 14),
           pw.Text('بنود المناقلة', style: const pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 8),
+          pw.SizedBox(height: 6),
           pw.TableHelper.fromTextArray(
             headers: headers,
             data: rows,
             headerStyle: const pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
             headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
+            oddRowDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xfff4f8f7)),
+            cellStyle: const pw.TextStyle(fontSize: 10),
+            cellPadding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 7),
             cellAlignment: pw.Alignment.centerRight,
             headerAlignment: pw.Alignment.centerRight,
             border: pw.TableBorder.all(color: PdfColors.grey300),
+            columnWidths: const {
+              0: pw.FixedColumnWidth(24),
+              1: pw.FlexColumnWidth(3.2),
+              2: pw.FlexColumnWidth(1.1),
+              3: pw.FlexColumnWidth(1.1),
+              4: pw.FlexColumnWidth(1.1),
+              5: pw.FlexColumnWidth(1.5),
+              6: pw.FlexColumnWidth(2.2),
+            },
           ),
           if (data.events.isNotEmpty) ...[
-            pw.SizedBox(height: 18),
+            pw.SizedBox(height: 16),
             pw.Text('سجل المعالجة', style: const pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
-            pw.SizedBox(height: 8),
-            ...data.events.take(8).map((event) {
-              final employee = data.employees[event['employee_id']];
-              return pw.Padding(
-                padding: const pw.EdgeInsets.only(bottom: 5),
-                child: pw.Text(
-                  '${eventLabel(event)} - ${employee?.name ?? 'موظف'} - ${formatEventTime(event['created_at'])}',
-                ),
-              );
-            }),
+            pw.SizedBox(height: 6),
+            pw.TableHelper.fromTextArray(
+              headers: const ['التحديث', 'نفذه', 'الوقت'],
+              data: eventRows,
+              headerStyle: const pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
+              headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff344f49)),
+              oddRowDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xfff4f8f7)),
+              cellStyle: const pw.TextStyle(fontSize: 10),
+              cellPadding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+              cellAlignment: pw.Alignment.centerRight,
+              headerAlignment: pw.Alignment.centerRight,
+              border: pw.TableBorder.all(color: PdfColors.grey300),
+              columnWidths: const {
+                0: pw.FlexColumnWidth(4),
+                1: pw.FlexColumnWidth(2),
+                2: pw.FlexColumnWidth(1.5),
+              },
+            ),
           ],
         ],
       ),
@@ -5194,8 +5594,8 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
 
   @override
   Widget build(BuildContext context) {
-    final fromBranch = (widget.order['from_branch_num'] as num?)?.toInt() ?? 0;
-    final toBranch = (widget.order['to_branch_num'] as num?)?.toInt() ?? 0;
+    final fromBranch = intValue(widget.order['from_branch_num']);
+    final toBranch = intValue(widget.order['to_branch_num']);
     return Scaffold(
       appBar: AppBar(
         title: Text('مناقلة ${widget.order['order_no'] ?? ''}'),
@@ -5203,8 +5603,10 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
           if (canHandle)
             IconButton(
               tooltip: 'تغيير الحالة',
-              onPressed: changeStatus,
-              icon: const Icon(Icons.edit_note_rounded),
+              onPressed: statusBusy ? null : changeStatus,
+              icon: statusBusy
+                  ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.edit_note_rounded),
             ),
         ],
       ),
@@ -5218,6 +5620,14 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
           if (snapshot.hasError && !snapshot.hasData) {
             return ErrorState(
               message: cleanError(snapshot.error),
+              onRetry: () => setState(() {
+                future = loadAndRememberItems();
+              }),
+            );
+          }
+          if (!snapshot.hasData) {
+            return ErrorState(
+              message: 'تعذر تحميل تفاصيل المناقلة الآن',
               onRetry: () => setState(() {
                 future = loadAndRememberItems();
               }),
@@ -5274,7 +5684,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            product?['name'] as String? ?? 'مادة ${item['mat_num']}',
+                            product?['name']?.toString() ?? 'مادة ${item['mat_num']}',
                             style: const TextStyle(fontWeight: FontWeight.bold),
                           ),
                           const SizedBox(height: 4),
@@ -5412,8 +5822,6 @@ class _TransferDialogState extends State<TransferDialog> {
   @override
   void initState() {
     super.initState();
-    final options = widget.branches.keys.where((number) => number != widget.session.branchNum);
-    if (options.isNotEmpty) toBranch = options.first;
     unawaited(prepareSearchCache());
   }
 
@@ -5483,7 +5891,7 @@ class _TransferDialogState extends State<TransferDialog> {
   void addItem() {
     final product = selectedProduct;
     final parsedQuantity = double.tryParse(quantity.text.trim());
-    final parsedMat = (product?['mat_num'] as num?)?.toInt();
+    final parsedMat = nullableIntValue(product?['mat_num']);
     if (product == null || parsedMat == null || parsedQuantity == null || parsedQuantity <= 0) return;
     setState(() {
       items.add(TransferItemDraft(
@@ -5529,6 +5937,7 @@ class _TransferDialogState extends State<TransferDialog> {
                 children: [
                   DropdownButtonFormField<int>(
                     initialValue: toBranch,
+                    isExpanded: true,
                     decoration: const InputDecoration(
                       labelText: 'الفرع المطلوب منه',
                       prefixIcon: Icon(Icons.storefront_rounded),
@@ -6368,25 +6777,36 @@ class StatTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Card(
-      color: color.withValues(alpha: 0.08),
+      margin: EdgeInsets.zero,
       child: Padding(
         padding: const EdgeInsets.all(14),
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            CircleAvatar(
-              backgroundColor: color.withValues(alpha: 0.14),
-              child: Icon(icon, color: color),
+            Row(
+              children: [
+                Container(
+                  width: 38,
+                  height: 38,
+                  decoration: BoxDecoration(
+                    color: color.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Icon(icon, color: color, size: 21),
+                ),
+                const Spacer(),
+                Text(
+                  value,
+                  style: TextStyle(color: color, fontSize: 23, fontWeight: FontWeight.w800),
+                ),
+              ],
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(title, style: const TextStyle(color: Colors.black54)),
-                  const SizedBox(height: 4),
-                  Text(value, style: const TextStyle(fontSize: 21, fontWeight: FontWeight.bold)),
-                ],
-              ),
+            const SizedBox(height: 10),
+            Text(
+              title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: mutedInk, fontSize: 12, fontWeight: FontWeight.w700),
             ),
           ],
         ),
@@ -6552,49 +6972,105 @@ class DailyHoursChart extends StatelessWidget {
     final entries = values.entries.toList()..sort((a, b) => a.key.compareTo(b.key));
     final shown = entries.length > 14 ? entries.sublist(entries.length - 14) : entries;
     final maxHours = shown.fold<double>(0, (max, item) => item.value > max ? item.value : max);
+    final chartMax = maxHours <= 0 ? 1.0 : maxHours * 1.18;
+    final interval = chartMax <= 4 ? 1.0 : (chartMax / 4).ceilToDouble();
     return Card(
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(10, 20, 10, 8),
-        child: BarChart(
-          BarChartData(
-            alignment: BarChartAlignment.spaceAround,
-            maxY: maxHours <= 0 ? 1 : maxHours * 1.2,
-            gridData: const FlGridData(show: false),
-            borderData: FlBorderData(show: false),
-            titlesData: FlTitlesData(
-              leftTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-              topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-              rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-              bottomTitles: AxisTitles(
-                sideTitles: SideTitles(
-                  showTitles: true,
-                  reservedSize: 34,
-                  getTitlesWidget: (value, meta) {
-                    final index = value.toInt();
-                    if (index < 0 || index >= shown.length) return const SizedBox.shrink();
-                    return Padding(
-                      padding: const EdgeInsets.only(top: 8),
-                      child: Text(shown[index].key, style: const TextStyle(fontSize: 10)),
-                    );
-                  },
+        padding: const EdgeInsets.fromLTRB(12, 14, 8, 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.bar_chart_rounded, color: brandColor, size: 20),
+                const SizedBox(width: 7),
+                Text(
+                  shown.length < entries.length ? 'آخر ${shown.length} يوماً من النطاق' : 'ساعات الدوام اليومية',
+                  style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 13),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: BarChart(
+                BarChartData(
+                  alignment: BarChartAlignment.spaceAround,
+                  maxY: chartMax,
+                  gridData: FlGridData(
+                    show: true,
+                    drawVerticalLine: false,
+                    horizontalInterval: interval,
+                    getDrawingHorizontalLine: (_) => const FlLine(color: borderColor, strokeWidth: 1),
+                  ),
+                  borderData: FlBorderData(
+                    show: true,
+                    border: const Border(
+                      bottom: BorderSide(color: borderColor),
+                      left: BorderSide(color: borderColor),
+                    ),
+                  ),
+                  titlesData: FlTitlesData(
+                    leftTitles: AxisTitles(
+                      sideTitles: SideTitles(
+                        showTitles: true,
+                        reservedSize: 31,
+                        interval: interval,
+                        getTitlesWidget: (value, meta) => Text(
+                          value.toStringAsFixed(0),
+                          style: const TextStyle(color: mutedInk, fontSize: 9),
+                        ),
+                      ),
+                    ),
+                    topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                    rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                    bottomTitles: AxisTitles(
+                      sideTitles: SideTitles(
+                        showTitles: true,
+                        reservedSize: 34,
+                        getTitlesWidget: (value, meta) {
+                          final index = value.toInt();
+                          if (index < 0 || index >= shown.length) return const SizedBox.shrink();
+                          if (shown.length > 8 && index.isOdd && index != shown.length - 1) {
+                            return const SizedBox.shrink();
+                          }
+                          return Padding(
+                            padding: const EdgeInsets.only(top: 8),
+                            child: Text(reportDayLabel(shown[index].key), style: const TextStyle(color: mutedInk, fontSize: 9)),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                  barGroups: [
+                    for (var i = 0; i < shown.length; i++)
+                      BarChartGroupData(
+                        x: i,
+                        barRods: [
+                          BarChartRodData(
+                            toY: shown[i].value,
+                            color: i == shown.length - 1
+                                ? accentColor
+                                : i.isEven
+                                    ? brandColor
+                                    : successColor,
+                            width: shown.length > 10 ? 11 : 15,
+                            borderRadius: const BorderRadius.only(
+                              topLeft: Radius.circular(5),
+                              topRight: Radius.circular(5),
+                            ),
+                            backDrawRodData: BackgroundBarChartRodData(
+                              show: true,
+                              toY: chartMax,
+                              color: softSurface,
+                            ),
+                          ),
+                        ],
+                      ),
+                  ],
                 ),
               ),
             ),
-            barGroups: [
-              for (var i = 0; i < shown.length; i++)
-                BarChartGroupData(
-                  x: i,
-                  barRods: [
-                    BarChartRodData(
-                      toY: shown[i].value,
-                      color: i == shown.length - 1 ? accentColor : brandColor,
-                      width: 14,
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                  ],
-                ),
-            ],
-          ),
+          ],
         ),
       ),
     );
@@ -6614,7 +7090,7 @@ class DurationListTile extends StatelessWidget {
       leading: Stack(
         clipBehavior: Clip.none,
         children: [
-          EmployeeAvatar(name: item.employee.name),
+          EmployeeAvatar(name: item.employee.name, imageUrl: item.employee.avatarUrl),
           if (rank != null)
             Positioned(
               right: -5,
@@ -7395,6 +7871,12 @@ String formatDateTime(DateTime value) {
   return '${shortDate(value)} ${formatTime(value)}';
 }
 
+String reportDayLabel(String value) {
+  final parsed = DateTime.tryParse(value);
+  if (parsed == null) return value;
+  return '${parsed.day.toString().padLeft(2, '0')}/${parsed.month.toString().padLeft(2, '0')}';
+}
+
 String attendanceDurationLabel(String? rawCheckIn) {
   final checkIn = DateTime.tryParse(rawCheckIn ?? '')?.toLocal();
   if (checkIn == null) return 'لحظات';
@@ -7422,6 +7904,20 @@ String formatMoneyValue(Object? value) {
   if (number == null) return '$value';
   if ((number - number.roundToDouble()).abs() < 0.001) return number.toStringAsFixed(0);
   return number.toStringAsFixed(2);
+}
+
+int? nullableIntValue(Object? value) {
+  if (value is num) return value.toInt();
+  return int.tryParse(value?.toString().trim() ?? '');
+}
+
+int intValue(Object? value, {int fallback = 0}) {
+  return nullableIntValue(value) ?? fallback;
+}
+
+double doubleValue(Object? value, {double fallback = 0}) {
+  if (value is num) return value.toDouble();
+  return double.tryParse(value?.toString().trim() ?? '') ?? fallback;
 }
 
 int? parseStoNum(Object? value) {

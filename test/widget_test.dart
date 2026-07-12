@@ -159,6 +159,15 @@ void main() {
     expect(branchLogoAsset('فرع جديد'), isNull);
   });
 
+  test('report labels and flexible numeric values are parsed safely', () {
+    expect(reportDayLabel('2026-07-12'), '12/07');
+    expect(reportDayLabel('invalid'), 'invalid');
+    expect(nullableIntValue('12'), 12);
+    expect(nullableIntValue(null), isNull);
+    expect(intValue('7'), 7);
+    expect(doubleValue('2.5'), 2.5);
+  });
+
   testWidgets('top bar fits mobile width with profile and notifications', (tester) async {
     await tester.binding.setSurfaceSize(const Size(390, 844));
     addTearDown(() => tester.binding.setSurfaceSize(null));
