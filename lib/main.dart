@@ -372,6 +372,72 @@ class BranchStatus {
   bool get isOpen => activeEmployees.isNotEmpty;
 }
 
+class BranchAttendanceEntry {
+  BranchAttendanceEntry({
+    required this.id,
+    required this.employee,
+    required this.checkIn,
+    required this.checkOut,
+  });
+
+  final String id;
+  final EmployeeLite employee;
+  final DateTime checkIn;
+  final DateTime? checkOut;
+
+  bool get isOpen => checkOut == null;
+
+  Duration workedUntil(DateTime now, DateTime dayStart) {
+    final effectiveStart = checkIn.isBefore(dayStart) ? dayStart : checkIn;
+    final effectiveEnd = checkOut ?? now;
+    if (effectiveEnd.isBefore(effectiveStart)) return Duration.zero;
+    return effectiveEnd.difference(effectiveStart);
+  }
+}
+
+class BranchEmployeeDay {
+  BranchEmployeeDay({required this.employee, required this.entries});
+
+  final EmployeeLite employee;
+  final List<BranchAttendanceEntry> entries;
+
+  bool get isPresent => entries.any((entry) => entry.isOpen);
+
+  DateTime get firstCheckIn {
+    return entries.map((entry) => entry.checkIn).reduce((a, b) => a.isBefore(b) ? a : b);
+  }
+
+  DateTime? get lastCheckOut {
+    final values = entries.map((entry) => entry.checkOut).whereType<DateTime>().toList();
+    if (values.isEmpty) return null;
+    return values.reduce((a, b) => a.isAfter(b) ? a : b);
+  }
+
+  Duration workedUntil(DateTime now, DateTime dayStart) {
+    return entries.fold(
+      Duration.zero,
+      (total, entry) => total + entry.workedUntil(now, dayStart),
+    );
+  }
+}
+
+class BranchTodayData {
+  BranchTodayData({required this.entries, required this.employeeDays});
+
+  final List<BranchAttendanceEntry> entries;
+  final List<BranchEmployeeDay> employeeDays;
+
+  int get activeCount => employeeDays.where((employee) => employee.isPresent).length;
+  int get employeeCount => employeeDays.length;
+
+  Duration totalWorkedUntil(DateTime now, DateTime dayStart) {
+    return employeeDays.fold(
+      Duration.zero,
+      (total, employee) => total + employee.workedUntil(now, dayStart),
+    );
+  }
+}
+
 class ReportData {
   ReportData({
     required this.branches,
@@ -1251,6 +1317,22 @@ class _DashboardPageState extends State<DashboardPage> {
     }
   }
 
+  Future<void> openBranchDetails(BranchStatus branch) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: BranchTodayPage(branch: branch),
+        ),
+      ),
+    );
+    if (mounted) {
+      setState(() {
+        future = loadAndRememberDashboard();
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return RefreshIndicator(
@@ -1354,6 +1436,12 @@ class _DashboardPageState extends State<DashboardPage> {
                       const Divider(),
                       const SizedBox(height: 16),
                       FilledButton.icon(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: isWorking ? dangerColor : brandColor,
+                          foregroundColor: Colors.white,
+                          disabledBackgroundColor: (isWorking ? dangerColor : brandColor).withValues(alpha: 0.55),
+                          disabledForegroundColor: Colors.white,
+                        ),
                         onPressed: attendanceBusy
                             ? null
                             : isWorking
@@ -1402,17 +1490,34 @@ class _DashboardPageState extends State<DashboardPage> {
                                 ],
                               ),
                       )
-                    : Card(
+                    : KeyedSubtree(
                         key: const ValueKey('branches'),
                         child: data.branchStatuses.isEmpty
-                            ? const EmptyState(icon: Icons.storefront_rounded, text: 'لا توجد فروع مسجلة')
-                            : Column(
-                                children: [
-                                  for (var i = 0; i < data.branchStatuses.length; i++) ...[
-                                    BranchStatusCard(branch: data.branchStatuses[i]),
-                                    if (i != data.branchStatuses.length - 1) const Divider(indent: 76),
-                                  ],
-                                ],
+                            ? const Card(
+                                child: EmptyState(icon: Icons.storefront_rounded, text: 'لا توجد فروع مسجلة'),
+                              )
+                            : LayoutBuilder(
+                                builder: (context, constraints) {
+                                  final columns = constraints.maxWidth < 270 ? 1 : 2;
+                                  return GridView.builder(
+                                    shrinkWrap: true,
+                                    physics: const NeverScrollableScrollPhysics(),
+                                    itemCount: data.branchStatuses.length,
+                                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                                      crossAxisCount: columns,
+                                      crossAxisSpacing: 10,
+                                      mainAxisSpacing: 10,
+                                      childAspectRatio: columns == 1 ? 2.2 : 1.05,
+                                    ),
+                                    itemBuilder: (context, index) {
+                                      final branch = data.branchStatuses[index];
+                                      return BranchStatusCard(
+                                        branch: branch,
+                                        onTap: () => openBranchDetails(branch),
+                                      );
+                                    },
+                                  );
+                                },
                               ),
                       ),
               ),
@@ -1591,6 +1696,429 @@ class DashboardSummary extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class BranchTodayPage extends StatefulWidget {
+  const BranchTodayPage({super.key, required this.branch});
+
+  final BranchStatus branch;
+
+  @override
+  State<BranchTodayPage> createState() => _BranchTodayPageState();
+}
+
+class _BranchTodayPageState extends State<BranchTodayPage> {
+  late Future<BranchTodayData> future;
+  BranchTodayData? latestData;
+  RealtimeChannel? attendanceChannel;
+  Timer? refreshTimer;
+  bool refreshing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    future = loadAndRemember();
+    attendanceChannel = supabase.channel('branch-today-${widget.branch.branchNum}')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_attendance_logs',
+        callback: (_) => reloadFromChange(),
+      ).subscribe();
+    refreshTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      reloadFromChange();
+    });
+  }
+
+  @override
+  void dispose() {
+    refreshTimer?.cancel();
+    if (attendanceChannel != null) supabase.removeChannel(attendanceChannel!);
+    super.dispose();
+  }
+
+  void reloadFromChange() {
+    if (!mounted) return;
+    setState(() {
+      future = loadAndRemember();
+    });
+  }
+
+  Future<void> refresh() async {
+    if (refreshing) return;
+    final refreshed = loadAndRemember();
+    setState(() {
+      refreshing = true;
+      future = refreshed;
+    });
+    try {
+      await refreshed;
+    } finally {
+      if (mounted) setState(() => refreshing = false);
+    }
+  }
+
+  Future<BranchTodayData> loadAndRemember() async {
+    final loaded = await loadData();
+    latestData = loaded;
+    return loaded;
+  }
+
+  Future<BranchTodayData> loadData() async {
+    final now = DateTime.now();
+    final dayStart = DateTime(now.year, now.month, now.day);
+    final nextDay = dayStart.add(const Duration(days: 1));
+    final employeeRows = await supabase
+        .from('ansar_employees')
+        .select('id, display_name, full_name, username, branch_num, role, is_active');
+    final employees = employeeRows.cast<Map<String, dynamic>>().map(EmployeeLite.fromRow).toList();
+    final employeesById = {for (final employee in employees) employee.id: employee};
+
+    final todayRows = await supabase
+        .from('ansar_attendance_logs')
+        .select()
+        .gte('check_in_at', dayStart.toUtc().toIso8601String())
+        .lt('check_in_at', nextDay.toUtc().toIso8601String())
+        .order('check_in_at', ascending: false);
+    final openRows = await supabase
+        .from('ansar_attendance_logs')
+        .select()
+        .eq('status', 'open')
+        .order('check_in_at', ascending: false);
+
+    final rowsById = <String, Map<String, dynamic>>{};
+    for (final rawRow in [...todayRows, ...openRows]) {
+      final row = Map<String, dynamic>.from(rawRow);
+      final fallbackId = '${row['employee_id']}-${row['check_in_at']}';
+      rowsById['${row['id'] ?? fallbackId}'] = row;
+    }
+
+    final entries = <BranchAttendanceEntry>[];
+    for (final row in rowsById.values) {
+      final employeeId = row['employee_id'] as String?;
+      final rawCheckIn = row['check_in_at'] as String?;
+      if (employeeId == null || rawCheckIn == null) continue;
+      final knownEmployee = employeesById[employeeId];
+      final branchNum = (row['branch_num'] as num?)?.toInt() ?? knownEmployee?.branchNum ?? 0;
+      if (branchNum != widget.branch.branchNum) continue;
+      final checkIn = DateTime.tryParse(rawCheckIn)?.toLocal();
+      if (checkIn == null) continue;
+      final rawCheckOut = row['check_out_at'] as String?;
+      final checkOut = rawCheckOut == null ? null : DateTime.tryParse(rawCheckOut)?.toLocal();
+      if (!checkIn.isBefore(nextDay) || (checkOut != null && !checkOut.isAfter(dayStart))) continue;
+      final employee = knownEmployee ??
+          EmployeeLite(
+            id: employeeId,
+            name: 'موظف',
+            username: '',
+            branchNum: branchNum,
+            role: 'employee',
+            isActive: false,
+          );
+      entries.add(
+        BranchAttendanceEntry(
+          id: '${row['id'] ?? '$employeeId-$rawCheckIn'}',
+          employee: employee,
+          checkIn: checkIn,
+          checkOut: checkOut,
+        ),
+      );
+    }
+    entries.sort((a, b) => b.checkIn.compareTo(a.checkIn));
+
+    final grouped = <String, List<BranchAttendanceEntry>>{};
+    for (final entry in entries) {
+      grouped.putIfAbsent(entry.employee.id, () => <BranchAttendanceEntry>[]).add(entry);
+    }
+    final employeeDays = grouped.values.map((employeeEntries) {
+      employeeEntries.sort((a, b) => b.checkIn.compareTo(a.checkIn));
+      return BranchEmployeeDay(employee: employeeEntries.first.employee, entries: employeeEntries);
+    }).toList()
+      ..sort((a, b) {
+        if (a.isPresent != b.isPresent) return a.isPresent ? -1 : 1;
+        return a.employee.name.compareTo(b.employee.name);
+      });
+    return BranchTodayData(entries: entries, employeeDays: employeeDays);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final dayStart = DateTime(now.year, now.month, now.day);
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.branch.branchName),
+        actions: [
+          IconButton(
+            tooltip: 'تحديث',
+            onPressed: refreshing ? null : refresh,
+            icon: refreshing
+                ? const SizedBox(width: 19, height: 19, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.refresh_rounded),
+          ),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: refresh,
+        child: FutureBuilder<BranchTodayData>(
+          future: future,
+          initialData: latestData,
+          builder: (context, snapshot) {
+            if (!snapshot.hasData && snapshot.connectionState != ConnectionState.done) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            if (!snapshot.hasData && snapshot.hasError) {
+              return ErrorState(message: cleanError(snapshot.error), onRetry: reloadFromChange);
+            }
+            final data = snapshot.data!;
+            final activeEmployees = data.employeeDays.where((employee) => employee.isPresent).toList();
+            final totalWorked = data.totalWorkedUntil(now, dayStart);
+            return ListView(
+              padding: pagePadding,
+              children: [
+                BranchTodayHeader(
+                  branchName: widget.branch.branchName,
+                  activeCount: data.activeCount,
+                  employeeCount: data.employeeCount,
+                  totalWorked: totalWorked,
+                ),
+                const SizedBox(height: 18),
+                const SectionHeader(title: 'الموجودون الآن'),
+                const SizedBox(height: 8),
+                if (activeEmployees.isEmpty)
+                  const Card(
+                    child: EmptyState(icon: Icons.storefront_outlined, text: 'لا يوجد موظفون داخل الفرع الآن'),
+                  )
+                else
+                  Card(
+                    child: Column(
+                      children: [
+                        for (var i = 0; i < activeEmployees.length; i++) ...[
+                          BranchActiveEmployeeTile(employeeDay: activeEmployees[i], dayStart: dayStart),
+                          if (i != activeEmployees.length - 1) const Divider(indent: 66),
+                        ],
+                      ],
+                    ),
+                  ),
+                const SizedBox(height: 18),
+                const SectionHeader(title: 'سجل دوام اليوم'),
+                const SizedBox(height: 8),
+                if (data.employeeDays.isEmpty)
+                  const Card(
+                    child: EmptyState(icon: Icons.event_busy_rounded, text: 'لم تُسجل حركات دوام في هذا الفرع اليوم'),
+                  )
+                else
+                  ...data.employeeDays.map(
+                    (employeeDay) => Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: BranchEmployeeDayCard(employeeDay: employeeDay, dayStart: dayStart),
+                    ),
+                  ),
+                const SizedBox(height: 80),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class BranchTodayHeader extends StatelessWidget {
+  const BranchTodayHeader({
+    super.key,
+    required this.branchName,
+    required this.activeCount,
+    required this.employeeCount,
+    required this.totalWorked,
+  });
+
+  final String branchName;
+  final int activeCount;
+  final int employeeCount;
+  final Duration totalWorked;
+
+  @override
+  Widget build(BuildContext context) {
+    final isOpen = activeCount > 0;
+    final statusColor = isOpen ? successColor : dangerColor;
+    return Card(
+      color: isOpen ? successSurface.withValues(alpha: 0.42) : panelSurface,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: statusColor.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Icon(Icons.storefront_rounded, color: statusColor),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(branchName, style: Theme.of(context).textTheme.titleLarge?.copyWith(fontSize: 18)),
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          StatusDot(color: statusColor, size: 8),
+                          const SizedBox(width: 6),
+                          Text(isOpen ? 'الفرع مفتوح الآن' : 'الفرع مغلق الآن', style: TextStyle(color: statusColor, fontWeight: FontWeight.w800)),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(child: BranchTodayMetric(label: 'الموجودون', value: '$activeCount', icon: Icons.groups_rounded)),
+                const SizedBox(width: 8),
+                Expanded(child: BranchTodayMetric(label: 'سجلوا اليوم', value: '$employeeCount', icon: Icons.how_to_reg_rounded)),
+                const SizedBox(width: 8),
+                Expanded(child: BranchTodayMetric(label: 'ساعات اليوم', value: formatDurationCompact(totalWorked), icon: Icons.schedule_rounded)),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class BranchTodayMetric extends StatelessWidget {
+  const BranchTodayMetric({super.key, required this.label, required this.value, required this.icon});
+
+  final String label;
+  final String value;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 10),
+      decoration: BoxDecoration(
+        color: panelSurface.withValues(alpha: 0.82),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: borderColor),
+      ),
+      child: Column(
+        children: [
+          Icon(icon, size: 18, color: brandColor),
+          const SizedBox(height: 5),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(value, maxLines: 1, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+          ),
+          const SizedBox(height: 2),
+          Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: mutedInk, fontSize: 10)),
+        ],
+      ),
+    );
+  }
+}
+
+class BranchActiveEmployeeTile extends StatelessWidget {
+  const BranchActiveEmployeeTile({super.key, required this.employeeDay, required this.dayStart});
+
+  final BranchEmployeeDay employeeDay;
+  final DateTime dayStart;
+
+  @override
+  Widget build(BuildContext context) {
+    final openEntry = employeeDay.entries.firstWhere((entry) => entry.isOpen);
+    final worked = employeeDay.workedUntil(DateTime.now(), dayStart);
+    return ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+      leading: EmployeeAvatar(name: employeeDay.employee.name),
+      title: Text(employeeDay.employee.name, style: const TextStyle(fontWeight: FontWeight.w800)),
+      subtitle: Text('دخل الساعة ${formatTime(openEntry.checkIn)}', style: const TextStyle(color: mutedInk)),
+      trailing: StatusPill(label: formatDurationCompact(worked), color: successColor),
+    );
+  }
+}
+
+class BranchEmployeeDayCard extends StatelessWidget {
+  const BranchEmployeeDayCard({super.key, required this.employeeDay, required this.dayStart});
+
+  final BranchEmployeeDay employeeDay;
+  final DateTime dayStart;
+
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final worked = employeeDay.workedUntil(now, dayStart);
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                EmployeeAvatar(name: employeeDay.employee.name),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(employeeDay.employee.name, style: const TextStyle(fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 3),
+                      Text(
+                        employeeDay.isPresent ? 'موجود داخل الفرع الآن' : 'أنهى دوامه في الفرع',
+                        style: TextStyle(color: employeeDay.isPresent ? successColor : mutedInk, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                ),
+                StatusPill(
+                  label: formatDurationCompact(worked),
+                  color: employeeDay.isPresent ? successColor : brandColor,
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            const Divider(height: 1),
+            const SizedBox(height: 9),
+            for (final entry in employeeDay.entries)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 5),
+                child: Row(
+                  children: [
+                    const Icon(Icons.login_rounded, size: 18, color: successColor),
+                    const SizedBox(width: 6),
+                    Text('دخول ${formatTime(entry.checkIn)}', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+                    const SizedBox(width: 10),
+                    Icon(Icons.logout_rounded, size: 18, color: entry.isOpen ? mutedInk : dangerColor),
+                    const SizedBox(width: 6),
+                    Text(
+                      entry.isOpen ? 'حتى الآن' : 'خروج ${formatTime(entry.checkOut!)}',
+                      style: const TextStyle(fontSize: 12, color: mutedInk),
+                    ),
+                    const Spacer(),
+                    Text(
+                      formatDurationCompact(entry.workedUntil(now, dayStart)),
+                      style: const TextStyle(color: brandColor, fontSize: 11, fontWeight: FontWeight.w800),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -5972,71 +6500,80 @@ class MovementTile extends StatelessWidget {
 }
 
 class BranchStatusCard extends StatelessWidget {
-  const BranchStatusCard({super.key, required this.branch});
+  const BranchStatusCard({super.key, required this.branch, required this.onTap});
 
   final BranchStatus branch;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     final open = branch.isOpen;
     final count = branch.activeEmployees.length;
-    final names = branch.activeEmployees.take(3).map((employee) => employee.name).join('، ');
-    final extra = count > 3 ? ' و${count - 3} آخرين' : '';
     final color = open ? successColor : dangerColor;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
-      child: Row(
-        children: [
-          Container(
-            width: 14,
-            height: 14,
-            decoration: BoxDecoration(
-              color: color,
-              shape: BoxShape.circle,
-              boxShadow: [
-                BoxShadow(color: color.withValues(alpha: 0.15), blurRadius: 0, spreadRadius: 5),
-              ],
-            ),
-          ),
-          const SizedBox(width: 16),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(branch.branchName, style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
-                const SizedBox(height: 5),
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 3,
-                  children: [
-                    Text(open ? 'مفتوح' : 'مغلق', style: TextStyle(color: color, fontWeight: FontWeight.w800)),
-                    Text(
-                      open ? '· ${count == 1 ? 'موظف واحد' : '$count موظفين'}' : '· لا يوجد موظفون داخل الفرع',
-                      style: const TextStyle(color: mutedInk),
+    return Card(
+      margin: EdgeInsets.zero,
+      color: open ? successSurface.withValues(alpha: 0.48) : panelSurface,
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(13),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: color.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(8),
                     ),
-                  ],
-                ),
-                if (open && names.isNotEmpty) ...[
-                  const SizedBox(height: 4),
-                  Text('$names$extra', style: const TextStyle(fontSize: 12, color: mutedInk)),
+                    child: Icon(
+                      open ? Icons.storefront_rounded : Icons.storefront_outlined,
+                      color: color,
+                      size: 20,
+                    ),
+                  ),
+                  const SizedBox(width: 9),
+                  Expanded(
+                    child: Text(
+                      branch.branchName,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 14, height: 1.35),
+                    ),
+                  ),
                 ],
-              ],
-            ),
+              ),
+              const Spacer(),
+              Row(
+                children: [
+                  StatusDot(color: color, size: 8),
+                  const SizedBox(width: 6),
+                  Text(open ? 'مفتوح الآن' : 'مغلق', style: TextStyle(color: color, fontWeight: FontWeight.w800)),
+                ],
+              ),
+              const SizedBox(height: 5),
+              Text(
+                open ? (count == 1 ? 'موظف واحد داخل الفرع' : '$count موظفين داخل الفرع') : 'لا يوجد موظفون الآن',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: mutedInk, fontSize: 11),
+              ),
+              const SizedBox(height: 7),
+              const Row(
+                children: [
+                  Text('تفاصيل دوام اليوم', style: TextStyle(color: brandColor, fontSize: 11, fontWeight: FontWeight.w800)),
+                  Spacer(),
+                  Icon(Icons.chevron_left_rounded, color: brandColor, size: 18),
+                ],
+              ),
+            ],
           ),
-          const SizedBox(width: 8),
-          Container(
-            width: 38,
-            height: 38,
-            decoration: const BoxDecoration(color: Color(0xfff1f4f3), shape: BoxShape.circle),
-            child: Icon(
-              open ? Icons.storefront_rounded : Icons.storefront_outlined,
-              color: open ? brandColor : mutedInk,
-              size: 21,
-            ),
-          ),
-          const SizedBox(width: 4),
-          const Icon(Icons.chevron_left_rounded, color: mutedInk),
-        ],
+        ),
       ),
     );
   }
@@ -6894,6 +7431,15 @@ String attendanceDurationLabel(String? rawCheckIn) {
   if (hours == 0) return '$minutes دقيقة';
   if (minutes == 0) return '$hours ${hours == 1 ? 'ساعة' : 'ساعات'}';
   return '$hours ${hours == 1 ? 'ساعة' : 'ساعات'} و$minutes دقيقة';
+}
+
+String formatDurationCompact(Duration duration) {
+  if (duration.isNegative || duration.inMinutes < 1) return 'أقل من د';
+  final hours = duration.inHours;
+  final minutes = duration.inMinutes.remainder(60);
+  if (hours == 0) return '$minutes د';
+  if (minutes == 0) return '$hours س';
+  return '$hours س $minutes د';
 }
 
 String formatMoneyValue(Object? value) {

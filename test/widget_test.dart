@@ -82,6 +82,7 @@ void main() {
     await tester.pumpWidget(
       _testShell(
         BranchStatusCard(
+          onTap: () {},
           branch: BranchStatus(
             branchNum: 1,
             branchName: 'فرع حمص',
@@ -110,8 +111,44 @@ void main() {
 
     expect(tester.takeException(), isNull);
     expect(find.text('فرع حمص'), findsOneWidget);
-    expect(find.text('مفتوح'), findsOneWidget);
+    expect(find.text('مفتوح الآن'), findsOneWidget);
     expect(find.textContaining('2 موظفين'), findsOneWidget);
+  });
+
+  test('branch attendance duration is calculated across daily sessions', () {
+    final employee = EmployeeLite(
+      id: '1',
+      name: 'إبراهيم عسكر',
+      username: 'ibrahim',
+      branchNum: 1,
+      role: 'employee',
+      isActive: true,
+    );
+    final employeeDay = BranchEmployeeDay(
+      employee: employee,
+      entries: [
+        BranchAttendanceEntry(
+          id: 'first',
+          employee: employee,
+          checkIn: DateTime(2026, 7, 12, 8),
+          checkOut: DateTime(2026, 7, 12, 10, 30),
+        ),
+        BranchAttendanceEntry(
+          id: 'second',
+          employee: employee,
+          checkIn: DateTime(2026, 7, 12, 11),
+          checkOut: DateTime(2026, 7, 12, 13),
+        ),
+      ],
+    );
+
+    final duration = employeeDay.workedUntil(
+      DateTime(2026, 7, 12, 14),
+      DateTime(2026, 7, 12),
+    );
+
+    expect(duration, const Duration(hours: 4, minutes: 30));
+    expect(formatDurationCompact(duration), '4 س 30 د');
   });
 
   testWidgets('top bar fits mobile width with profile and notifications', (tester) async {
