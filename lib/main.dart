@@ -85,7 +85,7 @@ ThemeData buildAnsarTheme() {
       bodySmall: base.textTheme.bodySmall?.copyWith(color: mutedInk, height: 1.45),
       labelLarge: base.textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w700, height: 1.3),
     ),
-    appBarTheme: const AppBarTheme(
+    appBarTheme: const AppBarThemeData(
       centerTitle: true,
       backgroundColor: panelSurface,
       foregroundColor: inkColor,
@@ -111,7 +111,7 @@ ThemeData buildAnsarTheme() {
       ),
     ),
     dividerTheme: const DividerThemeData(color: borderColor, thickness: 1, space: 1),
-    inputDecorationTheme: InputDecorationTheme(
+    inputDecorationTheme: InputDecorationThemeData(
       filled: true,
       fillColor: panelSurface,
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
