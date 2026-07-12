@@ -1055,15 +1055,19 @@ class _DashboardPageState extends State<DashboardPage> {
         schema: 'public',
         table: 'ansar_attendance_logs',
         callback: (_) {
-          if (mounted) setState(() {
-            future = loadAndRememberDashboard();
-          });
+          if (mounted) {
+            setState(() {
+              future = loadAndRememberDashboard();
+            });
+          }
         },
       ).subscribe();
     timer = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (mounted) setState(() {
-        future = loadAndRememberDashboard();
-      });
+      if (mounted) {
+        setState(() {
+          future = loadAndRememberDashboard();
+        });
+      }
     });
   }
 
@@ -1207,9 +1211,11 @@ class _DashboardPageState extends State<DashboardPage> {
           'branch_num': widget.session.branchNum,
         },
       ));
-      if (mounted) setState(() {
-        future = loadAndRememberDashboard();
-      });
+      if (mounted) {
+        setState(() {
+          future = loadAndRememberDashboard();
+        });
+      }
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -1233,9 +1239,11 @@ class _DashboardPageState extends State<DashboardPage> {
           'branch_num': widget.session.branchNum,
         },
       ));
-      if (mounted) setState(() {
-        future = loadAndRememberDashboard();
-      });
+      if (mounted) {
+        setState(() {
+          future = loadAndRememberDashboard();
+        });
+      }
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -1948,7 +1956,7 @@ class _ReportsPageState extends State<ReportsPage> {
             ),
             const SizedBox(height: 12),
             Card(
-              color: brandColor.withOpacity(0.07),
+              color: brandColor.withValues(alpha: 0.07),
               child: Padding(
                 padding: const EdgeInsets.all(12),
                 child: Wrap(
@@ -2710,7 +2718,7 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
                       Row(
                         children: [
                           CircleAvatar(
-                            backgroundColor: brandColor.withOpacity(0.1),
+                            backgroundColor: brandColor.withValues(alpha: 0.1),
                             child: const Icon(Icons.receipt_long_rounded, color: brandColor),
                           ),
                           const SizedBox(width: 10),
@@ -2991,9 +2999,9 @@ class StatusPill extends StatelessWidget {
   Widget build(BuildContext context) {
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: color.withOpacity(0.12),
+        color: color.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: color.withOpacity(0.25)),
+        border: Border.all(color: color.withValues(alpha: 0.25)),
       ),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
@@ -3022,9 +3030,9 @@ class _ManagementPageState extends State<ManagementPage> {
   Widget build(BuildContext context) {
     return Column(
       children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-          child: const PageHeading(
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 12, 16, 0),
+          child: PageHeading(
             title: 'إدارة النظام',
             subtitle: 'الموظفون والفروع وحالة الإشعارات',
             icon: Icons.admin_panel_settings_outlined,
@@ -3111,9 +3119,11 @@ class _EmployeesPageState extends State<EmployeesPage> {
       } else {
         await supabase.from('ansar_employees').update(result).eq('id', employee['id']);
       }
-      if (mounted) setState(() {
-        employeesFuture = loadEmployees();
-      });
+      if (mounted) {
+        setState(() {
+          employeesFuture = loadEmployees();
+        });
+      }
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -3131,9 +3141,11 @@ class _EmployeesPageState extends State<EmployeesPage> {
     setState(() => employeeBusy = true);
     try {
       await supabase.from('ansar_employees').update({'is_active': false}).eq('id', employee['id']);
-      if (mounted) setState(() {
-        employeesFuture = loadEmployees();
-      });
+      if (mounted) {
+        setState(() {
+          employeesFuture = loadEmployees();
+        });
+      }
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -3351,9 +3363,11 @@ class _BranchesPageState extends State<BranchesPage> {
           'created_by': widget.session.id,
         });
       }
-      if (mounted) setState(() {
-        future = loadAppBranchesMap();
-      });
+      if (mounted) {
+        setState(() {
+          future = loadAppBranchesMap();
+        });
+      }
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -3376,9 +3390,11 @@ class _BranchesPageState extends State<BranchesPage> {
         'is_active': false,
         'created_by': widget.session.id,
       });
-      if (mounted) setState(() {
-        future = loadAppBranchesMap();
-      });
+      if (mounted) {
+        setState(() {
+          future = loadAppBranchesMap();
+        });
+      }
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -4087,9 +4103,11 @@ class _TransfersPageState extends State<TransfersPage> {
             'طلب مناقلة من ${branchLabel(data.branches, widget.session.branchNum)} إلى ${branchLabel(data.branches, result.toBranch)}',
         data: {'type': 'transfer_created', 'order_id': inserted['id'], 'sender_id': widget.session.id},
       ));
-      if (mounted) setState(() {
-        future = loadTransfers();
-      });
+      if (mounted) {
+        setState(() {
+          future = loadTransfers();
+        });
+      }
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -4128,9 +4146,11 @@ class _TransfersPageState extends State<TransfersPage> {
         body: 'تم تحديث حالة المناقلة رقم ${order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
         data: {'type': 'transfer_updated', 'order_id': order['id'], 'status': status, 'sender_id': widget.session.id},
       ));
-      if (mounted) setState(() {
-        future = loadTransfers();
-      });
+      if (mounted) {
+        setState(() {
+          future = loadTransfers();
+        });
+      }
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -4151,9 +4171,11 @@ class _TransfersPageState extends State<TransfersPage> {
         ),
       ),
     );
-    if (mounted) setState(() {
-      future = loadTransfers();
-    });
+    if (mounted) {
+      setState(() {
+        future = loadTransfers();
+      });
+    }
   }
 
   @override
@@ -4205,7 +4227,7 @@ class _TransfersPageState extends State<TransfersPage> {
               ),
               Expanded(
                 child: visibleOrders.isEmpty
-                    ? EmptyState(
+                    ? const EmptyState(
                         icon: Icons.sync_alt_rounded,
                         text: 'لا توجد مناقلات ضمن هذا العرض',
                       )
@@ -4233,7 +4255,7 @@ class _TransfersPageState extends State<TransfersPage> {
                               Row(
                                 children: [
                                   CircleAvatar(
-                                    backgroundColor: transferStatusColor(status).withOpacity(0.12),
+                                    backgroundColor: transferStatusColor(status).withValues(alpha: 0.12),
                                     child: Icon(transferStatusIcon(status), color: transferStatusColor(status)),
                                   ),
                                   const SizedBox(width: 10),
@@ -4551,9 +4573,11 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       ));
       item['item_status'] = status;
       item['approved_quantity'] = approved;
-      if (mounted) setState(() {
-        future = loadAndRememberItems();
-      });
+      if (mounted) {
+        setState(() {
+          future = loadAndRememberItems();
+        });
+      }
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -4642,8 +4666,8 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
           pw.Row(
             mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
             children: [
-              pw.Text('فريق الأنصار', style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
-              pw.Text('تقرير مناقلة', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+              pw.Text('فريق الأنصار', style: const pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
+              pw.Text('تقرير مناقلة', style: const pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
             ],
           ),
           pw.SizedBox(height: 16),
@@ -4665,20 +4689,20 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
             ),
           ),
           pw.SizedBox(height: 18),
-          pw.Text('بنود المناقلة', style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
+          pw.Text('بنود المناقلة', style: const pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
           pw.SizedBox(height: 8),
           pw.TableHelper.fromTextArray(
             headers: headers,
             data: rows,
-            headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
-            headerDecoration: pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
+            headerStyle: const pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
+            headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
             cellAlignment: pw.Alignment.centerRight,
             headerAlignment: pw.Alignment.centerRight,
             border: pw.TableBorder.all(color: PdfColors.grey300),
           ),
           if (data.events.isNotEmpty) ...[
             pw.SizedBox(height: 18),
-            pw.Text('سجل المعالجة', style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
+            pw.Text('سجل المعالجة', style: const pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
             pw.SizedBox(height: 8),
             ...data.events.take(8).map((event) {
               final employee = data.employees[event['employee_id']];
@@ -4832,7 +4856,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                   final employee = details.employees[event['employee_id']];
                   return ListTile(
                     leading: CircleAvatar(
-                      backgroundColor: brandColor.withOpacity(0.1),
+                      backgroundColor: brandColor.withValues(alpha: 0.1),
                       child: const Icon(Icons.manage_history_rounded, color: brandColor),
                     ),
                     title: Text(eventLabel(event)),
@@ -5314,9 +5338,11 @@ class _ChatPageState extends State<ChatPage> {
         ),
       ),
     );
-    if (mounted) setState(() {
-      future = loadThreads();
-    });
+    if (mounted) {
+      setState(() {
+        future = loadThreads();
+      });
+    }
   }
 
   Future<void> createThread() async {
@@ -5350,9 +5376,11 @@ class _ChatPageState extends State<ChatPage> {
                     })
                 .toList(),
           );
-      if (mounted) setState(() {
-        future = loadThreads();
-      });
+      if (mounted) {
+        setState(() {
+          future = loadThreads();
+        });
+      }
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
     } finally {
@@ -5476,15 +5504,19 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
           value: widget.thread['id'],
         ),
         callback: (_) {
-          if (mounted) setState(() {
-            future = loadAndRememberMessages();
-          });
+          if (mounted) {
+            setState(() {
+              future = loadAndRememberMessages();
+            });
+          }
         },
       ).subscribe();
     timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {
-        future = loadAndRememberMessages();
-      });
+      if (mounted) {
+        setState(() {
+          future = loadAndRememberMessages();
+        });
+      }
     });
   }
 
@@ -5540,9 +5572,11 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       await supabase
           .from('ansar_chat_threads')
           .update({'updated_at': DateTime.now().toUtc().toIso8601String()}).eq('id', widget.thread['id']);
-      if (mounted) setState(() {
-        future = loadAndRememberMessages();
-      });
+      if (mounted) {
+        setState(() {
+          future = loadAndRememberMessages();
+        });
+      }
       unawaited(enqueueChatNotification(
         thread: widget.thread,
         sender: widget.session,
@@ -6105,6 +6139,24 @@ class DurationListTile extends StatelessWidget {
         '${item.hours.toStringAsFixed(1)} س',
         style: const TextStyle(color: brandColor, fontWeight: FontWeight.w800),
       ),
+    );
+  }
+}
+
+class StatusDot extends StatelessWidget {
+  const StatusDot({super.key, required this.color, this.size = 9});
+
+  final Color color;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: color,
+        shape: BoxShape.circle,
+      ),
+      child: SizedBox.square(dimension: size),
     );
   }
 }
@@ -6950,7 +7002,7 @@ void showSnack(BuildContext context, String message) {
         margin: const EdgeInsets.all(14),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(8),
-          side: BorderSide(color: brandColor.withOpacity(0.18)),
+          side: BorderSide(color: brandColor.withValues(alpha: 0.18)),
         ),
         duration: const Duration(seconds: 2),
       ),
