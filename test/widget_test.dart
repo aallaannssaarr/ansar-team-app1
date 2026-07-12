@@ -168,6 +168,65 @@ void main() {
     expect(doubleValue('2.5'), 2.5);
   });
 
+  test('amounts, PDF chunks, and chat dates use compact display values', () {
+    expect(formatMoneyValue(12000), '12,000');
+    expect(formatMoneyValue(12000.50), '12,000.5');
+    expect(chunkList([1, 2, 3, 4, 5], 2), [
+      [1, 2],
+      [3, 4],
+      [5],
+    ]);
+    expect(shortPdfText('abcdef', 5), 'abcd…');
+    expect(sameCalendarDay(DateTime(2026, 7, 12, 1), DateTime(2026, 7, 12, 23)), isTrue);
+    expect(sameCalendarDay(DateTime(2026, 7, 11), DateTime(2026, 7, 12)), isFalse);
+  });
+
+  testWidgets('product detail tables render compact rows without overflow', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      _testShell(
+        ProductDetailsTable(
+          title: 'الأسعار المعتمدة',
+          icon: Icons.sell_outlined,
+          headers: const ['نوع السعر', 'القيمة'],
+          rows: const [
+            ['السعر القائم', '12,500'],
+            ['سعر المفرق', '15,000'],
+          ],
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('الأسعار المعتمدة'), findsOneWidget);
+    expect(find.text('12,500'), findsOneWidget);
+  });
+
+  testWidgets('chat bubble shows sender image fallback and date safely', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      _testShell(
+        ChatMessageBubble(
+          row: {
+            'body': 'رسالة تجريبية',
+            'created_at': '2026-07-12T10:30:00Z',
+          },
+          mine: false,
+          senderName: 'إبراهيم عسكر',
+          avatarUrl: null,
+          showDate: true,
+          onLongPress: () {},
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('إبراهيم عسكر'), findsOneWidget);
+    expect(find.text('رسالة تجريبية'), findsOneWidget);
+  });
+
   testWidgets('top bar fits mobile width with profile and notifications', (tester) async {
     await tester.binding.setSurfaceSize(const Size(390, 844));
     addTearDown(() => tester.binding.setSurfaceSize(null));

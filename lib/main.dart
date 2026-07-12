@@ -8,9 +8,11 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:intl/intl.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'ansar_config.dart';
@@ -3107,13 +3109,49 @@ class _QueriesPageState extends State<QueriesPage> {
               final total = rows.fold<double>(0, (sum, row) => sum + ((row['ras'] as num?)?.toDouble() ?? 0));
               return Column(
                 children: [
-                  StatTile(title: 'إجمالي الصناديق', value: total.toStringAsFixed(0), icon: Icons.payments_rounded, color: brandColor),
+                  StatTile(title: 'إجمالي الصناديق', value: formatMoneyValue(total), icon: Icons.payments_rounded, color: brandColor),
                   ...rows.map((box) => Card(
-                        child: ListTile(
-                          leading: const CircleAvatar(child: Icon(Icons.point_of_sale_rounded)),
-                          title: Text(box['name'] as String? ?? 'صندوق ${box['num']}'),
-                          subtitle: Text('رقم ${box['num']}'),
-                          trailing: Text('${box['ras'] ?? 0}'),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 12),
+                          child: Row(
+                            children: [
+                              Container(
+                                width: 44,
+                                height: 44,
+                                decoration: const BoxDecoration(color: successSurface, shape: BoxShape.circle),
+                                child: const Icon(Icons.point_of_sale_rounded, color: brandColor),
+                              ),
+                              const SizedBox(width: 11),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      box['name'] as String? ?? 'صندوق ${box['num']}',
+                                      style: const TextStyle(fontWeight: FontWeight.w800),
+                                    ),
+                                    const SizedBox(height: 3),
+                                    Text('رقم الصندوق ${box['num']}', style: const TextStyle(color: mutedInk, fontSize: 11)),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.end,
+                                children: [
+                                  const Text('الرصيد', style: TextStyle(color: mutedInk, fontSize: 10)),
+                                  Text(
+                                    formatMoneyValue(box['ras']),
+                                    style: TextStyle(
+                                      color: doubleValue(box['ras']) < 0 ? dangerColor : brandColor,
+                                      fontWeight: FontWeight.w900,
+                                      fontSize: 15,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
                         ),
                       )),
                 ],
@@ -3602,63 +3640,158 @@ class ProductResultCard extends StatelessWidget {
         childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
         children: [
           if (prices.isNotEmpty)
-            Container(
-              decoration: BoxDecoration(color: softSurface, borderRadius: BorderRadius.circular(8)),
-              child: Column(
-                children: [
-                  for (var i = 0; i < prices.length; i++) ...[
-                    ListTile(
-                      dense: true,
-                      leading: const Icon(Icons.sell_outlined, color: brandColor, size: 20),
-                      title: Text(prices[i].$1),
-                      trailing: Text(
-                        formatMoneyValue(prices[i].$2),
-                        style: const TextStyle(fontWeight: FontWeight.w800),
-                      ),
-                    ),
-                    if (i != prices.length - 1) const Divider(indent: 48),
-                  ],
-                ],
-              ),
+            ProductDetailsTable(
+              title: 'الأسعار المعتمدة',
+              icon: Icons.sell_outlined,
+              headers: const ['نوع السعر', 'القيمة'],
+              rows: prices.map((price) => [price.$1, formatMoneyValue(price.$2)]).toList(),
             ),
           if (prices.isNotEmpty) const SizedBox(height: 12),
-          const Align(
-            alignment: Alignment.centerRight,
-            child: Text('الرصيد حسب الفرع', style: TextStyle(fontWeight: FontWeight.w800)),
-          ),
-          const SizedBox(height: 4),
           if (result.stock.isEmpty)
-            const Align(
-              alignment: Alignment.centerRight,
-              child: Text('لا توجد كميات حسب الفروع', style: TextStyle(color: Colors.black54)),
-            )
+            const EmptyState(icon: Icons.inventory_2_outlined, text: 'لا توجد كميات حسب الفروع')
           else
-            ...result.stock.map(
-                  (stock) => ListTile(
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                    leading: Icon(
-                      stock.quantity < 0
-                          ? Icons.warning_rounded
-                          : stock.quantity > 0
-                              ? Icons.storefront_rounded
-                              : Icons.storefront_outlined,
-                      color: stock.quantity < 0
-                          ? Colors.red
-                          : stock.quantity > 0
-                              ? brandColor
-                              : Colors.black38,
-                    ),
-                    title: Text(stock.branchName),
-                    trailing: Text(
-                      formatMoneyValue(stock.quantity),
-                      style: TextStyle(
-                        color: stock.quantity < 0 ? Colors.red : inkColor,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                  ),
+            ProductStockTable(stock: result.stock),
+        ],
+      ),
+    );
+  }
+}
+
+class ProductDetailsTable extends StatelessWidget {
+  const ProductDetailsTable({
+    super.key,
+    required this.title,
+    required this.icon,
+    required this.headers,
+    required this.rows,
+  });
+
+  final String title;
+  final IconData icon;
+  final List<String> headers;
+  final List<List<String>> rows;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: panelSurface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: borderColor),
+      ),
+      child: Column(
+        children: [
+          Container(
+            color: brandColor.withValues(alpha: 0.08),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: Row(
+              children: [
+                Icon(icon, color: brandColor, size: 19),
+                const SizedBox(width: 7),
+                Expanded(child: Text(title, style: const TextStyle(fontWeight: FontWeight.w800))),
+              ],
+            ),
+          ),
+          ProductTableRow(values: headers, header: true),
+          for (var i = 0; i < rows.length; i++)
+            ProductTableRow(values: rows[i], shaded: i.isOdd),
+        ],
+      ),
+    );
+  }
+}
+
+class ProductStockTable extends StatelessWidget {
+  const ProductStockTable({super.key, required this.stock});
+
+  final List<StockResult> stock;
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = stock.map((item) {
+      final state = item.quantity < 0
+          ? 'رصيد سالب'
+          : item.quantity == 0
+              ? 'غير متوفر'
+              : 'متوفر';
+      return [item.branchName, formatMoneyValue(item.quantity), state];
+    }).toList();
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: panelSurface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: borderColor),
+      ),
+      child: Column(
+        children: [
+          Container(
+            color: successSurface.withValues(alpha: 0.55),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: const Row(
+              children: [
+                Icon(Icons.inventory_2_outlined, color: brandColor, size: 19),
+                SizedBox(width: 7),
+                Expanded(child: Text('الرصيد حسب الفرع', style: TextStyle(fontWeight: FontWeight.w800))),
+              ],
+            ),
+          ),
+          const ProductTableRow(values: ['الفرع', 'الرصيد', 'الحالة'], header: true),
+          for (var i = 0; i < rows.length; i++)
+            ProductTableRow(
+              values: rows[i],
+              shaded: i.isOdd,
+              danger: stock[i].quantity < 0,
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class ProductTableRow extends StatelessWidget {
+  const ProductTableRow({
+    super.key,
+    required this.values,
+    this.header = false,
+    this.shaded = false,
+    this.danger = false,
+  });
+
+  final List<String> values;
+  final bool header;
+  final bool shaded;
+  final bool danger;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: danger
+          ? dangerColor.withValues(alpha: 0.07)
+          : shaded
+              ? softSurface
+              : panelSurface,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+      child: Row(
+        children: [
+          for (var i = 0; i < values.length; i++) ...[
+            Expanded(
+              flex: i == 0 ? 3 : 2,
+              child: Text(
+                values[i],
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                textAlign: i == 0 ? TextAlign.start : TextAlign.center,
+                style: TextStyle(
+                  color: danger && i > 0 ? dangerColor : header ? mutedInk : inkColor,
+                  fontSize: header ? 11 : 12,
+                  fontWeight: header || i > 0 ? FontWeight.w800 : FontWeight.w600,
                 ),
+              ),
+            ),
+            if (i != values.length - 1) const SizedBox(width: 6),
+          ],
         ],
       ),
     );
@@ -5418,18 +5551,35 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     setState(() => sharingPdf = true);
     try {
       final bytes = await buildTransferPdf(data);
-      await Printing.sharePdf(
-        bytes: bytes,
-        filename: 'ansar-transfer-${widget.order['order_no'] ?? widget.order['id']}.pdf',
-      );
+      final rawOrderNumber = '${widget.order['order_no'] ?? widget.order['id']}';
+      final safeOrderNumber = rawOrderNumber.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '-');
+      final filename = 'ansar-transfer-$safeOrderNumber.pdf';
+      try {
+        await Share.shareXFiles(
+          [XFile.fromData(bytes, mimeType: 'application/pdf')],
+          subject: 'طلب مناقلة $rawOrderNumber',
+          text: 'تقرير طلب المناقلة رقم $rawOrderNumber',
+          fileNameOverrides: [filename],
+        );
+      } catch (_) {
+        await Printing.sharePdf(bytes: bytes, filename: filename);
+      }
     } catch (error) {
-      if (mounted) showSnack(context, cleanError(error));
+      if (mounted) showSnack(context, 'تعذر إنشاء ملف المناقلة. ${cleanError(error)}');
     } finally {
       if (mounted) setState(() => sharingPdf = false);
     }
   }
 
   Future<Uint8List> buildTransferPdf(TransferDetailsData data) async {
+    try {
+      return await buildRichTransferPdf(data);
+    } catch (_) {
+      return buildFallbackTransferPdf(data);
+    }
+  }
+
+  Future<Uint8List> buildRichTransferPdf(TransferDetailsData data) async {
     final fromBranch = intValue(widget.order['from_branch_num']);
     final toBranch = intValue(widget.order['to_branch_num']);
     final fontBytes = await rootBundle.load('assets/fonts/Amiri-Regular.ttf');
@@ -5590,6 +5740,144 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       ),
     );
     return document.save();
+  }
+
+  Future<Uint8List> buildFallbackTransferPdf(TransferDetailsData data) async {
+    final fontBytes = await rootBundle.load('assets/fonts/Amiri-Regular.ttf');
+    final font = pw.Font.ttf(fontBytes);
+    final document = pw.Document(theme: pw.ThemeData.withFont(base: font, bold: font));
+    final fromName = branchLabel(widget.branches, intValue(widget.order['from_branch_num']));
+    final toName = branchLabel(widget.branches, intValue(widget.order['to_branch_num']));
+    final itemChunks = chunkList(data.items, 11);
+    final eventChunks = chunkList(data.events, 13);
+
+    if (itemChunks.isEmpty) itemChunks.add(<Map<String, dynamic>>[]);
+    for (var pageIndex = 0; pageIndex < itemChunks.length; pageIndex++) {
+      final chunk = itemChunks[pageIndex];
+      document.addPage(
+        pw.Page(
+          pageFormat: PdfPageFormat.a4.landscape,
+          margin: const pw.EdgeInsets.all(24),
+          textDirection: pw.TextDirection.rtl,
+          build: (_) => pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+            children: [
+              pw.Text(
+                'طلب مناقلة من $fromName إلى $toName',
+                style: const pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold),
+              ),
+              pw.SizedBox(height: 5),
+              pw.Text(
+                'رقم الطلب: ${widget.order['order_no'] ?? '-'}   |   الحالة: ${statusLabel(widget.order['status'] as String? ?? 'submitted')}   |   صفحة ${pageIndex + 1}/${itemChunks.length}',
+                style: const pw.TextStyle(fontSize: 11),
+              ),
+              pw.SizedBox(height: 12),
+              pw.Table(
+                border: pw.TableBorder.all(color: PdfColors.grey400),
+                columnWidths: const {
+                  0: pw.FixedColumnWidth(28),
+                  1: pw.FlexColumnWidth(3.2),
+                  2: pw.FlexColumnWidth(1.1),
+                  3: pw.FlexColumnWidth(1.1),
+                  4: pw.FlexColumnWidth(1.1),
+                  5: pw.FlexColumnWidth(1.6),
+                  6: pw.FlexColumnWidth(2.1),
+                },
+                children: [
+                  pw.TableRow(
+                    decoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
+                    children: ['#', 'الكتاب', 'الرقم', 'المطلوب', 'المتوفر', 'الحالة', 'الملاحظة']
+                        .map((text) => fallbackPdfCell(text, header: true))
+                        .toList(),
+                  ),
+                  for (var i = 0; i < chunk.length; i++)
+                    pw.TableRow(
+                      decoration: i.isOdd ? const pw.BoxDecoration(color: PdfColor.fromInt(0xfff4f8f7)) : null,
+                      children: fallbackItemCells(chunk[i], pageIndex * 11 + i + 1)
+                          .map((text) => fallbackPdfCell(text))
+                          .toList(),
+                    ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    for (var pageIndex = 0; pageIndex < eventChunks.length; pageIndex++) {
+      final chunk = eventChunks[pageIndex];
+      document.addPage(
+        pw.Page(
+          pageFormat: PdfPageFormat.a4.landscape,
+          margin: const pw.EdgeInsets.all(24),
+          textDirection: pw.TextDirection.rtl,
+          build: (_) => pw.Column(
+            crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+            children: [
+              pw.Text('سجل معالجة المناقلة', style: const pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+              pw.SizedBox(height: 12),
+              pw.Table(
+                border: pw.TableBorder.all(color: PdfColors.grey400),
+                columnWidths: const {
+                  0: pw.FlexColumnWidth(4),
+                  1: pw.FlexColumnWidth(2),
+                  2: pw.FlexColumnWidth(1.6),
+                },
+                children: [
+                  pw.TableRow(
+                    decoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff344f49)),
+                    children: ['التحديث', 'نفذه', 'الوقت']
+                        .map((text) => fallbackPdfCell(text, header: true))
+                        .toList(),
+                  ),
+                  for (var i = 0; i < chunk.length; i++)
+                    pw.TableRow(
+                      decoration: i.isOdd ? const pw.BoxDecoration(color: PdfColor.fromInt(0xfff4f8f7)) : null,
+                      children: [
+                        eventLabel(chunk[i]),
+                        data.employees['${chunk[i]['employee_id']}']?.name ?? 'موظف',
+                        formatEventTime(chunk[i]['created_at']),
+                      ].map((text) => fallbackPdfCell(shortPdfText(text, 90))).toList(),
+                    ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    return document.save();
+  }
+
+  List<String> fallbackItemCells(Map<String, dynamic> item, int index) {
+    final product = item['product'] as Map<String, dynamic>?;
+    return [
+      '$index',
+      shortPdfText(product?['name']?.toString() ?? 'مادة ${item['mat_num']}', 70),
+      '${item['mat_num'] ?? '-'}',
+      formatMoneyValue(item['requested_quantity']),
+      item['approved_quantity'] == null ? '-' : formatMoneyValue(item['approved_quantity']),
+      itemStatusLabel(item['item_status'] as String? ?? 'requested'),
+      shortPdfText(item['note']?.toString() ?? '', 55),
+    ];
+  }
+
+  pw.Widget fallbackPdfCell(String text, {bool header = false}) {
+    return pw.Container(
+      height: 30,
+      padding: const pw.EdgeInsets.symmetric(horizontal: 5, vertical: 6),
+      alignment: pw.Alignment.centerRight,
+      child: pw.Text(
+        text,
+        maxLines: 2,
+        style: pw.TextStyle(
+          fontSize: 9,
+          fontWeight: header ? pw.FontWeight.bold : pw.FontWeight.normal,
+          color: header ? PdfColors.white : PdfColors.black,
+        ),
+      ),
+    );
   }
 
   @override
@@ -6181,12 +6469,47 @@ class ChatPage extends StatefulWidget {
 
 class _ChatPageState extends State<ChatPage> {
   late Future<List<Map<String, dynamic>>> future;
+  List<Map<String, dynamic>>? latestThreads;
+  RealtimeChannel? threadsChannel;
+  Timer? threadsTimer;
   bool threadBusy = false;
 
   @override
   void initState() {
     super.initState();
-    future = loadThreads();
+    future = loadAndRememberThreads();
+    threadsChannel = supabase.channel('chat-list-${widget.session.id}')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_chat_threads',
+        callback: (_) => refreshThreads(),
+      )
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_chat_messages',
+        callback: (_) => refreshThreads(),
+      ).subscribe();
+    threadsTimer = Timer.periodic(const Duration(seconds: 15), (_) => refreshThreads());
+  }
+
+  @override
+  void dispose() {
+    threadsTimer?.cancel();
+    if (threadsChannel != null) supabase.removeChannel(threadsChannel!);
+    super.dispose();
+  }
+
+  void refreshThreads() {
+    if (!mounted) return;
+    setState(() => future = loadAndRememberThreads());
+  }
+
+  Future<List<Map<String, dynamic>>> loadAndRememberThreads() async {
+    final loaded = await loadThreads();
+    latestThreads = loaded;
+    return loaded;
   }
 
   Future<List<Map<String, dynamic>>> loadThreads() async {
@@ -6196,17 +6519,86 @@ class _ChatPageState extends State<ChatPage> {
         .eq('is_active', true)
         .order('updated_at', ascending: false);
 
-    final participants = await supabase
+    final joinedParticipants = await supabase
         .from('ansar_chat_participants')
         .select('thread_id')
         .eq('employee_id', widget.session.id);
-    final joinedThreadIds = participants.map((row) => row['thread_id']).toSet();
+    final joinedThreadIds = joinedParticipants.map((row) => row['thread_id']).toSet();
 
-    return rows.cast<Map<String, dynamic>>().where((row) {
+    final visible = rows.cast<Map<String, dynamic>>().where((row) {
       final type = row['thread_type'] as String? ?? 'general';
       if (type == 'general') return true;
       if (widget.session.isAdmin) return true;
       return joinedThreadIds.contains(row['id']);
+    }).toList();
+    final threadIds = visible.map((row) => row['id']).whereType<String>().toList();
+    if (threadIds.isEmpty) return visible;
+
+    final participantRows = await supabase
+        .from('ansar_chat_participants')
+        .select('thread_id, employee_id')
+        .inFilter('thread_id', threadIds);
+    final messageRows = await supabase
+        .from('ansar_chat_messages')
+        .select('id, thread_id, sender_id, body, created_at')
+        .inFilter('thread_id', threadIds)
+        .isFilter('deleted_at', null)
+        .order('created_at', ascending: false)
+        .limit(250);
+    final allParticipants = participantRows.cast<Map<String, dynamic>>();
+    final messages = messageRows.cast<Map<String, dynamic>>();
+    final employeeIds = <String>{
+      ...allParticipants.map((row) => row['employee_id'] as String?).whereType<String>(),
+      ...messages.map((row) => row['sender_id'] as String?).whereType<String>(),
+    }.toList();
+    final employeeRows = employeeIds.isEmpty
+        ? <Map<String, dynamic>>[]
+        : await supabase
+            .from('ansar_employees')
+            .select('id, display_name, full_name, username, avatar_url')
+            .inFilter('id', employeeIds);
+    final employees = {
+      for (final row in employeeRows.cast<Map<String, dynamic>>())
+        row['id'] as String: EmployeeLite(
+          id: row['id'] as String,
+          name: (row['display_name'] ?? row['full_name'] ?? row['username'] ?? 'موظف').toString(),
+          username: row['username']?.toString() ?? '',
+          branchNum: 0,
+          role: 'employee',
+          isActive: true,
+          avatarUrl: row['avatar_url'] as String?,
+        ),
+    };
+    final latestByThread = <String, Map<String, dynamic>>{};
+    for (final row in messages) {
+      final threadId = row['thread_id']?.toString();
+      if (threadId != null) latestByThread.putIfAbsent(threadId, () => row);
+    }
+    final participantsByThread = <String, List<String>>{};
+    for (final row in allParticipants) {
+      final threadId = row['thread_id']?.toString();
+      final employeeId = row['employee_id']?.toString();
+      if (threadId != null && employeeId != null) {
+        participantsByThread.putIfAbsent(threadId, () => <String>[]).add(employeeId);
+      }
+    }
+    return visible.map((thread) {
+      final threadId = thread['id']?.toString() ?? '';
+      final latest = latestByThread[threadId];
+      final otherIds = participantsByThread[threadId]
+              ?.where((employeeId) => employeeId != widget.session.id)
+              .toList() ??
+          <String>[];
+      final otherId = otherIds.isEmpty ? null : otherIds.first;
+      final otherEmployee = otherId == null ? null : employees[otherId];
+      final sender = latest == null ? null : employees[latest['sender_id']];
+      return {
+        ...thread,
+        'last_message': latest,
+        'last_sender_name': sender?.name,
+        'thread_avatar_url': otherEmployee?.avatarUrl,
+        'thread_avatar_name': otherEmployee?.name,
+      };
     }).toList();
   }
 
@@ -6221,7 +6613,7 @@ class _ChatPageState extends State<ChatPage> {
     );
     if (mounted) {
       setState(() {
-        future = loadThreads();
+        future = loadAndRememberThreads();
       });
     }
   }
@@ -6259,7 +6651,7 @@ class _ChatPageState extends State<ChatPage> {
           );
       if (mounted) {
         setState(() {
-          future = loadThreads();
+          future = loadAndRememberThreads();
         });
       }
     } catch (error) {
@@ -6273,15 +6665,16 @@ class _ChatPageState extends State<ChatPage> {
   Widget build(BuildContext context) {
     return FutureBuilder<List<Map<String, dynamic>>>(
       future: future,
+      initialData: latestThreads,
       builder: (context, snapshot) {
-        if (snapshot.connectionState != ConnectionState.done) {
+        if (snapshot.connectionState != ConnectionState.done && !snapshot.hasData) {
           return const Center(child: CircularProgressIndicator());
         }
-        if (snapshot.hasError) {
+        if (snapshot.hasError && !snapshot.hasData) {
           return ErrorState(
             message: cleanError(snapshot.error),
             onRetry: () => setState(() {
-              future = loadThreads();
+              future = loadAndRememberThreads();
             }),
           );
         }
@@ -6306,29 +6699,45 @@ class _ChatPageState extends State<ChatPage> {
                         Builder(builder: (context) {
                           final thread = threads[i];
                           final general = thread['thread_type'] == 'general';
+                          final latest = thread['last_message'] as Map<String, dynamic>?;
+                          final senderName = thread['last_sender_name'] as String?;
+                          final avatarName = thread['thread_avatar_name'] as String? ?? thread['title'] as String? ?? 'محادثة';
+                          final avatarUrl = thread['thread_avatar_url'] as String?;
                           return ListTile(
                             contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-                            leading: Container(
-                              width: 44,
-                              height: 44,
-                              decoration: BoxDecoration(
-                                color: (general ? accentColor : brandColor).withValues(alpha: 0.1),
-                                shape: BoxShape.circle,
-                              ),
-                              child: Icon(
-                                general ? Icons.campaign_rounded : Icons.forum_outlined,
-                                color: general ? accentColor : brandColor,
-                              ),
-                            ),
+                            leading: general
+                                ? Container(
+                                    width: 44,
+                                    height: 44,
+                                    decoration: BoxDecoration(
+                                      color: accentColor.withValues(alpha: 0.1),
+                                      shape: BoxShape.circle,
+                                    ),
+                                    child: const Icon(Icons.campaign_rounded, color: accentColor),
+                                  )
+                                : EmployeeAvatar(name: avatarName, imageUrl: avatarUrl, radius: 22),
                             title: Text(
                               thread['title'] as String? ?? 'محادثة',
                               style: const TextStyle(fontWeight: FontWeight.w800),
                             ),
                             subtitle: Text(
-                              chatTypeLabel(thread['thread_type'] as String? ?? 'general'),
+                              latest == null
+                                  ? chatTypeLabel(thread['thread_type'] as String? ?? 'general')
+                                  : '${senderName == null ? '' : '$senderName: '}${latest['body'] ?? ''}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
                               style: const TextStyle(color: mutedInk),
                             ),
-                            trailing: const Icon(Icons.chevron_left_rounded, color: mutedInk),
+                            trailing: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                if (latest != null)
+                                  Text(chatListTime(latest['created_at']), style: const TextStyle(color: mutedInk, fontSize: 10)),
+                                const SizedBox(height: 3),
+                                const Icon(Icons.chevron_left_rounded, color: mutedInk, size: 20),
+                              ],
+                            ),
                             onTap: () => openThread(thread),
                           );
                         }),
@@ -6364,16 +6773,20 @@ class ChatThreadPage extends StatefulWidget {
 
 class _ChatThreadPageState extends State<ChatThreadPage> {
   final message = TextEditingController();
+  final scrollController = ScrollController();
   late Future<List<Map<String, dynamic>>> future;
   List<Map<String, dynamic>>? latestMessages;
   Timer? timer;
   RealtimeChannel? channel;
   bool sendingMessage = false;
+  bool showNewMessageHint = false;
+  String? lastRenderedMessageId;
 
   @override
   void initState() {
     super.initState();
     future = loadAndRememberMessages();
+    scrollController.addListener(handleMessageScroll);
     channel = supabase.channel('chat-thread-${widget.thread['id']}')
       ..onPostgresChanges(
         event: PostgresChangeEvent.all,
@@ -6384,29 +6797,69 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
           column: 'thread_id',
           value: widget.thread['id'],
         ),
-        callback: (_) {
-          if (mounted) {
-            setState(() {
-              future = loadAndRememberMessages();
-            });
-          }
-        },
+        callback: (_) => refreshMessages(),
       ).subscribe();
-    timer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) {
-        setState(() {
-          future = loadAndRememberMessages();
-        });
-      }
-    });
+    timer = Timer.periodic(const Duration(seconds: 5), (_) => refreshMessages());
   }
 
   @override
   void dispose() {
     timer?.cancel();
     if (channel != null) supabase.removeChannel(channel!);
+    scrollController
+      ..removeListener(handleMessageScroll)
+      ..dispose();
     message.dispose();
     super.dispose();
+  }
+
+  void refreshMessages() {
+    if (!mounted) return;
+    setState(() => future = loadAndRememberMessages());
+  }
+
+  bool get isNearMessageBottom {
+    if (!scrollController.hasClients) return true;
+    return scrollController.position.maxScrollExtent - scrollController.offset < 110;
+  }
+
+  void handleMessageScroll() {
+    if (showNewMessageHint && isNearMessageBottom && mounted) {
+      setState(() => showNewMessageHint = false);
+    }
+  }
+
+  void syncMessageScroll(List<Map<String, dynamic>> messages) {
+    if (messages.isEmpty) return;
+    final last = messages.last;
+    final messageId = '${last['id']}';
+    if (messageId == lastRenderedMessageId) return;
+    final initial = lastRenderedMessageId == null;
+    final shouldFollow = initial || isNearMessageBottom || last['sender_id'] == widget.session.id;
+    lastRenderedMessageId = messageId;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (shouldFollow) {
+        scrollToMessageBottom(jump: initial);
+      } else if (!showNewMessageHint) {
+        setState(() => showNewMessageHint = true);
+      }
+    });
+  }
+
+  void scrollToMessageBottom({bool jump = false}) {
+    if (!scrollController.hasClients) return;
+    final target = scrollController.position.maxScrollExtent;
+    if (jump) {
+      scrollController.jumpTo(target);
+    } else {
+      scrollController.animateTo(
+        target,
+        duration: const Duration(milliseconds: 280),
+        curve: Curves.easeOutCubic,
+      );
+    }
+    if (showNewMessageHint && mounted) setState(() => showNewMessageHint = false);
   }
 
   Future<List<Map<String, dynamic>>> loadAndRememberMessages() async {
@@ -6429,13 +6882,22 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
         ? <Map<String, dynamic>>[]
         : await supabase
             .from('ansar_employees')
-            .select('id, display_name, full_name, username')
+            .select('id, display_name, full_name, username, avatar_url')
             .inFilter('id', senderIds);
-    final names = {
+    final employees = {
       for (final row in employeeRows.cast<Map<String, dynamic>>())
-        row['id'] as String: (row['display_name'] ?? row['full_name'] ?? row['username'] ?? 'موظف') as String,
+        row['id'] as String: row,
     };
-    return messages.map((row) => {...row, 'sender_name': names[row['sender_id']] ?? 'موظف'}).toList();
+    return messages.map((row) {
+      final employee = employees[row['sender_id']];
+      return {
+        ...row,
+        'sender_name': employee == null
+            ? 'موظف'
+            : (employee['display_name'] ?? employee['full_name'] ?? employee['username'] ?? 'موظف').toString(),
+        'sender_avatar_url': employee?['avatar_url'],
+      };
+    }).toList();
   }
 
   Future<void> sendMessage() async {
@@ -6454,9 +6916,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
           .from('ansar_chat_threads')
           .update({'updated_at': DateTime.now().toUtc().toIso8601String()}).eq('id', widget.thread['id']);
       if (mounted) {
-        setState(() {
-          future = loadAndRememberMessages();
-        });
+        refreshMessages();
       }
       unawaited(enqueueChatNotification(
         thread: widget.thread,
@@ -6473,28 +6933,35 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
 
   Future<void> deleteMessage(Map<String, dynamic> row) async {
     if (row['sender_id'] != widget.session.id && !widget.session.isAdmin) return;
-    await supabase
-        .from('ansar_chat_messages')
-        .update({'deleted_at': DateTime.now().toUtc().toIso8601String()}).eq('id', row['id']);
-    setState(() {
-      future = loadAndRememberMessages();
-    });
+    try {
+      await supabase
+          .from('ansar_chat_messages')
+          .update({'deleted_at': DateTime.now().toUtc().toIso8601String()}).eq('id', row['id']);
+      refreshMessages();
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(widget.thread['title'] as String? ?? 'محادثة'),
-        actions: [
-          IconButton(
-            tooltip: 'تحديث',
-            onPressed: () => setState(() {
-              future = loadAndRememberMessages();
-            }),
-            icon: const Icon(Icons.refresh_rounded),
-          ),
-        ],
+        title: Row(
+          children: [
+            CircleAvatar(
+              radius: 17,
+              backgroundColor: accentColor.withValues(alpha: 0.12),
+              child: Icon(
+                widget.thread['thread_type'] == 'general' ? Icons.campaign_rounded : Icons.forum_rounded,
+                color: widget.thread['thread_type'] == 'general' ? accentColor : brandColor,
+                size: 19,
+              ),
+            ),
+            const SizedBox(width: 9),
+            Expanded(child: Text(widget.thread['title'] as String? ?? 'محادثة')),
+          ],
+        ),
       ),
       body: Column(
         children: [
@@ -6518,57 +6985,62 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                 if (messages.isEmpty) {
                   return const EmptyState(icon: Icons.mark_chat_unread_rounded, text: 'ابدأ أول رسالة');
                 }
-                return ListView.builder(
-                  padding: const EdgeInsets.fromLTRB(12, 14, 12, 18),
-                  itemCount: messages.length,
-                  itemBuilder: (context, i) {
-                    final row = messages[i];
-                    final mine = row['sender_id'] == widget.session.id;
-                    final senderName = mine ? 'أنت' : row['sender_name'] as String? ?? 'موظف';
-                    return Align(
-                      alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
-                      child: Padding(
-                        padding: const EdgeInsets.only(bottom: 8),
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 320),
-                          child: Material(
-                            color: mine ? successSurface : panelSurface,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(8),
-                              side: BorderSide(color: mine ? successSurface : borderColor),
-                            ),
-                            child: InkWell(
-                              borderRadius: BorderRadius.circular(8),
-                              onLongPress: () => deleteMessage(row),
-                              child: Padding(
-                                padding: const EdgeInsets.fromLTRB(13, 10, 13, 9),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      senderName,
-                                      style: TextStyle(
-                                        fontSize: 11,
-                                        fontWeight: FontWeight.w800,
-                                        color: mine ? brandColor : infoColor,
+                syncMessageScroll(messages);
+                return Stack(
+                  children: [
+                    ListView.builder(
+                      controller: scrollController,
+                      padding: const EdgeInsets.fromLTRB(10, 14, 10, 22),
+                      itemCount: messages.length,
+                      itemBuilder: (context, i) {
+                        final row = messages[i];
+                        final mine = row['sender_id'] == widget.session.id;
+                        final currentDate = parseChatDate(row['created_at']);
+                        final previousDate = i == 0 ? null : parseChatDate(messages[i - 1]['created_at']);
+                        return ChatMessageBubble(
+                          row: row,
+                          mine: mine,
+                          senderName: mine ? 'أنت' : row['sender_name'] as String? ?? 'موظف',
+                          avatarUrl: mine ? widget.session.avatarUrl : row['sender_avatar_url'] as String?,
+                          showDate: previousDate == null || !sameCalendarDay(previousDate, currentDate),
+                          onLongPress: () => deleteMessage(row),
+                        );
+                      },
+                    ),
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 10,
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 180),
+                        child: showNewMessageHint
+                            ? Center(
+                                key: const ValueKey('new-message-hint'),
+                                child: Material(
+                                  color: brandColor,
+                                  elevation: 3,
+                                  borderRadius: BorderRadius.circular(22),
+                                  child: InkWell(
+                                    borderRadius: BorderRadius.circular(22),
+                                    onTap: () => scrollToMessageBottom(),
+                                    child: const Padding(
+                                      padding: EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(Icons.keyboard_arrow_down_rounded, color: Colors.white, size: 20),
+                                          SizedBox(width: 5),
+                                          Text('رسالة جديدة', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w800)),
+                                        ],
                                       ),
                                     ),
-                                    const SizedBox(height: 4),
-                                    Text(row['body'] as String? ?? ''),
-                                    const SizedBox(height: 6),
-                                    Text(
-                                      formatDateTime(DateTime.parse(row['created_at'] as String).toLocal()),
-                                      style: const TextStyle(fontSize: 10, color: mutedInk),
-                                    ),
-                                  ],
+                                  ),
                                 ),
-                              ),
-                            ),
-                          ),
-                        ),
+                              )
+                            : const SizedBox.shrink(key: ValueKey('no-new-message-hint')),
                       ),
-                    );
-                  },
+                    ),
+                  ],
                 );
               },
             ),
@@ -6591,6 +7063,11 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                         hintText: 'اكتب رسالة',
                         prefixIcon: Icon(Icons.chat_bubble_outline_rounded),
                       ),
+                      onTap: () {
+                        unawaited(Future<void>.delayed(const Duration(milliseconds: 260), () {
+                          if (mounted) scrollToMessageBottom();
+                        }));
+                      },
                       onSubmitted: (_) => sendMessage(),
                     ),
                   ),
@@ -6607,6 +7084,110 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class ChatMessageBubble extends StatelessWidget {
+  const ChatMessageBubble({
+    super.key,
+    required this.row,
+    required this.mine,
+    required this.senderName,
+    required this.avatarUrl,
+    required this.showDate,
+    required this.onLongPress,
+  });
+
+  final Map<String, dynamic> row;
+  final bool mine;
+  final String senderName;
+  final String? avatarUrl;
+  final bool showDate;
+  final VoidCallback onLongPress;
+
+  @override
+  Widget build(BuildContext context) {
+    final created = parseChatDate(row['created_at']);
+    return Column(
+      children: [
+        if (showDate) ...[
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 5),
+              decoration: BoxDecoration(
+                color: softSurface,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: borderColor),
+              ),
+              child: Text(chatDayLabel(created), style: const TextStyle(color: mutedInk, fontSize: 10, fontWeight: FontWeight.w700)),
+            ),
+          ),
+        ],
+        Align(
+          alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
+          child: Directionality(
+            textDirection: mine ? TextDirection.rtl : TextDirection.ltr,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                EmployeeAvatar(name: senderName, imageUrl: avatarUrl, radius: 16),
+                const SizedBox(width: 7),
+                Flexible(
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.72),
+                    child: Directionality(
+                      textDirection: TextDirection.rtl,
+                      child: Material(
+                        color: mine ? successSurface : panelSurface,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.only(
+                            topLeft: const Radius.circular(8),
+                            topRight: const Radius.circular(8),
+                            bottomLeft: Radius.circular(mine ? 8 : 2),
+                            bottomRight: Radius.circular(mine ? 2 : 8),
+                          ),
+                          side: BorderSide(color: mine ? brandColor.withValues(alpha: 0.12) : borderColor),
+                        ),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(8),
+                          onLongPress: onLongPress,
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(12, 9, 12, 7),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  senderName,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w800,
+                                    color: mine ? brandColor : infoColor,
+                                  ),
+                                ),
+                                const SizedBox(height: 3),
+                                Text(row['body']?.toString() ?? '', style: const TextStyle(height: 1.45)),
+                                const SizedBox(height: 5),
+                                Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: Text(formatTime(created), style: const TextStyle(fontSize: 9, color: mutedInk)),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 7),
+      ],
     );
   }
 }
@@ -7871,6 +8452,33 @@ String formatDateTime(DateTime value) {
   return '${shortDate(value)} ${formatTime(value)}';
 }
 
+DateTime parseChatDate(Object? value) {
+  return DateTime.tryParse(value?.toString() ?? '')?.toLocal() ?? DateTime.now();
+}
+
+bool sameCalendarDay(DateTime first, DateTime second) {
+  return first.year == second.year && first.month == second.month && first.day == second.day;
+}
+
+String chatDayLabel(DateTime value) {
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final day = DateTime(value.year, value.month, value.day);
+  final difference = today.difference(day).inDays;
+  if (difference == 0) return 'اليوم';
+  if (difference == 1) return 'أمس';
+  return '${value.day.toString().padLeft(2, '0')}/${value.month.toString().padLeft(2, '0')}/${value.year}';
+}
+
+String chatListTime(Object? value) {
+  final date = parseChatDate(value);
+  final now = DateTime.now();
+  if (sameCalendarDay(date, now)) return formatTime(date);
+  final yesterday = now.subtract(const Duration(days: 1));
+  if (sameCalendarDay(date, yesterday)) return 'أمس';
+  return '${date.day.toString().padLeft(2, '0')}/${date.month.toString().padLeft(2, '0')}';
+}
+
 String reportDayLabel(String value) {
   final parsed = DateTime.tryParse(value);
   if (parsed == null) return value;
@@ -7902,8 +8510,20 @@ String formatMoneyValue(Object? value) {
   if (value == null) return '-';
   final number = (value as num?)?.toDouble() ?? double.tryParse('$value');
   if (number == null) return '$value';
-  if ((number - number.roundToDouble()).abs() < 0.001) return number.toStringAsFixed(0);
-  return number.toStringAsFixed(2);
+  return NumberFormat('#,##0.##', 'en_US').format(number);
+}
+
+List<List<T>> chunkList<T>(List<T> values, int size) {
+  if (values.isEmpty) return <List<T>>[];
+  return [
+    for (var index = 0; index < values.length; index += size)
+      values.sublist(index, (index + size).clamp(0, values.length).toInt()),
+  ];
+}
+
+String shortPdfText(String value, int maxLength) {
+  if (value.length <= maxLength) return value;
+  return '${value.substring(0, maxLength - 1)}…';
 }
 
 int? nullableIntValue(Object? value) {
