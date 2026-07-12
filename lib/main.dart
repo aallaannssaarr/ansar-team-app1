@@ -8036,9 +8036,15 @@ class ChatModeButton extends StatelessWidget {
             children: [
               Icon(icon, color: selected ? Colors.white : brandColor, size: 20),
               const SizedBox(width: 7),
-              Text(
-                label,
-                style: TextStyle(color: selected ? Colors.white : inkColor, fontWeight: FontWeight.w800),
+              Flexible(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    style: TextStyle(color: selected ? Colors.white : inkColor, fontWeight: FontWeight.w800),
+                  ),
+                ),
               ),
             ],
           ),
