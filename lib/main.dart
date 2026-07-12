@@ -24,7 +24,7 @@ Future<void> main() async {
   runApp(const AnsarApp());
 }
 
-final supabase = Supabase.instance.client;
+SupabaseClient get supabase => Supabase.instance.client;
 List<Map<String, dynamic>>? cachedProducts;
 Map<int, String>? cachedBarcodes;
 Future<List<Map<String, dynamic>>>? cachedProductsFuture;
