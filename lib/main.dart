@@ -19,6 +19,27 @@ import 'ansar_config.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  ErrorWidget.builder = (details) => const Material(
+        color: softSurface,
+        child: Directionality(
+          textDirection: TextDirection.rtl,
+          child: Center(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.error_outline_rounded, color: dangerColor, size: 42),
+                  SizedBox(height: 12),
+                  Text('تعذر عرض هذا الجزء', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 17)),
+                  SizedBox(height: 5),
+                  Text('أغلق الصفحة وافتحها مرة أخرى', style: TextStyle(color: mutedInk)),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
   await Firebase.initializeApp();
   await Supabase.initialize(
     url: AnsarConfig.supabaseUrl,
@@ -296,13 +317,13 @@ class EmployeeLite {
 
   factory EmployeeLite.fromRow(Map<String, dynamic> row) {
     return EmployeeLite(
-      id: row['id'] as String,
-      name: (row['display_name'] ?? row['full_name'] ?? row['username'] ?? '') as String,
-      username: row['username'] as String? ?? '',
-      branchNum: (row['branch_num'] as num?)?.toInt() ?? 0,
-      role: row['role'] as String? ?? 'employee',
+      id: row['id']?.toString() ?? '',
+      name: (row['display_name'] ?? row['full_name'] ?? row['username'] ?? '').toString(),
+      username: row['username']?.toString() ?? '',
+      branchNum: nullableIntValue(row['branch_num']) ?? 0,
+      role: row['role']?.toString() ?? 'employee',
       isActive: row['is_active'] != false,
-      avatarUrl: row['avatar_url'] as String?,
+      avatarUrl: row['avatar_url']?.toString(),
     );
   }
 
@@ -2805,7 +2826,7 @@ class _QueriesPageState extends State<QueriesPage> {
     final branches = await loadLegacyBranchesMap();
     final matNums = productRows
         .take(40)
-        .map((product) => (product['mat_num'] as num?)?.toInt())
+        .map((product) => nullableIntValue(product['mat_num']))
         .whereType<int>()
         .toList();
     final stockRows = matNums.isEmpty
@@ -2816,19 +2837,19 @@ class _QueriesPageState extends State<QueriesPage> {
             .inFilter('mat_num', matNums);
     final stockByMat = <int, List<StockResult>>{};
     for (final row in stockRows.cast<Map<String, dynamic>>()) {
-      final matNum = (row['mat_num'] as num?)?.toInt();
-      final branchNum = (row['sto_num'] as num?)?.toInt();
+      final matNum = nullableIntValue(row['mat_num']);
+      final branchNum = nullableIntValue(row['sto_num']);
       if (matNum == null || branchNum == null) continue;
       stockByMat.putIfAbsent(matNum, () => <StockResult>[]).add(
             StockResult(
               branchName: branchLabel(branches, branchNum),
-              quantity: (row['quantity'] as num?)?.toDouble() ?? 0,
+              quantity: doubleValue(row['quantity']),
             ),
           );
     }
     final results = <ProductResult>[];
     for (final product in productRows.take(40)) {
-      final matNum = (product['mat_num'] as num?)?.toInt();
+      final matNum = nullableIntValue(product['mat_num']);
       if (matNum == null) continue;
       final stock = stockByMat[matNum] ?? <StockResult>[];
       stock.sort((a, b) => b.quantity.compareTo(a.quantity));
@@ -2865,7 +2886,7 @@ class _QueriesPageState extends State<QueriesPage> {
     final accounts = await loadAccountsCached();
     final normalized = normalizeSearch(value);
     final results = accounts.where((account) {
-      final accountNum = (account['num'] as num?)?.toInt();
+      final accountNum = nullableIntValue(account['num']);
       final name = normalizeSearch(account['name'] as String? ?? '');
       if (numeric != null) return accountNum?.toString().contains(value) == true;
       return name.contains(normalized);
@@ -2896,10 +2917,11 @@ class _QueriesPageState extends State<QueriesPage> {
     }
     final rows = await query.order('date', ascending: false).order('bnum', ascending: false).limit(100);
     final accounts = {
-      for (final account in await loadAccountsCached()) (account['num'] as num?)?.toInt(): account['name'] as String? ?? ''
+      for (final account in await loadAccountsCached())
+        nullableIntValue(account['num']): account['name']?.toString() ?? ''
     };
     return rows.cast<Map<String, dynamic>>().map((bill) {
-      final accNum = (bill['accnum'] as num?)?.toInt();
+      final accNum = nullableIntValue(bill['accnum']);
       return {
         ...bill,
         'account_name': accNum == null ? 'زبون عابر' : accounts[accNum] ?? 'حساب $accNum',
@@ -2927,6 +2949,19 @@ class _QueriesPageState extends State<QueriesPage> {
         ),
       ),
     );
+  }
+
+  Future<void> pickQueryDate(TextEditingController controller) async {
+    final initial = DateTime.tryParse(controller.text) ?? DateTime.now();
+    final selected = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(2020),
+      lastDate: DateTime.now().add(const Duration(days: 1)),
+    );
+    if (selected == null || !mounted) return;
+    controller.text = formatDateKey(selected);
+    setState(() => future = runDailySales());
   }
 
   @override
@@ -2983,7 +3018,7 @@ class _QueriesPageState extends State<QueriesPage> {
               ),
             ),
           ),
-        if (queryMode == 1 || queryMode == 3) ...[
+        if (queryMode == 3) ...[
           const SizedBox(height: 10),
           Card(
             child: Padding(
@@ -2993,20 +3028,32 @@ class _QueriesPageState extends State<QueriesPage> {
                 children: [
                   const Text('الفترة الزمنية', style: TextStyle(fontWeight: FontWeight.w800)),
                   const SizedBox(height: 10),
-                  TextField(
-                    controller: startDate,
-                    decoration: const InputDecoration(
-                      labelText: 'من تاريخ',
-                      prefixIcon: Icon(Icons.calendar_today_outlined),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: endDate,
-                    decoration: const InputDecoration(
-                      labelText: 'إلى تاريخ',
-                      prefixIcon: Icon(Icons.event_available_outlined),
-                    ),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: startDate,
+                          readOnly: true,
+                          onTap: () => pickQueryDate(startDate),
+                          decoration: const InputDecoration(
+                            labelText: 'من تاريخ',
+                            prefixIcon: Icon(Icons.calendar_today_outlined),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: TextField(
+                          controller: endDate,
+                          readOnly: true,
+                          onTap: () => pickQueryDate(endDate),
+                          decoration: const InputDecoration(
+                            labelText: 'إلى تاريخ',
+                            prefixIcon: Icon(Icons.event_available_outlined),
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -3033,8 +3080,8 @@ class _QueriesPageState extends State<QueriesPage> {
           const SizedBox(height: 10),
           FilledButton.icon(
             onPressed: submitSearch,
-            icon: const Icon(Icons.refresh_rounded),
-            label: const Text('تحديث'),
+            icon: Icon(queryMode == 3 ? Icons.receipt_long_rounded : Icons.refresh_rounded),
+            label: Text(queryMode == 3 ? 'عرض الفواتير' : 'تحديث'),
           ),
         ],
         const SizedBox(height: 12),
@@ -3106,7 +3153,7 @@ class _QueriesPageState extends State<QueriesPage> {
               }
               if (snapshot.hasError) return ErrorState(message: cleanError(snapshot.error), onRetry: submitSearch);
               final rows = snapshot.data!;
-              final total = rows.fold<double>(0, (sum, row) => sum + ((row['ras'] as num?)?.toDouble() ?? 0));
+              final total = rows.fold<double>(0, (sum, row) => sum + doubleValue(row['ras']));
               return Column(
                 children: [
                   StatTile(title: 'إجمالي الصناديق', value: formatMoneyValue(total), icon: Icons.payments_rounded, color: brandColor),
@@ -3175,24 +3222,191 @@ class _QueriesPageState extends State<QueriesPage> {
               if (results.isEmpty) {
                 return const EmptyState(icon: Icons.search_off_rounded, text: 'لا توجد مبيعات اليوم');
               }
+              final totalSales = results.fold<double>(0, (sum, bill) => sum + doubleValue(bill['totalvalue']));
+              final cashCount = results.where((bill) => paymentLabelFromRemark(bill['remark']).isCash).length;
               return Column(
-                children: results
-                    .map(
-                      (bill) => Card(
-                        child: ListTile(
-                          leading: const CircleAvatar(child: Icon(Icons.receipt_long_rounded)),
-                          title: Text('فاتورة ${bill['bnum']} · ${salesBookName(bill['book'])}'),
-                          subtitle: Text('${bill['account_name']} · ${paymentLabelFromRemark(bill['remark']).text} · ${bill['date']}'),
-                          trailing: Text(formatMoneyValue(bill['totalvalue'])),
-                          onTap: () => openSalesDetails(bill),
-                        ),
-                      ),
-                    )
-                    .toList(),
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SalesDailySummary(
+                    invoices: results.length,
+                    total: totalSales,
+                    cashInvoices: cashCount,
+                    creditInvoices: results.length - cashCount,
+                  ),
+                  const SizedBox(height: 14),
+                  SectionHeader(title: 'الفواتير (${results.length})'),
+                  Container(
+                    clipBehavior: Clip.antiAlias,
+                    decoration: BoxDecoration(
+                      color: panelSurface,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: borderColor),
+                    ),
+                    child: Column(
+                      children: [
+                        for (var i = 0; i < results.length; i++) ...[
+                          SalesBillTile(
+                            bill: results[i],
+                            onTap: () => openSalesDetails(results[i]),
+                          ),
+                          if (i != results.length - 1) const Divider(indent: 68, height: 1),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
               );
             },
           ),
       ],
+    );
+  }
+}
+
+class SalesDailySummary extends StatelessWidget {
+  const SalesDailySummary({
+    super.key,
+    required this.invoices,
+    required this.total,
+    required this.cashInvoices,
+    required this.creditInvoices,
+  });
+
+  final int invoices;
+  final double total;
+  final int cashInvoices;
+  final int creditInvoices;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(15),
+      decoration: BoxDecoration(
+        color: brandDark,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text('إجمالي المبيعات', style: TextStyle(color: Colors.white70, fontSize: 12)),
+          const SizedBox(height: 3),
+          Text(
+            formatMoneyValue(total),
+            style: const TextStyle(color: Colors.white, fontSize: 27, fontWeight: FontWeight.w900),
+          ),
+          const SizedBox(height: 13),
+          Row(
+            children: [
+              Expanded(child: SalesSummaryMetric(icon: Icons.receipt_long_rounded, label: 'فاتورة', value: '$invoices')),
+              const SizedBox(width: 7),
+              Expanded(child: SalesSummaryMetric(icon: Icons.payments_rounded, label: 'نقدي', value: '$cashInvoices')),
+              const SizedBox(width: 7),
+              Expanded(child: SalesSummaryMetric(icon: Icons.schedule_rounded, label: 'آجل', value: '$creditInvoices')),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class SalesSummaryMetric extends StatelessWidget {
+  const SalesSummaryMetric({super.key, required this.icon, required this.label, required this.value});
+
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 9),
+      decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.09), borderRadius: BorderRadius.circular(7)),
+      child: Row(
+        children: [
+          Icon(icon, color: Colors.white70, size: 17),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label, style: const TextStyle(color: Colors.white70, fontSize: 9)),
+                Text(value, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 13)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class SalesBillTile extends StatelessWidget {
+  const SalesBillTile({super.key, required this.bill, required this.onTap});
+
+  final Map<String, dynamic> bill;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final payment = paymentLabelFromRemark(bill['remark']);
+    return Material(
+      color: panelSurface,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          child: Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: (payment.isCash ? successColor : accentColor).withValues(alpha: 0.11),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  payment.isCash ? Icons.payments_rounded : Icons.schedule_rounded,
+                  color: payment.isCash ? successColor : accentColor,
+                ),
+              ),
+              const SizedBox(width: 11),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'فاتورة ${bill['bnum']} · ${salesBookName(bill['book'])}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontWeight: FontWeight.w900),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      '${bill['account_name'] ?? 'زبون عابر'} · ${payment.text} · ${bill['date'] ?? ''}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: mutedInk, fontSize: 11),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(
+                    formatMoneyValue(bill['totalvalue']),
+                    style: const TextStyle(color: brandColor, fontWeight: FontWeight.w900, fontSize: 14),
+                  ),
+                  const SizedBox(height: 4),
+                  const Icon(Icons.chevron_left_rounded, color: mutedInk, size: 18),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -3304,7 +3518,8 @@ class _AccountStatementPageState extends State<AccountStatementPage> {
         .order('num', ascending: true)
         .order('item', ascending: true);
     final accounts = {
-      for (final account in await loadAccountsCached()) (account['num'] as num?)?.toInt(): account['name'] as String? ?? ''
+      for (final account in await loadAccountsCached())
+        nullableIntValue(account['num']): account['name']?.toString() ?? ''
     };
     return rows.cast<Map<String, dynamic>>().map((entry) {
       final otherNum = (entry['acc_num2'] as num?)?.toInt();
@@ -3410,18 +3625,19 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
         .eq('kind', 0)
         .order('item', ascending: true);
     final items = rows.cast<Map<String, dynamic>>();
-    final matNums = items.map((row) => (row['matnum'] as num?)?.toInt()).whereType<int>().toSet().toList();
+    final matNums = items.map((row) => nullableIntValue(row['matnum'])).whereType<int>().toSet().toList();
     final products = matNums.isEmpty
         ? <Map<String, dynamic>>[]
         : await supabase.from('products').select('mat_num, name').inFilter('mat_num', matNums);
-    final names = {
-      for (final product in products.cast<Map<String, dynamic>>())
-        (product['mat_num'] as num).toInt(): product['name'] as String? ?? ''
-    };
+    final names = <int, String>{};
+    for (final product in products.cast<Map<String, dynamic>>()) {
+      final matNum = nullableIntValue(product['mat_num']);
+      if (matNum != null) names[matNum] = product['name']?.toString() ?? '';
+    }
     final branches = await loadLegacyBranchesMap();
     return SalesBillDetailsData(
       branches: branches,
-      items: items.map((item) => {...item, 'product_name': names[(item['matnum'] as num?)?.toInt()]}).toList(),
+      items: items.map((item) => {...item, 'product_name': names[nullableIntValue(item['matnum'])]}).toList(),
     );
   }
 
@@ -3447,11 +3663,10 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
           final items = data.items;
           final payment = paymentLabelFromRemark(widget.bill['remark']);
           final stoNum = parseStoNum(widget.bill['remark']);
-          final total = (widget.bill['totalvalue'] as num?)?.toDouble() ?? 0;
+          final total = doubleValue(widget.bill['totalvalue']);
           final gross = items.fold<double>(
             0,
-            (sum, item) =>
-                sum + (((item['quantity'] as num?)?.toDouble() ?? 0) * ((item['price'] as num?)?.toDouble() ?? 0)),
+            (sum, item) => sum + (doubleValue(item['quantity']) * doubleValue(item['price'])),
           );
           final discount = gross > total && gross > 0 ? gross - total : 0.0;
           return ListView(
@@ -3505,60 +3720,9 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
               if (items.isEmpty)
                 const EmptyState(icon: Icons.inventory_2_outlined, text: 'لا توجد بنود')
               else
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(12),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        const Text('بنود الفاتورة', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                        const Divider(height: 18),
-                        ...items.asMap().entries.map((entry) {
-                          final index = entry.key;
-                          final item = entry.value;
-                          final itemSto = parseStoNum(item['remarki']);
-                          return Padding(
-                            padding: EdgeInsets.only(bottom: index == items.length - 1 ? 0 : 12),
-                            child: DecoratedBox(
-                              decoration: BoxDecoration(
-                                color: softSurface,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(color: Colors.black12),
-                              ),
-                              child: Padding(
-                                padding: const EdgeInsets.all(10),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      item['product_name'] as String? ?? 'مادة ${item['matnum']}',
-                                      style: const TextStyle(fontWeight: FontWeight.bold),
-                                    ),
-                                    const SizedBox(height: 8),
-                                    Wrap(
-                                      spacing: 8,
-                                      runSpacing: 8,
-                                      children: [
-                                        InfoChip(icon: Icons.numbers_rounded, label: 'الكمية ${formatMoneyValue(item['quantity'])}'),
-                                        InfoChip(icon: Icons.sell_rounded, label: 'السعر ${formatMoneyValue(item['price'])}'),
-                                        InfoChip(icon: Icons.percent_rounded, label: 'الحسم ${discountDisplay(item)}'),
-                                        InfoChip(icon: Icons.summarize_rounded, label: 'القيمة ${formatMoneyValue(item['value'])}'),
-                                        InfoChip(
-                                          icon: Icons.warehouse_rounded,
-                                          label: itemSto == null ? 'مستودع غير محدد' : branchLabel(data.branches, itemSto),
-                                        ),
-                                      ],
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          );
-                        }),
-                      ],
-                    ),
-                  ),
-                ),
+                InvoiceItemsTable(items: items, branches: data.branches),
+              const SizedBox(height: 12),
+              InvoiceTotals(gross: gross, discount: discount, total: total),
             ],
           );
         },
@@ -3572,6 +3736,240 @@ class SalesBillDetailsData {
 
   final List<Map<String, dynamic>> items;
   final Map<int, BranchOption> branches;
+}
+
+class InvoiceItemsTable extends StatelessWidget {
+  const InvoiceItemsTable({super.key, required this.items, required this.branches});
+
+  final List<Map<String, dynamic>> items;
+  final Map<int, BranchOption> branches;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: panelSurface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: borderColor),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Padding(
+            padding: EdgeInsets.fromLTRB(12, 12, 12, 9),
+            child: Row(
+              children: [
+                Icon(Icons.receipt_long_rounded, color: brandColor, size: 20),
+                SizedBox(width: 7),
+                Text('بنود الفاتورة', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 15)),
+              ],
+            ),
+          ),
+          const InvoiceTableRow(
+            header: true,
+            name: 'المادة',
+            quantity: 'الكمية',
+            price: 'السعر',
+            discount: 'الحسم',
+            total: 'القيمة',
+          ),
+          for (var i = 0; i < items.length; i++)
+            InvoiceTableRow.fromItem(
+              item: items[i],
+              index: i + 1,
+              branchName: () {
+                final stoNum = parseStoNum(items[i]['remarki']);
+                return stoNum == null ? null : branchLabel(branches, stoNum);
+              }(),
+              shaded: i.isOdd,
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class InvoiceTableRow extends StatelessWidget {
+  const InvoiceTableRow({
+    super.key,
+    required this.name,
+    required this.quantity,
+    required this.price,
+    required this.discount,
+    required this.total,
+    this.subtitle,
+    this.header = false,
+    this.shaded = false,
+  });
+
+  factory InvoiceTableRow.fromItem({
+    required Map<String, dynamic> item,
+    required int index,
+    required String? branchName,
+    required bool shaded,
+  }) {
+    final productName = item['product_name']?.toString();
+    return InvoiceTableRow(
+      name: '$index. ${productName == null || productName.isEmpty ? 'مادة ${item['matnum']}' : productName}',
+      subtitle: branchName == null ? 'رقم ${item['matnum'] ?? '-'}' : 'رقم ${item['matnum'] ?? '-'} · $branchName',
+      quantity: formatMoneyValue(item['quantity']),
+      price: formatMoneyValue(item['price']),
+      discount: discountDisplay(item),
+      total: formatMoneyValue(item['value']),
+      shaded: shaded,
+    );
+  }
+
+  final String name;
+  final String? subtitle;
+  final String quantity;
+  final String price;
+  final String discount;
+  final String total;
+  final bool header;
+  final bool shaded;
+
+  @override
+  Widget build(BuildContext context) {
+    final textColor = header ? Colors.white : inkColor;
+    return Container(
+      constraints: BoxConstraints(minHeight: header ? 38 : 56),
+      color: header
+          ? brandDark
+          : shaded
+              ? softSurface
+              : panelSurface,
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Expanded(
+            flex: 5,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  name,
+                  maxLines: header ? 1 : 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: textColor, fontSize: header ? 10 : 11, fontWeight: FontWeight.w800),
+                ),
+                if (!header && subtitle != null)
+                  Text(
+                    subtitle!,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: mutedInk, fontSize: 8),
+                  ),
+              ],
+            ),
+          ),
+          InvoiceValueCell(value: quantity, flex: 2, header: header),
+          InvoiceValueCell(value: price, flex: 3, header: header),
+          InvoiceValueCell(value: discount, flex: 2, header: header),
+          InvoiceValueCell(value: total, flex: 3, header: header, strong: !header),
+        ],
+      ),
+    );
+  }
+}
+
+class InvoiceValueCell extends StatelessWidget {
+  const InvoiceValueCell({
+    super.key,
+    required this.value,
+    required this.flex,
+    required this.header,
+    this.strong = false,
+  });
+
+  final String value;
+  final int flex;
+  final bool header;
+  final bool strong;
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      flex: flex,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2),
+        child: Text(
+          value,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: header ? Colors.white : strong ? brandColor : inkColor,
+            fontSize: header ? 9 : 10,
+            fontWeight: header || strong ? FontWeight.w900 : FontWeight.w600,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class InvoiceTotals extends StatelessWidget {
+  const InvoiceTotals({super.key, required this.gross, required this.discount, required this.total});
+
+  final double gross;
+  final double discount;
+  final double total;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        width: 245,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: panelSurface,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: borderColor),
+        ),
+        child: Column(
+          children: [
+            InvoiceTotalLine(label: 'الإجمالي قبل الحسم', value: formatMoneyValue(gross)),
+            if (discount > 0) ...[
+              const SizedBox(height: 6),
+              InvoiceTotalLine(label: 'الحسم', value: '- ${formatMoneyValue(discount)}', color: dangerColor),
+            ],
+            const Divider(height: 18),
+            InvoiceTotalLine(label: 'صافي الفاتورة', value: formatMoneyValue(total), color: brandColor, strong: true),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class InvoiceTotalLine extends StatelessWidget {
+  const InvoiceTotalLine({
+    super.key,
+    required this.label,
+    required this.value,
+    this.color = inkColor,
+    this.strong = false,
+  });
+
+  final String label;
+  final String value;
+  final Color color;
+  final bool strong;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(child: Text(label, style: TextStyle(color: strong ? inkColor : mutedInk, fontSize: 11))),
+        Text(value, style: TextStyle(color: color, fontWeight: FontWeight.w900, fontSize: strong ? 15 : 12)),
+      ],
+    );
+  }
 }
 
 class StockResult {
@@ -3630,7 +4028,7 @@ class ProductResultCard extends StatelessWidget {
           child: const Icon(Icons.menu_book_outlined, color: brandColor),
         ),
         title: Text(
-          product['name'] as String? ?? 'بدون اسم',
+          product['name']?.toString() ?? 'بدون اسم',
           style: const TextStyle(fontWeight: FontWeight.w800),
         ),
         subtitle: Text(
@@ -3800,7 +4198,7 @@ class ProductTableRow extends StatelessWidget {
 
 bool hasVisiblePrice(Object? value) {
   if (value == null) return false;
-  final number = (value as num?)?.toDouble() ?? double.tryParse('$value');
+  final number = value is num ? value.toDouble() : double.tryParse(value.toString());
   return number != null && number.abs() > 0.001;
 }
 
@@ -6171,7 +6569,7 @@ class _TransferDialogState extends State<TransferDialog> {
   void selectProduct(Map<String, dynamic> product) {
     setState(() {
       selectedProduct = product;
-      bookSearch.text = product['name'] as String? ?? '${product['mat_num']}';
+      bookSearch.text = product['name']?.toString() ?? '${product['mat_num']}';
       suggestions = [];
     });
   }
@@ -6184,7 +6582,7 @@ class _TransferDialogState extends State<TransferDialog> {
     setState(() {
       items.add(TransferItemDraft(
         matNum: parsedMat,
-        name: product['name'] as String? ?? 'كتاب $parsedMat',
+        name: product['name']?.toString() ?? 'كتاب $parsedMat',
         quantity: parsedQuantity,
         note: itemNote.text.trim(),
       ));
@@ -6299,7 +6697,7 @@ class _TransferDialogState extends State<TransferDialog> {
                           return ListTile(
                             dense: true,
                             leading: const Icon(Icons.menu_book_rounded),
-                            title: Text(product['name'] as String? ?? 'بدون اسم'),
+                            title: Text(product['name']?.toString() ?? 'بدون اسم'),
                             subtitle: Text('رقم ${product['mat_num']} · كمية ${product['quantity'] ?? '-'}'),
                             onTap: () => selectProduct(product),
                           );
@@ -6468,6 +6866,7 @@ class ChatPage extends StatefulWidget {
 }
 
 class _ChatPageState extends State<ChatPage> {
+  final threadSearch = TextEditingController();
   late Future<List<Map<String, dynamic>>> future;
   List<Map<String, dynamic>>? latestThreads;
   RealtimeChannel? threadsChannel;
@@ -6498,6 +6897,7 @@ class _ChatPageState extends State<ChatPage> {
   void dispose() {
     threadsTimer?.cancel();
     if (threadsChannel != null) supabase.removeChannel(threadsChannel!);
+    threadSearch.dispose();
     super.dispose();
   }
 
@@ -6528,7 +6928,6 @@ class _ChatPageState extends State<ChatPage> {
     final visible = rows.cast<Map<String, dynamic>>().where((row) {
       final type = row['thread_type'] as String? ?? 'general';
       if (type == 'general') return true;
-      if (widget.session.isAdmin) return true;
       return joinedThreadIds.contains(row['id']);
     }).toList();
     final threadIds = visible.map((row) => row['id']).whereType<String>().toList();
@@ -6598,6 +6997,7 @@ class _ChatPageState extends State<ChatPage> {
         'last_sender_name': sender?.name,
         'thread_avatar_url': otherEmployee?.avatarUrl,
         'thread_avatar_name': otherEmployee?.name,
+        'participant_ids': participantsByThread[threadId] ?? <String>[],
       };
     }).toList();
   }
@@ -6619,13 +7019,34 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<void> createThread() async {
-    final employees = await loadEmployeesForScope(widget.session, includeInactive: false);
+    final employees = await loadAllActiveEmployees();
+    final branches = await loadAppBranchesMap();
     if (!mounted) return;
-    final result = await showDialog<CreateThreadResult>(
-      context: context,
-      builder: (_) => CreateThreadDialog(session: widget.session, employees: employees),
+    final result = await Navigator.of(context).push<CreateThreadResult>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: CreateThreadPage(
+            session: widget.session,
+            employees: employees,
+            branches: branches,
+          ),
+        ),
+      ),
     );
     if (result == null) return;
+
+    if (!result.isGroup && result.employeeIds.length == 1) {
+      final wanted = {widget.session.id, result.employeeIds.single};
+      for (final thread in latestThreads ?? <Map<String, dynamic>>[]) {
+        final participants = (thread['participant_ids'] as List?)?.map((value) => '$value').toSet() ?? <String>{};
+        if (thread['thread_type'] == 'direct' && participants.length == wanted.length && participants.containsAll(wanted)) {
+          await openThread(thread);
+          return;
+        }
+      }
+    }
 
     setState(() => threadBusy = true);
     try {
@@ -6633,26 +7054,39 @@ class _ChatPageState extends State<ChatPage> {
           .from('ansar_chat_threads')
           .insert({
             'title': result.title,
-            'thread_type': result.employeeIds.length == 1 ? 'direct' : 'group',
+            'thread_type': result.isGroup ? 'group' : 'direct',
             'created_by': widget.session.id,
           })
           .select('id')
           .single();
       final threadId = inserted['id'];
       final participantIds = {widget.session.id, ...result.employeeIds};
-      await supabase.from('ansar_chat_participants').insert(
-            participantIds
-                .map((employeeId) => {
-                      'thread_id': threadId,
-                      'employee_id': employeeId,
-                      'role': employeeId == widget.session.id ? 'admin' : 'member',
-                    })
-                .toList(),
-          );
+      try {
+        await supabase.from('ansar_chat_participants').insert(
+              participantIds
+                  .map((employeeId) => {
+                        'thread_id': threadId,
+                        'employee_id': employeeId,
+                        'role': employeeId == widget.session.id ? 'admin' : 'member',
+                      })
+                  .toList(),
+            );
+      } catch (_) {
+        try {
+          await supabase.from('ansar_chat_threads').delete().eq('id', threadId);
+        } catch (_) {
+          // Keep the original participant error if cleanup is unavailable.
+        }
+        rethrow;
+      }
       if (mounted) {
-        setState(() {
-          future = loadAndRememberThreads();
-        });
+        final createdThread = <String, dynamic>{
+          ...inserted,
+          'title': result.title,
+          'thread_type': result.isGroup ? 'group' : 'direct',
+          'participant_ids': participantIds.toList(),
+        };
+        await openThread(createdThread);
       }
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
@@ -6679,84 +7113,155 @@ class _ChatPageState extends State<ChatPage> {
           );
         }
         final threads = snapshot.data!;
+        final query = normalizeSearch(threadSearch.text);
+        final visibleThreads = query.isEmpty
+            ? threads
+            : threads.where((thread) {
+                final title = normalizeSearch(thread['title']?.toString() ?? '');
+                final latest = thread['last_message'] as Map<String, dynamic>?;
+                final body = normalizeSearch(latest?['body']?.toString() ?? '');
+                return title.contains(query) || body.contains(query);
+              }).toList();
         return Scaffold(
           body: ListView(
             key: const PageStorageKey('chat-list'),
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
             children: [
-              const PageHeading(
+              PageHeading(
                 title: 'الدردشة',
                 subtitle: 'المحادثات العامة والخاصة ومجموعات العمل',
                 icon: Icons.chat_bubble_outline_rounded,
+                action: IconButton.filled(
+                  tooltip: 'محادثة جديدة',
+                  onPressed: threadBusy ? null : createThread,
+                  icon: const Icon(Icons.add_comment_rounded),
+                ),
               ),
-              if (threads.isEmpty)
+              TextField(
+                controller: threadSearch,
+                onChanged: (_) => setState(() {}),
+                decoration: InputDecoration(
+                  hintText: 'ابحث في المحادثات',
+                  prefixIcon: const Icon(Icons.search_rounded),
+                  suffixIcon: threadSearch.text.isEmpty
+                      ? null
+                      : IconButton(
+                          tooltip: 'مسح البحث',
+                          onPressed: () {
+                            threadSearch.clear();
+                            setState(() {});
+                          },
+                          icon: const Icon(Icons.close_rounded),
+                        ),
+                ),
+              ),
+              const SizedBox(height: 14),
+              SectionHeader(title: 'المحادثات (${visibleThreads.length})'),
+              if (visibleThreads.isEmpty)
                 const EmptyState(icon: Icons.chat_bubble_outline_rounded, text: 'لا توجد محادثات بعد')
               else
-                Card(
+                Container(
+                  clipBehavior: Clip.antiAlias,
+                  decoration: BoxDecoration(
+                    color: panelSurface,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: borderColor),
+                  ),
                   child: Column(
                     children: [
-                      for (var i = 0; i < threads.length; i++) ...[
-                        Builder(builder: (context) {
-                          final thread = threads[i];
-                          final general = thread['thread_type'] == 'general';
-                          final latest = thread['last_message'] as Map<String, dynamic>?;
-                          final senderName = thread['last_sender_name'] as String?;
-                          final avatarName = thread['thread_avatar_name'] as String? ?? thread['title'] as String? ?? 'محادثة';
-                          final avatarUrl = thread['thread_avatar_url'] as String?;
-                          return ListTile(
-                            contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-                            leading: general
-                                ? Container(
-                                    width: 44,
-                                    height: 44,
-                                    decoration: BoxDecoration(
-                                      color: accentColor.withValues(alpha: 0.1),
-                                      shape: BoxShape.circle,
-                                    ),
-                                    child: const Icon(Icons.campaign_rounded, color: accentColor),
-                                  )
-                                : EmployeeAvatar(name: avatarName, imageUrl: avatarUrl, radius: 22),
-                            title: Text(
-                              thread['title'] as String? ?? 'محادثة',
-                              style: const TextStyle(fontWeight: FontWeight.w800),
-                            ),
-                            subtitle: Text(
-                              latest == null
-                                  ? chatTypeLabel(thread['thread_type'] as String? ?? 'general')
-                                  : '${senderName == null ? '' : '$senderName: '}${latest['body'] ?? ''}',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(color: mutedInk),
-                            ),
-                            trailing: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              crossAxisAlignment: CrossAxisAlignment.end,
-                              children: [
-                                if (latest != null)
-                                  Text(chatListTime(latest['created_at']), style: const TextStyle(color: mutedInk, fontSize: 10)),
-                                const SizedBox(height: 3),
-                                const Icon(Icons.chevron_left_rounded, color: mutedInk, size: 20),
-                              ],
-                            ),
-                            onTap: () => openThread(thread),
-                          );
-                        }),
-                        if (i != threads.length - 1) const Divider(indent: 72),
+                      for (var i = 0; i < visibleThreads.length; i++) ...[
+                        ChatThreadTile(
+                          thread: visibleThreads[i],
+                          onTap: () => openThread(visibleThreads[i]),
+                        ),
+                        if (i != visibleThreads.length - 1) const Divider(indent: 78, height: 1),
                       ],
                     ],
                   ),
                 ),
             ],
           ),
-          floatingActionButton: FloatingActionButton.extended(
-            onPressed: threadBusy ? null : createThread,
-            icon: threadBusy
-                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                : const Icon(Icons.add_comment_rounded),
-            label: Text(threadBusy ? 'جاري الحفظ' : 'محادثة جديدة'),
-          ),
         );
       },
+    );
+  }
+}
+
+class ChatThreadTile extends StatelessWidget {
+  const ChatThreadTile({super.key, required this.thread, required this.onTap});
+
+  final Map<String, dynamic> thread;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final type = thread['thread_type']?.toString() ?? 'general';
+    final general = type == 'general';
+    final group = type == 'group';
+    final latest = thread['last_message'] as Map<String, dynamic>?;
+    final senderName = thread['last_sender_name']?.toString();
+    final avatarName = thread['thread_avatar_name']?.toString() ?? thread['title']?.toString() ?? 'محادثة';
+    final avatarUrl = thread['thread_avatar_url'] as String?;
+    return Material(
+      color: panelSurface,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 12),
+          child: Row(
+            children: [
+              if (general || group)
+                Container(
+                  width: 50,
+                  height: 50,
+                  decoration: BoxDecoration(
+                    color: (general ? accentColor : infoColor).withValues(alpha: 0.11),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    general ? Icons.campaign_rounded : Icons.groups_rounded,
+                    color: general ? accentColor : infoColor,
+                  ),
+                )
+              else
+                EmployeeAvatar(name: avatarName, imageUrl: avatarUrl, radius: 25),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            thread['title']?.toString() ?? 'محادثة',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 15),
+                          ),
+                        ),
+                        if (latest != null)
+                          Text(chatListTime(latest['created_at']), style: const TextStyle(color: mutedInk, fontSize: 10)),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      latest == null
+                          ? chatTypeLabel(type)
+                          : '${senderName == null ? '' : '$senderName: '}${latest['body'] ?? ''}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: mutedInk, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 5),
+              const Icon(Icons.chevron_left_rounded, color: mutedInk, size: 20),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -6903,21 +7408,38 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   Future<void> sendMessage() async {
     final body = message.text.trim();
     if (body.isEmpty || sendingMessage) return;
-    message.clear();
     setState(() => sendingMessage = true);
     try {
-      await supabase.from('ansar_chat_messages').insert({
-        'thread_id': widget.thread['id'],
-        'sender_id': widget.session.id,
-        'body': body,
-        'message_type': 'text',
-      });
-      await supabase
-          .from('ansar_chat_threads')
-          .update({'updated_at': DateTime.now().toUtc().toIso8601String()}).eq('id', widget.thread['id']);
+      final inserted = await supabase
+          .from('ansar_chat_messages')
+          .insert({
+            'thread_id': widget.thread['id'],
+            'sender_id': widget.session.id,
+            'body': body,
+            'message_type': 'text',
+          })
+          .select()
+          .single();
       if (mounted) {
-        refreshMessages();
+        message.clear();
+        final updated = <Map<String, dynamic>>[
+          for (final row in latestMessages ?? <Map<String, dynamic>>[])
+            if ('${row['id']}' != '${inserted['id']}') row,
+          {
+            ...inserted,
+            'sender_name': widget.session.name,
+            'sender_avatar_url': widget.session.avatarUrl,
+          },
+        ];
+        setState(() {
+          latestMessages = updated;
+          future = Future.value(updated);
+        });
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) scrollToMessageBottom();
+        });
       }
+      unawaited(touchThread());
       unawaited(enqueueChatNotification(
         thread: widget.thread,
         sender: widget.session,
@@ -6925,9 +7447,18 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       ));
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
-      message.text = body;
     } finally {
       if (mounted) setState(() => sendingMessage = false);
+    }
+  }
+
+  Future<void> touchThread() async {
+    try {
+      await supabase
+          .from('ansar_chat_threads')
+          .update({'updated_at': DateTime.now().toUtc().toIso8601String()}).eq('id', widget.thread['id']);
+    } catch (_) {
+      // The message is already saved; a timestamp failure must not restore the composer text.
     }
   }
 
@@ -6946,6 +7477,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xffeef3f1),
       appBar: AppBar(
         title: Row(
           children: [
@@ -6959,7 +7491,25 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
               ),
             ),
             const SizedBox(width: 9),
-            Expanded(child: Text(widget.thread['title'] as String? ?? 'محادثة')),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    widget.thread['title'] as String? ?? 'محادثة',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900),
+                  ),
+                  Text(
+                    widget.thread['thread_type'] == 'group'
+                        ? '${(widget.thread['participant_ids'] as List?)?.length ?? 0} أعضاء'
+                        : chatTypeLabel(widget.thread['thread_type'] as String? ?? 'general'),
+                    style: const TextStyle(color: mutedInk, fontSize: 10, fontWeight: FontWeight.w500),
+                  ),
+                ],
+              ),
+            ),
           ],
         ),
       ),
@@ -6997,12 +7547,18 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                         final mine = row['sender_id'] == widget.session.id;
                         final currentDate = parseChatDate(row['created_at']);
                         final previousDate = i == 0 ? null : parseChatDate(messages[i - 1]['created_at']);
+                        final previousSender = i == 0 ? null : messages[i - 1]['sender_id'];
+                        final startsSenderGroup = i == 0 ||
+                            previousSender != row['sender_id'] ||
+                            previousDate == null ||
+                            !sameCalendarDay(previousDate, currentDate);
                         return ChatMessageBubble(
                           row: row,
                           mine: mine,
                           senderName: mine ? 'أنت' : row['sender_name'] as String? ?? 'موظف',
                           avatarUrl: mine ? widget.session.avatarUrl : row['sender_avatar_url'] as String?,
                           showDate: previousDate == null || !sameCalendarDay(previousDate, currentDate),
+                          showIdentity: !mine && startsSenderGroup,
                           onLongPress: () => deleteMessage(row),
                         );
                       },
@@ -7047,36 +7603,56 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
           ),
           SafeArea(
             child: Container(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
               decoration: const BoxDecoration(
                 color: panelSurface,
-                border: Border(top: BorderSide(color: borderColor)),
+                boxShadow: [BoxShadow(color: Color(0x16000000), blurRadius: 10, offset: Offset(0, -2))],
               ),
               child: Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
                   Expanded(
-                    child: TextField(
-                      controller: message,
-                      minLines: 1,
-                      maxLines: 4,
-                      decoration: const InputDecoration(
-                        hintText: 'اكتب رسالة',
-                        prefixIcon: Icon(Icons.chat_bubble_outline_rounded),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: softSurface,
+                        borderRadius: BorderRadius.circular(24),
+                        border: Border.all(color: borderColor),
                       ),
-                      onTap: () {
-                        unawaited(Future<void>.delayed(const Duration(milliseconds: 260), () {
-                          if (mounted) scrollToMessageBottom();
-                        }));
-                      },
-                      onSubmitted: (_) => sendMessage(),
+                      child: TextField(
+                        controller: message,
+                        minLines: 1,
+                        maxLines: 5,
+                        textInputAction: TextInputAction.newline,
+                        decoration: const InputDecoration(
+                          hintText: 'اكتب رسالة',
+                          border: InputBorder.none,
+                          enabledBorder: InputBorder.none,
+                          focusedBorder: InputBorder.none,
+                          contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+                        ),
+                        onTap: () {
+                          unawaited(Future<void>.delayed(const Duration(milliseconds: 260), () {
+                            if (mounted) scrollToMessageBottom();
+                          }));
+                        },
+                      ),
                     ),
                   ),
                   const SizedBox(width: 8),
-                  IconButton.filled(
-                    onPressed: sendingMessage ? null : sendMessage,
-                    icon: sendingMessage
-                        ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                        : const Icon(Icons.send_rounded),
+                  SizedBox(
+                    width: 48,
+                    height: 48,
+                    child: IconButton.filled(
+                      tooltip: 'إرسال',
+                      onPressed: sendingMessage ? null : sendMessage,
+                      icon: sendingMessage
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                            )
+                          : const Icon(Icons.send_rounded),
+                    ),
                   ),
                 ],
               ),
@@ -7096,6 +7672,7 @@ class ChatMessageBubble extends StatelessWidget {
     required this.senderName,
     required this.avatarUrl,
     required this.showDate,
+    required this.showIdentity,
     required this.onLongPress,
   });
 
@@ -7104,6 +7681,7 @@ class ChatMessageBubble extends StatelessWidget {
   final String senderName;
   final String? avatarUrl;
   final bool showDate;
+  final bool showIdentity;
   final VoidCallback onLongPress;
 
   @override
@@ -7128,20 +7706,28 @@ class ChatMessageBubble extends StatelessWidget {
         Align(
           alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
           child: Directionality(
-            textDirection: mine ? TextDirection.rtl : TextDirection.ltr,
+            textDirection: TextDirection.ltr,
             child: Row(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.end,
+              mainAxisAlignment: mine ? MainAxisAlignment.end : MainAxisAlignment.start,
               children: [
-                EmployeeAvatar(name: senderName, imageUrl: avatarUrl, radius: 16),
-                const SizedBox(width: 7),
+                if (!mine) ...[
+                  SizedBox(
+                    width: 32,
+                    child: showIdentity
+                        ? EmployeeAvatar(name: senderName, imageUrl: avatarUrl, radius: 16)
+                        : const SizedBox(width: 32),
+                  ),
+                  const SizedBox(width: 7),
+                ],
                 Flexible(
                   child: ConstrainedBox(
                     constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.72),
                     child: Directionality(
                       textDirection: TextDirection.rtl,
                       child: Material(
-                        color: mine ? successSurface : panelSurface,
+                        color: mine ? const Color(0xffdff3e8) : panelSurface,
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.only(
                             topLeft: const Radius.circular(8),
@@ -7159,20 +7745,31 @@ class ChatMessageBubble extends StatelessWidget {
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Text(
-                                  senderName,
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w800,
-                                    color: mine ? brandColor : infoColor,
+                                if (showIdentity) ...[
+                                  Text(
+                                    senderName,
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w900,
+                                      color: infoColor,
+                                    ),
                                   ),
-                                ),
-                                const SizedBox(height: 3),
+                                  const SizedBox(height: 3),
+                                ],
                                 Text(row['body']?.toString() ?? '', style: const TextStyle(height: 1.45)),
                                 const SizedBox(height: 5),
                                 Align(
                                   alignment: Alignment.centerLeft,
-                                  child: Text(formatTime(created), style: const TextStyle(fontSize: 9, color: mutedInk)),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(formatTime(created), style: const TextStyle(fontSize: 9, color: mutedInk)),
+                                      if (mine) ...[
+                                        const SizedBox(width: 3),
+                                        const Icon(Icons.done_rounded, size: 13, color: brandColor),
+                                      ],
+                                    ],
+                                  ),
                                 ),
                               ],
                             ),
@@ -7193,77 +7790,260 @@ class ChatMessageBubble extends StatelessWidget {
 }
 
 class CreateThreadResult {
-  CreateThreadResult({required this.title, required this.employeeIds});
+  CreateThreadResult({required this.title, required this.employeeIds, required this.isGroup});
 
   final String title;
   final List<String> employeeIds;
+  final bool isGroup;
 }
 
-class CreateThreadDialog extends StatefulWidget {
-  const CreateThreadDialog({super.key, required this.session, required this.employees});
+class CreateThreadPage extends StatefulWidget {
+  const CreateThreadPage({
+    super.key,
+    required this.session,
+    required this.employees,
+    required this.branches,
+  });
 
   final EmployeeSession session;
   final List<EmployeeLite> employees;
+  final Map<int, BranchOption> branches;
 
   @override
-  State<CreateThreadDialog> createState() => _CreateThreadDialogState();
+  State<CreateThreadPage> createState() => _CreateThreadPageState();
 }
 
-class _CreateThreadDialogState extends State<CreateThreadDialog> {
+class _CreateThreadPageState extends State<CreateThreadPage> {
   final title = TextEditingController();
+  final search = TextEditingController();
   final selected = <String>{};
+  bool isGroup = false;
+
+  @override
+  void dispose() {
+    title.dispose();
+    search.dispose();
+    super.dispose();
+  }
+
+  void selectEmployee(EmployeeLite employee) {
+    setState(() {
+      if (isGroup) {
+        if (!selected.add(employee.id)) selected.remove(employee.id);
+      } else {
+        selected
+          ..clear()
+          ..add(employee.id);
+      }
+    });
+  }
+
+  void changeMode(bool group) {
+    setState(() {
+      isGroup = group;
+      selected.clear();
+      title.clear();
+    });
+  }
+
+  void submit() {
+    final selectedEmployees = widget.employees.where((employee) => selected.contains(employee.id)).toList();
+    if (selectedEmployees.isEmpty || (isGroup && selectedEmployees.length < 2)) return;
+    final fallbackGroupTitle = selectedEmployees.take(3).map((employee) => employee.name).join('، ');
+    Navigator.pop(
+      context,
+      CreateThreadResult(
+        title: isGroup
+            ? (title.text.trim().isEmpty ? fallbackGroupTitle : title.text.trim())
+            : selectedEmployees.single.name,
+        employeeIds: selectedEmployees.map((employee) => employee.id).toList(),
+        isGroup: isGroup,
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    final employees = widget.employees.where((employee) => employee.id != widget.session.id).toList();
-    return AlertDialog(
-      title: const Text('محادثة جديدة'),
-      content: SizedBox(
-        width: 420,
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(controller: title, decoration: const InputDecoration(labelText: 'عنوان المحادثة')),
-              const SizedBox(height: 8),
-              ...employees.map(
-                (employee) => CheckboxListTile(
-                  value: selected.contains(employee.id),
-                  title: Text(employee.name),
-                  subtitle: Text(roleLabel(employee.role)),
-                  onChanged: (checked) {
-                    setState(() {
-                      if (checked == true) {
-                        selected.add(employee.id);
-                      } else {
-                        selected.remove(employee.id);
-                      }
-                    });
-                  },
+    final query = normalizeSearch(search.text);
+    final employees = widget.employees.where((employee) {
+      if (employee.id == widget.session.id) return false;
+      if (query.isEmpty) return true;
+      return normalizeSearch(employee.name).contains(query) || normalizeSearch(employee.username).contains(query);
+    }).toList();
+    final canCreate = isGroup ? selected.length >= 2 : selected.length == 1;
+    return Scaffold(
+      appBar: AppBar(title: Text(isGroup ? 'مجموعة جديدة' : 'محادثة جديدة')),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: ChatModeButton(
+                        selected: !isGroup,
+                        icon: Icons.person_rounded,
+                        label: 'محادثة خاصة',
+                        onTap: () => changeMode(false),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: ChatModeButton(
+                        selected: isGroup,
+                        icon: Icons.groups_rounded,
+                        label: 'مجموعة',
+                        onTap: () => changeMode(true),
+                      ),
+                    ),
+                  ],
                 ),
+                if (isGroup) ...[
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: title,
+                    decoration: const InputDecoration(
+                      labelText: 'اسم المجموعة',
+                      hintText: 'مثال: فريق فرع حمص',
+                      prefixIcon: Icon(Icons.edit_rounded),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 10),
+                TextField(
+                  controller: search,
+                  onChanged: (_) => setState(() {}),
+                  decoration: InputDecoration(
+                    hintText: 'ابحث عن موظف بالاسم أو اسم المستخدم',
+                    prefixIcon: const Icon(Icons.search_rounded),
+                    suffixIcon: search.text.isEmpty
+                        ? null
+                        : IconButton(
+                            tooltip: 'مسح البحث',
+                            onPressed: () {
+                              search.clear();
+                              setState(() {});
+                            },
+                            icon: const Icon(Icons.close_rounded),
+                          ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Text(
+                      isGroup ? 'اختر شخصين على الأقل' : 'اختر موظفاً واحداً',
+                      style: const TextStyle(color: mutedInk, fontSize: 12),
+                    ),
+                    const Spacer(),
+                    if (selected.isNotEmpty)
+                      StatusPill(label: '${selected.length} محدد', color: brandColor),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: employees.isEmpty
+                ? const EmptyState(icon: Icons.person_search_rounded, text: 'لا يوجد موظفون مطابقون')
+                : ListView.separated(
+                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
+                    itemCount: employees.length,
+                    separatorBuilder: (_, __) => const Divider(indent: 64, height: 1),
+                    itemBuilder: (context, index) {
+                      final employee = employees[index];
+                      final active = selected.contains(employee.id);
+                      return ListTile(
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        onTap: () => selectEmployee(employee),
+                        leading: EmployeeAvatar(name: employee.name, imageUrl: employee.avatarUrl, radius: 23),
+                        title: Text(employee.name, style: const TextStyle(fontWeight: FontWeight.w800)),
+                        subtitle: Text(
+                          '@${employee.username} · ${branchLabel(widget.branches, employee.branchNum)}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: mutedInk, fontSize: 11),
+                        ),
+                        trailing: AnimatedContainer(
+                          duration: const Duration(milliseconds: 150),
+                          width: 27,
+                          height: 27,
+                          decoration: BoxDecoration(
+                            color: active ? brandColor : Colors.transparent,
+                            shape: BoxShape.circle,
+                            border: Border.all(color: active ? brandColor : borderColor, width: 2),
+                          ),
+                          child: active ? const Icon(Icons.check_rounded, color: Colors.white, size: 17) : null,
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Container(
+          padding: const EdgeInsets.all(14),
+          decoration: const BoxDecoration(
+            color: panelSurface,
+            border: Border(top: BorderSide(color: borderColor)),
+          ),
+          child: FilledButton.icon(
+            onPressed: canCreate ? submit : null,
+            icon: Icon(isGroup ? Icons.group_add_rounded : Icons.chat_rounded),
+            label: Text(isGroup ? 'إنشاء المجموعة' : 'بدء المحادثة'),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ChatModeButton extends StatelessWidget {
+  const ChatModeButton({
+    super.key,
+    required this.selected,
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  final bool selected;
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: selected ? brandColor : panelSurface,
+      borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          height: 48,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: selected ? brandColor : borderColor),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, color: selected ? Colors.white : brandColor, size: 20),
+              const SizedBox(width: 7),
+              Text(
+                label,
+                style: TextStyle(color: selected ? Colors.white : inkColor, fontWeight: FontWeight.w800),
               ),
             ],
           ),
         ),
       ),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
-        FilledButton(
-          onPressed: selected.isEmpty
-              ? null
-              : () {
-                  final fallbackTitle = selected.length == 1 ? 'محادثة خاصة' : 'مجموعة جديدة';
-                  Navigator.pop(
-                    context,
-                    CreateThreadResult(
-                      title: title.text.trim().isEmpty ? fallbackTitle : title.text.trim(),
-                      employeeIds: selected.toList(),
-                    ),
-                  );
-                },
-          child: const Text('إنشاء'),
-        ),
-      ],
     );
   }
 }
@@ -7829,11 +8609,11 @@ Future<Map<int, BranchOption>> loadLegacyBranchesMap() async {
   final branches = <int, BranchOption>{};
   final legacyRows = await supabase.from('branches').select('sto_num, name').order('sto_num');
   for (final row in legacyRows) {
-    final number = (row['sto_num'] as num?)?.toInt();
+    final number = nullableIntValue(row['sto_num']);
     if (number == null) continue;
     branches[number] = BranchOption(
       number: number,
-      name: (row['name'] ?? 'فرع $number') as String,
+      name: (row['name'] ?? 'فرع $number').toString(),
     );
   }
   return branches;
@@ -7847,14 +8627,14 @@ Future<Map<int, BranchOption>> loadAppBranchesMap() async {
         .select('sto_num, name, is_active')
         .order('sto_num');
     for (final row in appRows) {
-      final number = (row['sto_num'] as num?)?.toInt();
+      final number = nullableIntValue(row['sto_num']);
       if (number == null) continue;
       if (row['is_active'] == false) {
         branches.remove(number);
       } else {
         branches[number] = BranchOption(
           number: number,
-          name: (row['name'] ?? 'فرع $number') as String,
+          name: (row['name'] ?? 'فرع $number').toString(),
         );
       }
     }
@@ -7899,7 +8679,7 @@ Future<List<Map<String, dynamic>>> _loadAllProducts() async {
   }
   final unique = <int, Map<String, dynamic>>{};
   for (final product in all) {
-    final matNum = (product['mat_num'] as num?)?.toInt();
+    final matNum = nullableIntValue(product['mat_num']);
     if (matNum != null) unique.putIfAbsent(matNum, () => product);
   }
   return unique.values.toList();
@@ -7934,8 +8714,8 @@ Future<Map<int, String>> _loadAllBarcodes() async {
   }
   final map = <int, String>{};
   for (final row in all) {
-    final matNum = (row['mat_num'] as num?)?.toInt();
-    final barcode = row['barcode'] as String?;
+    final matNum = nullableIntValue(row['mat_num']);
+    final barcode = row['barcode']?.toString();
     if (matNum != null && barcode != null && barcode.isNotEmpty) {
       map[matNum] = barcode;
     }
@@ -7995,9 +8775,9 @@ double productSearchScore(
   List<String> words,
   Map<int, String> barcodes,
 ) {
-  final matNum = (product['mat_num'] as num?)?.toInt();
+  final matNum = nullableIntValue(product['mat_num']);
   final matText = matNum?.toString() ?? '';
-  final name = normalizeSearch(product['name'] as String? ?? '');
+  final name = normalizeSearch(product['name']?.toString() ?? '');
   final barcode = matNum == null ? '' : (barcodes[matNum] ?? '');
   if (query.isEmpty) return 0;
   if (matText == query) return 120;
@@ -8039,6 +8819,15 @@ Future<List<EmployeeLite>> loadEmployeesForScope(
   }
   final rows = await query.order('display_name', ascending: true);
   return rows.map(EmployeeLite.fromRow).toList();
+}
+
+Future<List<EmployeeLite>> loadAllActiveEmployees() async {
+  final rows = await supabase
+      .from('ansar_employees')
+      .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url')
+      .eq('is_active', true)
+      .order('display_name', ascending: true);
+  return rows.cast<Map<String, dynamic>>().map(EmployeeLite.fromRow).toList();
 }
 
 List<Movement> buildMovementsFromRows(
@@ -8508,7 +9297,7 @@ String formatDurationCompact(Duration duration) {
 
 String formatMoneyValue(Object? value) {
   if (value == null) return '-';
-  final number = (value as num?)?.toDouble() ?? double.tryParse('$value');
+  final number = value is num ? value.toDouble() : double.tryParse(value.toString());
   if (number == null) return '$value';
   return intl.NumberFormat('#,##0.##', 'en_US').format(number);
 }
@@ -8565,9 +9354,9 @@ PaymentInfo paymentLabelFromRemark(Object? remark) {
 String discountDisplay(Map<String, dynamic> item) {
   final explicit = parseDiscountItem(item['remarki']);
   if (explicit > 0) return '${formatMoneyValue(explicit)}%';
-  final quantity = (item['quantity'] as num?)?.toDouble() ?? 0;
-  final price = (item['price'] as num?)?.toDouble() ?? 0;
-  final value = (item['value'] as num?)?.toDouble() ?? 0;
+  final quantity = doubleValue(item['quantity']);
+  final price = doubleValue(item['price']);
+  final value = doubleValue(item['value']);
   final gross = quantity * price;
   if (gross > 0 && value < gross - 0.001) {
     return '${formatMoneyValue((1 - value / gross) * 100)}%';

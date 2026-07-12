@@ -179,6 +179,17 @@ void main() {
     expect(shortPdfText('abcdef', 5), 'abcd…');
     expect(sameCalendarDay(DateTime(2026, 7, 12, 1), DateTime(2026, 7, 12, 23)), isTrue);
     expect(sameCalendarDay(DateTime(2026, 7, 11), DateTime(2026, 7, 12)), isFalse);
+    expect(formatMoneyValue('12500.00'), '12,500');
+    expect(hasVisiblePrice('12500'), isTrue);
+    expect(
+      productSearchScore(
+        {'mat_num': '10', 'name': 'كتاب تجريبي'},
+        normalizeSearch('كتاب'),
+        ['كتاب'],
+        const {},
+      ),
+      greaterThan(0),
+    );
   });
 
   testWidgets('product detail tables render compact rows without overflow', (tester) async {
@@ -217,6 +228,7 @@ void main() {
           senderName: 'إبراهيم عسكر',
           avatarUrl: null,
           showDate: true,
+          showIdentity: true,
           onLongPress: () {},
         ),
       ),
@@ -225,6 +237,72 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(find.text('إبراهيم عسكر'), findsOneWidget);
     expect(find.text('رسالة تجريبية'), findsOneWidget);
+  });
+
+  testWidgets('invoice table fits a mobile screen without horizontal scrolling', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      _testShell(
+        SingleChildScrollView(
+          child: InvoiceItemsTable(
+            branches: {1: BranchOption(number: 1, name: 'فرع حمص')},
+            items: const [
+              {
+                'matnum': '10',
+                'product_name': 'كتاب طويل الاسم لاختبار عرض الجدول ضمن شاشة الهاتف',
+                'quantity': '2',
+                'price': '12500',
+                'value': '25000',
+                'remarki': '__sto:1',
+              },
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('بنود الفاتورة'), findsOneWidget);
+    expect(find.byType(SingleChildScrollView), findsOneWidget);
+  });
+
+  testWidgets('new group page lists employees from different branches', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final session = EmployeeSession({
+      'id': 'current',
+      'display_name': 'المستخدم الحالي',
+      'username': 'current',
+      'branch_num': 1,
+      'role': 'employee',
+    });
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildAnsarTheme(),
+        home: Directionality(
+          textDirection: TextDirection.rtl,
+          child: CreateThreadPage(
+            session: session,
+            branches: {
+              1: BranchOption(number: 1, name: 'فرع حمص'),
+              2: BranchOption(number: 2, name: 'فرع إدلب'),
+            },
+            employees: [
+              EmployeeLite(id: 'current', name: 'المستخدم الحالي', username: 'current', branchNum: 1, role: 'employee', isActive: true),
+              EmployeeLite(id: 'one', name: 'موظف حمص', username: 'homs', branchNum: 1, role: 'employee', isActive: true),
+              EmployeeLite(id: 'two', name: 'موظف إدلب', username: 'idlib', branchNum: 2, role: 'employee', isActive: true),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('موظف حمص'), findsOneWidget);
+    expect(find.text('موظف إدلب'), findsOneWidget);
+    expect(find.textContaining('فرع حمص'), findsOneWidget);
+    expect(find.textContaining('فرع إدلب'), findsOneWidget);
   });
 
   testWidgets('top bar fits mobile width with profile and notifications', (tester) async {
