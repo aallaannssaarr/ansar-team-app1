@@ -16,7 +16,7 @@ dependencies:
   pushy_flutter: 2.0.47
   shared_preferences: ^2.3.3
   image_picker: ^1.1.2
-  file_picker: ^11.0.2
+  file_picker: 10.3.10
   flutter_image_compress: ^2.4.0
   intl: ^0.19.0
   pdf: ^3.11.1

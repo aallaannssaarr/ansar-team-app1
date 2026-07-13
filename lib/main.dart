@@ -9044,7 +9044,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
 
   Future<void> pickAttachments() async {
     if (pendingAttachments.length >= 5 || sendingMessage) return;
-    final result = await FilePicker.pickFiles(
+    final result = await FilePicker.platform.pickFiles(
       allowMultiple: true,
       withData: true,
       type: FileType.custom,
