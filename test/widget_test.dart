@@ -210,7 +210,7 @@ void main() {
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(
       _testShell(
-        ProductDetailsTable(
+        const ProductDetailsTable(
           title: 'الأسعار المعتمدة',
           icon: Icons.sell_outlined,
           headers: const ['نوع السعر', 'القيمة'],
@@ -233,7 +233,7 @@ void main() {
     await tester.pumpWidget(
       _testShell(
         ChatMessageBubble(
-          row: {
+          row: const {
             'body': 'رسالة تجريبية',
             'created_at': '2026-07-12T10:30:00Z',
             'reply_to_id': 'old-message',
@@ -265,8 +265,8 @@ void main() {
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(
       _testShell(
-        ChatMessageBubble(
-          row: const {
+        const ChatMessageBubble(
+          row: {
             'body': 'نص يجب ألا يظهر',
             'created_at': '2026-07-12T10:30:00Z',
             'deleted_at': '2026-07-12T10:31:00Z',

@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:fl_chart/fl_chart.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -6841,10 +6840,10 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                 child: pw.Column(
                   crossAxisAlignment: pw.CrossAxisAlignment.start,
                   children: [
-                    pw.Text('فريق الأنصار', style: const pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold)),
+                    pw.Text('فريق الأنصار', style: pw.TextStyle(fontSize: 20, fontWeight: pw.FontWeight.bold)),
                     pw.Text(
                       'طلب مناقلة من $fromName إلى $toName',
-                      style: const pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold, color: PdfColor.fromInt(0xff087568)),
+                      style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold, color: const PdfColor.fromInt(0xff087568)),
                     ),
                   ],
                 ),
@@ -6857,7 +6856,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                 ),
                 child: pw.Text(
                   statusLabel(widget.order['status'] as String? ?? 'submitted'),
-                  style: const pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColor.fromInt(0xff087568)),
+                  style: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: const PdfColor.fromInt(0xff087568)),
                 ),
               ),
             ],
@@ -6883,12 +6882,12 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
             ),
           ),
           pw.SizedBox(height: 14),
-          pw.Text('بنود المناقلة', style: const pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
+          pw.Text('بنود المناقلة', style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
           pw.SizedBox(height: 6),
           pw.TableHelper.fromTextArray(
             headers: headers,
             data: rows,
-            headerStyle: const pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
+            headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
             headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
             oddRowDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xfff4f8f7)),
             cellStyle: const pw.TextStyle(fontSize: 10),
@@ -6910,12 +6909,12 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
           ),
           if (data.events.isNotEmpty) ...[
             pw.SizedBox(height: 16),
-            pw.Text('سجل المعالجة', style: const pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
+            pw.Text('سجل المعالجة', style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
             pw.SizedBox(height: 6),
             pw.TableHelper.fromTextArray(
               headers: const ['التحديث', 'نفذه', 'الوقت'],
               data: eventRows,
-              headerStyle: const pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
+              headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
               headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff344f49)),
               oddRowDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xfff4f8f7)),
               cellStyle: const pw.TextStyle(fontSize: 10),
@@ -6958,7 +6957,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
             children: [
               pw.Text(
                 'طلب مناقلة من $fromName إلى $toName',
-                style: const pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold),
+                style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold),
               ),
               pw.SizedBox(height: 5),
               pw.Text(
@@ -7011,7 +7010,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
           build: (_) => pw.Column(
             crossAxisAlignment: pw.CrossAxisAlignment.stretch,
             children: [
-              pw.Text('سجل معالجة المناقلة', style: const pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+              pw.Text('سجل معالجة المناقلة', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
               pw.SizedBox(height: 12),
               pw.Table(
                 border: pw.TableBorder.all(color: PdfColors.grey400),
@@ -9045,7 +9044,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
 
   Future<void> pickAttachments() async {
     if (pendingAttachments.length >= 5 || sendingMessage) return;
-    final result = await FilePicker.platform.pickFiles(
+    final result = await FilePicker.pickFiles(
       allowMultiple: true,
       withData: true,
       type: FileType.custom,
@@ -9572,7 +9571,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       await Future<void>.delayed(const Duration(milliseconds: 120));
     }
     final targetContext = messageKeys[messageId]?.currentContext;
-    if (targetContext == null) {
+    if (targetContext == null || !targetContext.mounted) {
       if (mounted) showSnack(context, 'الرسالة أقدم من النطاق المحمل حالياً');
       return;
     }
