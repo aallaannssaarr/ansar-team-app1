@@ -286,6 +286,64 @@ void main() {
     expect(find.text('نص يجب ألا يظهر'), findsNothing);
   });
 
+  test('delete for everyone belongs to the original sender only', () {
+    final sender = EmployeeSession({
+      'id': 'sender',
+      'display_name': 'المرسل',
+      'username': 'sender',
+      'role': 'employee',
+    });
+    final otherAdmin = EmployeeSession({
+      'id': 'admin',
+      'display_name': 'المدير',
+      'username': 'admin',
+      'role': 'admin',
+    });
+    final message = <String, dynamic>{'sender_id': 'sender'};
+
+    expect(canDeleteChatMessageForEveryone(message, sender), isTrue);
+    expect(canDeleteChatMessageForEveryone(message, otherAdmin), isFalse);
+  });
+
+  test('chat refresh ignores identical snapshots and detects message edits', () {
+    final previous = <Map<String, dynamic>>[
+      {'id': 'one', 'body': 'النص', 'edited_at': null, 'deleted_at': null},
+    ];
+    expect(chatMessageSnapshotsEqual(previous, List<Map<String, dynamic>>.from(previous)), isTrue);
+    expect(
+      chatMessageSnapshotsEqual(previous, [
+        {'id': 'one', 'body': 'النص المعدل', 'edited_at': '2026-07-13T10:00:00Z', 'deleted_at': null},
+      ]),
+      isFalse,
+    );
+  });
+
+  test('notification data accepts database maps and Firebase JSON strings', () {
+    expect(notificationData({'type': 'chat_message'})['type'], 'chat_message');
+    expect(notificationData('{"type":"chat_message","thread_id":"one"}')['thread_id'], 'one');
+    expect(notificationData('not-json'), isEmpty);
+  });
+
+  testWidgets('chat contact tile is ready to start a private conversation', (tester) async {
+    await tester.pumpWidget(
+      _testShell(
+        ChatThreadTile(
+          thread: const {
+            'id': 'contact:employee',
+            'thread_type': 'contact',
+            'title': 'موظف جديد',
+            'thread_avatar_name': 'موظف جديد',
+          },
+          onTap: () {},
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('موظف جديد'), findsOneWidget);
+    expect(find.text('بدء محادثة خاصة'), findsOneWidget);
+  });
+
   testWidgets('invoice table fits a mobile screen without horizontal scrolling', (tester) async {
     await tester.binding.setSurfaceSize(const Size(390, 844));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -350,6 +408,38 @@ void main() {
     expect(find.text('موظف إدلب'), findsOneWidget);
     expect(find.textContaining('فرع حمص'), findsOneWidget);
     expect(find.textContaining('فرع إدلب'), findsOneWidget);
+  });
+
+  testWidgets('group-only chat creation hides the private chat mode', (tester) async {
+    final session = EmployeeSession({
+      'id': 'current',
+      'display_name': 'المستخدم الحالي',
+      'username': 'current',
+      'branch_num': 1,
+      'role': 'employee',
+    });
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildAnsarTheme(),
+        home: Directionality(
+          textDirection: TextDirection.rtl,
+          child: CreateThreadPage(
+            groupOnly: true,
+            session: session,
+            branches: const {},
+            employees: [
+              EmployeeLite(id: 'one', name: 'الموظف الأول', username: 'one', branchNum: 1, role: 'employee', isActive: true),
+              EmployeeLite(id: 'two', name: 'الموظف الثاني', username: 'two', branchNum: 2, role: 'employee', isActive: true),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('مجموعة جديدة'), findsOneWidget);
+    expect(find.text('محادثة خاصة'), findsNothing);
+    expect(find.text('اسم المجموعة'), findsOneWidget);
   });
 
   testWidgets('top bar fits mobile width with profile and notifications', (tester) async {

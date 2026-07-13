@@ -121,6 +121,10 @@ async function loadEmployees(): Promise<Employee[]> {
 async function sendToDevice(accessToken: string, item: QueueItem, device: DeviceToken) {
   const serviceAccount = JSON.parse(firebaseJson);
   const projectId = serviceAccount.project_id;
+  const senderImage =
+    typeof item.data?.sender_avatar_url === "string" && item.data.sender_avatar_url.startsWith("https://")
+      ? item.data.sender_avatar_url
+      : null;
   const response = await fetch(`https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`, {
     method: "POST",
     headers: {
@@ -133,12 +137,14 @@ async function sendToDevice(accessToken: string, item: QueueItem, device: Device
         notification: {
           title: item.title,
           body: item.body,
+          ...(senderImage ? { image: senderImage } : {}),
         },
-        data: stringifyData(item.data),
+        data: stringifyData({ ...item.data, notification_id: item.id }),
         android: {
           priority: "HIGH",
           notification: {
             sound: "default",
+            ...(senderImage ? { image: senderImage } : {}),
           },
         },
       },

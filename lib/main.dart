@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -59,6 +60,7 @@ String? lastNotificationTokenPreview;
 String? lastNotificationRegistrationError;
 DateTime? lastNotificationRegistrationAt;
 StreamSubscription<String>? notificationTokenRefreshSubscription;
+String? activeChatThreadId;
 
 const brandColor = Color(0xff006a57);
 const brandDark = Color(0xff004d40);
@@ -655,8 +657,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   late EmployeeSession session;
   int index = 0;
   StreamSubscription<RemoteMessage>? foregroundMessages;
+  StreamSubscription<RemoteMessage>? openedMessages;
   Timer? notificationRegistrationTimer;
   Timer? inAppNotificationsTimer;
+  bool openingChatNotification = false;
   final seenInAppNotificationIds = <String>{};
   DateTime inAppNotificationCursor = DateTime.now().toUtc();
 
@@ -670,10 +674,70 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     foregroundMessages = FirebaseMessaging.onMessage.listen((message) {
       if (!mounted) return;
       if (message.data['sender_id'] == session.id || message.data['employee_id'] == session.id) return;
+      final notificationId = message.data['notification_id']?.toString();
+      if (notificationId != null && notificationId.isNotEmpty) seenInAppNotificationIds.add(notificationId);
+      if (message.data['type'] == 'chat_message' && message.data['thread_id'] == activeChatThreadId) return;
       final title = message.notification?.title ?? 'إشعار جديد';
       final body = message.notification?.body ?? '';
-      showSnack(context, body.isEmpty ? title : '$title\n$body');
+      final data = Map<String, dynamic>.from(message.data);
+      final isChat = data['type'] == 'chat_message';
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            duration: const Duration(seconds: 6),
+            content: Row(
+              children: [
+                if (isChat) ...[
+                  EmployeeAvatar(
+                    name: data['sender_name']?.toString() ?? 'موظف',
+                    imageUrl: data['sender_avatar_url']?.toString(),
+                    radius: 19,
+                  ),
+                  const SizedBox(width: 10),
+                ],
+                Expanded(
+                  child: Text(
+                    body.isEmpty ? title : '$title\n$body',
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+            action: isChat
+                ? SnackBarAction(
+                    label: 'فتح',
+                    textColor: const Color(0xffb9f5df),
+                    onPressed: () => unawaited(openChatFromNotification(data)),
+                  )
+                : null,
+          ),
+        );
     });
+    openedMessages = FirebaseMessaging.onMessageOpenedApp.listen(handleOpenedNotification);
+    unawaited(FirebaseMessaging.instance.getInitialMessage().then((message) {
+      if (message != null) handleOpenedNotification(message);
+    }));
+  }
+
+  void handleOpenedNotification(RemoteMessage message) {
+    if (message.data['type'] != 'chat_message') return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(openChatFromNotification(message.data));
+    });
+  }
+
+  Future<void> openChatFromNotification(Map<String, dynamic> data) async {
+    if (openingChatNotification || !mounted) return;
+    openingChatNotification = true;
+    try {
+      setState(() => index = 4);
+      await openChatNotification(context, session, data);
+    } finally {
+      openingChatNotification = false;
+    }
   }
 
   void updateSession(EmployeeSession value) {
@@ -717,6 +781,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         final id = row['id'] as String? ?? '';
         if (id.isEmpty || seenInAppNotificationIds.contains(id)) continue;
         seenInAppNotificationIds.add(id);
+        final data = notificationData(row['data']);
+        if (data['type'] == 'chat_message' && data['thread_id']?.toString() == activeChatThreadId) continue;
         if (!mounted) return;
         final title = row['title'] as String? ?? 'إشعار جديد';
         final body = row['body'] as String? ?? '';
@@ -731,6 +797,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     foregroundMessages?.cancel();
+    openedMessages?.cancel();
     notificationRegistrationTimer?.cancel();
     inAppNotificationsTimer?.cancel();
     super.dispose();
@@ -1035,6 +1102,13 @@ class _NotificationInboxPageState extends State<NotificationInboxPage> {
     setState(() => future = loadNotifications());
   }
 
+  Future<void> openNotification(Map<String, dynamic> row) async {
+    final data = notificationData(row['data']);
+    if (data['type'] == 'chat_message') {
+      await openChatNotification(context, widget.session, data);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<List<Map<String, dynamic>>>(
@@ -1070,7 +1144,10 @@ class _NotificationInboxPageState extends State<NotificationInboxPage> {
                   child: Column(
                     children: [
                       for (var i = 0; i < rows.length; i++) ...[
-                        NotificationInboxTile(row: rows[i]),
+                        NotificationInboxTile(
+                          row: rows[i],
+                          onTap: () => openNotification(rows[i]),
+                        ),
                         if (i != rows.length - 1) const Divider(indent: 68),
                       ],
                     ],
@@ -1085,17 +1162,19 @@ class _NotificationInboxPageState extends State<NotificationInboxPage> {
 }
 
 class NotificationInboxTile extends StatelessWidget {
-  const NotificationInboxTile({super.key, required this.row});
+  const NotificationInboxTile({super.key, required this.row, this.onTap});
 
   final Map<String, dynamic> row;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     final created = DateTime.tryParse(row['created_at'] as String? ?? '')?.toLocal();
-    final data = row['data'] is Map ? Map<String, dynamic>.from(row['data'] as Map) : <String, dynamic>{};
+    final data = notificationData(row['data']);
     final type = data['type'] as String? ?? '';
     final isChat = type.contains('chat');
     final isTransfer = type.contains('transfer');
+    final effectiveOnTap = isChat ? onTap : null;
     final color = isChat
         ? infoColor
         : isTransfer
@@ -1107,21 +1186,35 @@ class NotificationInboxTile extends StatelessWidget {
             ? Icons.swap_horiz_rounded
             : Icons.schedule_rounded;
     return ListTile(
+      onTap: effectiveOnTap,
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-      leading: Container(
-        width: 42,
-        height: 42,
-        decoration: BoxDecoration(color: color.withValues(alpha: 0.1), shape: BoxShape.circle),
-        child: Icon(icon, color: color, size: 21),
-      ),
+      leading: isChat
+          ? EmployeeAvatar(
+              name: data['sender_name']?.toString() ?? 'موظف',
+              imageUrl: data['sender_avatar_url']?.toString(),
+              radius: 21,
+            )
+          : Container(
+              width: 42,
+              height: 42,
+              decoration: BoxDecoration(color: color.withValues(alpha: 0.1), shape: BoxShape.circle),
+              child: Icon(icon, color: color, size: 21),
+            ),
       title: Text(row['title'] as String? ?? 'إشعار جديد', style: const TextStyle(fontWeight: FontWeight.w800)),
       subtitle: Padding(
         padding: const EdgeInsets.only(top: 4),
         child: Text(row['body'] as String? ?? '', style: const TextStyle(color: mutedInk)),
       ),
       trailing: created == null
-          ? null
-          : Text(formatTime(created), style: const TextStyle(color: mutedInk, fontSize: 11)),
+          ? (effectiveOnTap == null ? null : const Icon(Icons.chevron_left_rounded, color: mutedInk))
+          : Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Text(formatTime(created), style: const TextStyle(color: mutedInk, fontSize: 11)),
+                if (effectiveOnTap != null) const Icon(Icons.chevron_left_rounded, color: mutedInk, size: 18),
+              ],
+            ),
     );
   }
 }
@@ -6900,8 +6993,14 @@ class _ChatPageState extends State<ChatPage> {
         schema: 'public',
         table: 'ansar_chat_messages',
         callback: (_) => refreshThreads(),
+      )
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_employees',
+        callback: (_) => refreshThreads(),
       ).subscribe();
-    threadsTimer = Timer.periodic(const Duration(seconds: 15), (_) => refreshThreads());
+    threadsTimer = Timer.periodic(const Duration(seconds: 5), (_) => refreshThreads());
   }
 
   @override
@@ -6924,75 +7023,74 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<List<Map<String, dynamic>>> loadThreads() async {
-    final rows = await supabase
+    final threadRowsFuture = supabase
         .from('ansar_chat_threads')
         .select()
         .eq('is_active', true)
         .order('updated_at', ascending: false);
-
-    final joinedParticipants = await supabase
+    final joinedParticipantsFuture = supabase
         .from('ansar_chat_participants')
         .select('thread_id')
         .eq('employee_id', widget.session.id);
+    final employeesFuture = loadAllActiveEmployees();
+    final rows = (await threadRowsFuture).cast<Map<String, dynamic>>();
+    final joinedParticipants = (await joinedParticipantsFuture).cast<Map<String, dynamic>>();
+    final activeEmployees = await employeesFuture;
     final joinedThreadIds = joinedParticipants.map((row) => row['thread_id']).toSet();
 
-    final visible = rows.cast<Map<String, dynamic>>().where((row) {
+    final visible = rows.where((row) {
       final type = row['thread_type'] as String? ?? 'general';
       if (type == 'general') return true;
       return joinedThreadIds.contains(row['id']);
     }).toList();
     final threadIds = visible.map((row) => row['id']).whereType<String>().toList();
-    if (threadIds.isEmpty) return visible;
-
-    final participantRows = await supabase
-        .from('ansar_chat_participants')
-        .select('thread_id, employee_id')
-        .inFilter('thread_id', threadIds);
-    final messageRows = await supabase
-        .from('ansar_chat_messages')
-        .select('id, thread_id, sender_id, body, created_at')
-        .inFilter('thread_id', threadIds)
-        .isFilter('deleted_at', null)
-        .order('created_at', ascending: false)
-        .limit(250);
-    final allParticipants = participantRows.cast<Map<String, dynamic>>();
-    final messages = messageRows.cast<Map<String, dynamic>>();
-    final employeeIds = <String>{
-      ...allParticipants.map((row) => row['employee_id'] as String?).whereType<String>(),
-      ...messages.map((row) => row['sender_id'] as String?).whereType<String>(),
-    }.toList();
-    final employeeRows = employeeIds.isEmpty
+    final participantRows = threadIds.isEmpty
         ? <Map<String, dynamic>>[]
-        : await supabase
-            .from('ansar_employees')
-            .select('id, display_name, full_name, username, avatar_url')
-            .inFilter('id', employeeIds);
-    final employees = {
-      for (final row in employeeRows.cast<Map<String, dynamic>>())
-        row['id'] as String: EmployeeLite(
-          id: row['id'] as String,
-          name: (row['display_name'] ?? row['full_name'] ?? row['username'] ?? 'موظف').toString(),
-          username: row['username']?.toString() ?? '',
-          branchNum: 0,
-          role: 'employee',
-          isActive: true,
-          avatarUrl: row['avatar_url'] as String?,
-        ),
-    };
+        : (await supabase
+                .from('ansar_chat_participants')
+                .select('thread_id, employee_id')
+                .inFilter('thread_id', threadIds))
+            .cast<Map<String, dynamic>>();
+    final rawMessageRows = threadIds.isEmpty
+        ? <Map<String, dynamic>>[]
+        : (await supabase
+                .from('ansar_chat_messages')
+                .select('id, thread_id, sender_id, body, created_at')
+                .inFilter('thread_id', threadIds)
+                .isFilter('deleted_at', null)
+                .order('created_at', ascending: false)
+                .limit(250))
+            .cast<Map<String, dynamic>>();
+    var hiddenMessageIds = <String>{};
+    if (rawMessageRows.isNotEmpty) {
+      try {
+        final hiddenRows = await supabase
+            .from('ansar_chat_message_hidden')
+            .select('message_id')
+            .eq('employee_id', widget.session.id)
+            .inFilter('message_id', rawMessageRows.map((row) => '${row['id']}').toList());
+        hiddenMessageIds = hiddenRows.map((row) => '${row['message_id']}').toSet();
+      } catch (_) {
+        // The list remains usable before the optional per-user deletion migration is installed.
+      }
+    }
+    final messageRows = rawMessageRows.where((row) => !hiddenMessageIds.contains('${row['id']}')).toList();
+    final employees = {for (final employee in activeEmployees) employee.id: employee};
     final latestByThread = <String, Map<String, dynamic>>{};
-    for (final row in messages) {
+    for (final row in messageRows) {
       final threadId = row['thread_id']?.toString();
       if (threadId != null) latestByThread.putIfAbsent(threadId, () => row);
     }
     final participantsByThread = <String, List<String>>{};
-    for (final row in allParticipants) {
+    for (final row in participantRows) {
       final threadId = row['thread_id']?.toString();
       final employeeId = row['employee_id']?.toString();
       if (threadId != null && employeeId != null) {
         participantsByThread.putIfAbsent(threadId, () => <String>[]).add(employeeId);
       }
     }
-    return visible.map((thread) {
+    final representedDirectEmployees = <String>{};
+    final enrichedThreads = visible.map((thread) {
       final threadId = thread['id']?.toString() ?? '';
       final latest = latestByThread[threadId];
       final otherIds = participantsByThread[threadId]
@@ -7002,8 +7100,10 @@ class _ChatPageState extends State<ChatPage> {
       final otherId = otherIds.isEmpty ? null : otherIds.first;
       final otherEmployee = otherId == null ? null : employees[otherId];
       final sender = latest == null ? null : employees[latest['sender_id']];
+      if (thread['thread_type'] == 'direct' && otherId != null) representedDirectEmployees.add(otherId);
       return {
         ...thread,
+        if (thread['thread_type'] == 'direct' && otherEmployee != null) 'title': otherEmployee.name,
         'last_message': latest,
         'last_sender_name': sender?.name,
         'thread_avatar_url': otherEmployee?.avatarUrl,
@@ -7011,9 +7111,32 @@ class _ChatPageState extends State<ChatPage> {
         'participant_ids': participantsByThread[threadId] ?? <String>[],
       };
     }).toList();
+    final contactThreads = activeEmployees
+        .where((employee) => employee.id != widget.session.id && !representedDirectEmployees.contains(employee.id))
+        .map<Map<String, dynamic>>((employee) => {
+              'id': 'contact:${employee.id}',
+              'thread_type': 'contact',
+              'title': employee.name,
+              'thread_avatar_url': employee.avatarUrl,
+              'thread_avatar_name': employee.name,
+              'contact_username': employee.username,
+              'participant_ids': [widget.session.id, employee.id],
+              'contact_employee': employee,
+            })
+        .toList()
+      ..sort((a, b) => normalizeSearch('${a['title']}').compareTo(normalizeSearch('${b['title']}')));
+    return [...enrichedThreads, ...contactThreads];
   }
 
   Future<void> openThread(Map<String, dynamic> thread) async {
+    if (thread['thread_type'] == 'contact') {
+      final employee = thread['contact_employee'];
+      if (employee is EmployeeLite) {
+        await openOrCreateDirectChat(context, widget.session, employee);
+        if (mounted) refreshThreads();
+      }
+      return;
+    }
     await Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => Directionality(
@@ -7042,6 +7165,7 @@ class _ChatPageState extends State<ChatPage> {
             session: widget.session,
             employees: employees,
             branches: branches,
+            groupOnly: true,
           ),
         ),
       ),
@@ -7129,9 +7253,10 @@ class _ChatPageState extends State<ChatPage> {
             ? threads
             : threads.where((thread) {
                 final title = normalizeSearch(thread['title']?.toString() ?? '');
+                final username = normalizeSearch(thread['contact_username']?.toString() ?? '');
                 final latest = thread['last_message'] as Map<String, dynamic>?;
                 final body = normalizeSearch(latest?['body']?.toString() ?? '');
-                return title.contains(query) || body.contains(query);
+                return title.contains(query) || username.contains(query) || body.contains(query);
               }).toList();
         return Scaffold(
           body: ListView(
@@ -7140,12 +7265,12 @@ class _ChatPageState extends State<ChatPage> {
             children: [
               PageHeading(
                 title: 'الدردشة',
-                subtitle: 'المحادثات العامة والخاصة ومجموعات العمل',
+                subtitle: 'اختر أي موظف لمراسلته أو أنشئ مجموعة عمل',
                 icon: Icons.chat_bubble_outline_rounded,
                 action: IconButton.filled(
-                  tooltip: 'محادثة جديدة',
+                  tooltip: 'مجموعة جديدة',
                   onPressed: threadBusy ? null : createThread,
-                  icon: const Icon(Icons.add_comment_rounded),
+                  icon: const Icon(Icons.group_add_rounded),
                 ),
               ),
               TextField(
@@ -7209,8 +7334,13 @@ class ChatThreadTile extends StatelessWidget {
     final type = thread['thread_type']?.toString() ?? 'general';
     final general = type == 'general';
     final group = type == 'group';
+    final contact = type == 'contact';
     final latest = thread['last_message'] as Map<String, dynamic>?;
     final senderName = thread['last_sender_name']?.toString();
+    final contactUsername = thread['contact_username']?.toString() ?? '';
+    final emptySubtitle = contact
+        ? '${contactUsername.isEmpty ? '' : '@$contactUsername · '}بدء محادثة خاصة'
+        : chatTypeLabel(type);
     final avatarName = thread['thread_avatar_name']?.toString() ?? thread['title']?.toString() ?? 'محادثة';
     final avatarUrl = thread['thread_avatar_url'] as String?;
     return Material(
@@ -7258,7 +7388,7 @@ class ChatThreadTile extends StatelessWidget {
                     const SizedBox(height: 4),
                     Text(
                       latest == null
-                          ? chatTypeLabel(type)
+                          ? emptySubtitle
                           : '${senderName == null ? '' : '$senderName: '}${latest['body'] ?? ''}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
@@ -7292,40 +7422,40 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   final composerFocus = FocusNode();
   final scrollController = ScrollController();
   final messageKeys = <String, GlobalKey>{};
+  final senderProfiles = <String, Map<String, dynamic>>{};
   late Future<List<Map<String, dynamic>>> future;
   List<Map<String, dynamic>>? latestMessages;
   Map<String, dynamic>? replyingTo;
   Map<String, dynamic>? editingMessage;
   Timer? timer;
-  RealtimeChannel? channel;
+  StreamSubscription<List<Map<String, dynamic>>>? messageChanges;
   bool sendingMessage = false;
+  bool refreshingMessages = false;
+  bool refreshMessagesAgain = false;
   bool showNewMessageHint = false;
   String? lastRenderedMessageId;
+  String? previousActiveChatThreadId;
 
   @override
   void initState() {
     super.initState();
+    previousActiveChatThreadId = activeChatThreadId;
+    activeChatThreadId = '${widget.thread['id']}';
     future = loadAndRememberMessages();
     scrollController.addListener(handleMessageScroll);
-    channel = supabase.channel('chat-thread-${widget.thread['id']}')
-      ..onPostgresChanges(
-        event: PostgresChangeEvent.all,
-        schema: 'public',
-        table: 'ansar_chat_messages',
-        filter: PostgresChangeFilter(
-          type: PostgresChangeFilterType.eq,
-          column: 'thread_id',
-          value: widget.thread['id'],
-        ),
-        callback: (_) => refreshMessages(),
-      ).subscribe();
-    timer = Timer.periodic(const Duration(seconds: 5), (_) => refreshMessages());
+    messageChanges = supabase
+        .from('ansar_chat_messages')
+        .stream(primaryKey: ['id'])
+        .eq('thread_id', '${widget.thread['id']}')
+        .listen((_) => unawaited(refreshMessages()), onError: (_) {});
+    timer = Timer.periodic(const Duration(seconds: 2), (_) => unawaited(refreshMessages()));
   }
 
   @override
   void dispose() {
+    if (activeChatThreadId == '${widget.thread['id']}') activeChatThreadId = previousActiveChatThreadId;
     timer?.cancel();
-    if (channel != null) supabase.removeChannel(channel!);
+    messageChanges?.cancel();
     scrollController
       ..removeListener(handleMessageScroll)
       ..dispose();
@@ -7334,9 +7464,30 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     super.dispose();
   }
 
-  void refreshMessages() {
+  Future<void> refreshMessages() async {
     if (!mounted) return;
-    setState(() => future = loadAndRememberMessages());
+    if (refreshingMessages) {
+      refreshMessagesAgain = true;
+      return;
+    }
+    refreshingMessages = true;
+    try {
+      final loaded = await loadMessages();
+      if (!mounted) return;
+      if (chatMessageSnapshotsEqual(latestMessages, loaded)) return;
+      setState(() {
+        latestMessages = loaded;
+        future = Future.value(loaded);
+      });
+    } catch (_) {
+      // A short network interruption must not replace the conversation with an error screen.
+    } finally {
+      refreshingMessages = false;
+      if (refreshMessagesAgain && mounted) {
+        refreshMessagesAgain = false;
+        unawaited(refreshMessages());
+      }
+    }
   }
 
   bool get isNearMessageBottom {
@@ -7394,9 +7545,23 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
         .from('ansar_chat_messages')
         .select()
         .eq('thread_id', widget.thread['id'])
-        .order('created_at', ascending: true)
+        .order('created_at', ascending: false)
         .limit(120);
-    final messages = rows.cast<Map<String, dynamic>>();
+    final allMessages = rows.cast<Map<String, dynamic>>().reversed.toList();
+    var hiddenMessageIds = <String>{};
+    try {
+      final messageIds = allMessages.map((row) => '${row['id']}').toList();
+      if (messageIds.isEmpty) return <Map<String, dynamic>>[];
+      final hiddenRows = await supabase
+          .from('ansar_chat_message_hidden')
+          .select('message_id')
+          .eq('employee_id', widget.session.id)
+          .inFilter('message_id', messageIds);
+      hiddenMessageIds = hiddenRows.map((row) => '${row['message_id']}').toSet();
+    } catch (_) {
+      // The chat remains usable before the optional per-user deletion migration is installed.
+    }
+    final messages = allMessages.where((row) => !hiddenMessageIds.contains('${row['id']}')).toList();
     final messageById = <String, Map<String, dynamic>>{
       for (final row in messages) if (row['id'] != null) '${row['id']}': row,
     };
@@ -7404,6 +7569,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
         .map((row) => row['reply_to_id']?.toString())
         .whereType<String>()
         .where((id) => !messageById.containsKey(id))
+        .where((id) => !hiddenMessageIds.contains(id))
         .toSet()
         .toList();
     if (missingReplyIds.isNotEmpty) {
@@ -7420,16 +7586,17 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       ...messages.map((row) => row['sender_id']?.toString()).whereType<String>(),
       ...messageById.values.map((row) => row['sender_id']?.toString()).whereType<String>(),
     }.toList();
-    final employeeRows = senderIds.isEmpty
+    final missingSenderIds = senderIds.where((id) => !senderProfiles.containsKey(id)).toList();
+    final employeeRows = missingSenderIds.isEmpty
         ? <Map<String, dynamic>>[]
         : await supabase
             .from('ansar_employees')
             .select('id, display_name, full_name, username, avatar_url')
-            .inFilter('id', senderIds);
-    final employees = {
-      for (final row in employeeRows.cast<Map<String, dynamic>>())
-        row['id'] as String: row,
-    };
+            .inFilter('id', missingSenderIds);
+    for (final row in employeeRows.cast<Map<String, dynamic>>()) {
+      senderProfiles['${row['id']}'] = row;
+    }
+    final employees = senderProfiles;
     return messages.map((row) {
       final employee = employees[row['sender_id']];
       final reply = messageById[row['reply_to_id']?.toString()];
@@ -7548,7 +7715,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   }
 
   Future<void> deleteMessage(Map<String, dynamic> row) async {
-    if (row['sender_id'] != widget.session.id && !widget.session.isAdmin) return;
+    if (!canDeleteChatMessageForEveryone(row, widget.session)) return;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -7574,6 +7741,43 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       if (!mounted) return;
       final updated = (latestMessages ?? <Map<String, dynamic>>[])
           .map((item) => '${item['id']}' == '${row['id']}' ? {...item, 'deleted_at': deletedAt} : item)
+          .toList();
+      setState(() {
+        latestMessages = updated;
+        future = Future.value(updated);
+        if ('${editingMessage?['id']}' == '${row['id']}') editingMessage = null;
+        if ('${replyingTo?['id']}' == '${row['id']}') replyingTo = null;
+      });
+    } catch (error) {
+      if (mounted) showSnack(context, chatUpgradeError(error));
+    }
+  }
+
+  Future<void> hideMessageForMe(Map<String, dynamic> row) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('حذف الرسالة لديك؟'),
+        content: const Text('ستختفي الرسالة من حسابك فقط، وستبقى ظاهرة لبقية المشاركين.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('إلغاء')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: dangerColor),
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('حذف لدي'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    try {
+      await supabase.from('ansar_chat_message_hidden').upsert({
+        'employee_id': widget.session.id,
+        'message_id': '${row['id']}',
+      }, onConflict: 'employee_id,message_id');
+      if (!mounted) return;
+      final updated = (latestMessages ?? <Map<String, dynamic>>[])
+          .where((item) => '${item['id']}' != '${row['id']}')
           .toList();
       setState(() {
         latestMessages = updated;
@@ -7662,10 +7866,20 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                     beginEdit(row);
                   },
                 ),
-              if ((mine || widget.session.isAdmin) && !deleted)
+              ListTile(
+                leading: const Icon(Icons.delete_sweep_outlined, color: dangerColor),
+                title: const Text('حذف لدي', style: TextStyle(color: dangerColor)),
+                subtitle: const Text('يختفي من حسابك فقط'),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  unawaited(hideMessageForMe(row));
+                },
+              ),
+              if (canDeleteChatMessageForEveryone(row, widget.session) && !deleted)
                 ListTile(
                   leading: const Icon(Icons.delete_outline_rounded, color: dangerColor),
                   title: const Text('حذف لدى الجميع', style: TextStyle(color: dangerColor)),
+                  subtitle: const Text('متاح لمرسل الرسالة فقط'),
                   onTap: () {
                     Navigator.pop(sheetContext);
                     unawaited(deleteMessage(row));
@@ -7835,7 +8049,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                             avatarUrl: mine ? widget.session.avatarUrl : row['sender_avatar_url'] as String?,
                             showDate: previousDate == null || !sameCalendarDay(previousDate, currentDate),
                             showIdentity: !mine && startsSenderGroup,
-                            onLongPress: row['deleted_at'] == null ? () => showMessageActions(row) : null,
+                            onLongPress: () => showMessageActions(row),
                             onAvatarTap: mine ? null : () => openSenderChat(row),
                             onReplyTap: () => scrollToReply(row['reply_to_id']?.toString()),
                           ),
@@ -8242,11 +8456,13 @@ class CreateThreadPage extends StatefulWidget {
     required this.session,
     required this.employees,
     required this.branches,
+    this.groupOnly = false,
   });
 
   final EmployeeSession session;
   final List<EmployeeLite> employees;
   final Map<int, BranchOption> branches;
+  final bool groupOnly;
 
   @override
   State<CreateThreadPage> createState() => _CreateThreadPageState();
@@ -8257,6 +8473,12 @@ class _CreateThreadPageState extends State<CreateThreadPage> {
   final search = TextEditingController();
   final selected = <String>{};
   bool isGroup = false;
+
+  @override
+  void initState() {
+    super.initState();
+    isGroup = widget.groupOnly;
+  }
 
   @override
   void dispose() {
@@ -8319,29 +8541,30 @@ class _CreateThreadPageState extends State<CreateThreadPage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: ChatModeButton(
-                        selected: !isGroup,
-                        icon: Icons.person_rounded,
-                        label: 'محادثة خاصة',
-                        onTap: () => changeMode(false),
+                if (!widget.groupOnly)
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ChatModeButton(
+                          selected: !isGroup,
+                          icon: Icons.person_rounded,
+                          label: 'محادثة خاصة',
+                          onTap: () => changeMode(false),
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: ChatModeButton(
-                        selected: isGroup,
-                        icon: Icons.groups_rounded,
-                        label: 'مجموعة',
-                        onTap: () => changeMode(true),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: ChatModeButton(
+                          selected: isGroup,
+                          icon: Icons.groups_rounded,
+                          label: 'مجموعة',
+                          onTap: () => changeMode(true),
+                        ),
                       ),
-                    ),
-                  ],
-                ),
+                    ],
+                  ),
                 if (isGroup) ...[
-                  const SizedBox(height: 10),
+                  if (!widget.groupOnly) const SizedBox(height: 10),
                   TextField(
                     controller: title,
                     decoration: const InputDecoration(
@@ -8497,6 +8720,24 @@ String employeeDisplayName(Map<String, dynamic> row) {
   return (row['display_name'] ?? row['full_name'] ?? row['username'] ?? 'موظف').toString();
 }
 
+bool canDeleteChatMessageForEveryone(Map<String, dynamic> message, EmployeeSession session) {
+  return message['sender_id']?.toString() == session.id;
+}
+
+bool chatMessageSnapshotsEqual(
+  List<Map<String, dynamic>>? previous,
+  List<Map<String, dynamic>> current,
+) {
+  if (previous == null || previous.length != current.length) return false;
+  const watchedKeys = ['id', 'body', 'edited_at', 'deleted_at', 'reply_to_id', 'forwarded_from_id'];
+  for (var index = 0; index < current.length; index++) {
+    for (final key in watchedKeys) {
+      if (previous[index][key]?.toString() != current[index][key]?.toString()) return false;
+    }
+  }
+  return true;
+}
+
 Future<List<Map<String, dynamic>>> loadVisibleChatThreads(EmployeeSession session) async {
   final threadRows = await supabase
       .from('ansar_chat_threads')
@@ -8512,6 +8753,91 @@ Future<List<Map<String, dynamic>>> loadVisibleChatThreads(EmployeeSession sessio
     if (thread['thread_type'] == 'general') return true;
     return joinedIds.contains(thread['id']?.toString());
   }).toList();
+}
+
+Map<String, dynamic> notificationData(Object? value) {
+  if (value is Map) return Map<String, dynamic>.from(value);
+  if (value is String && value.trim().isNotEmpty) {
+    try {
+      final decoded = jsonDecode(value);
+      if (decoded is Map) return Map<String, dynamic>.from(decoded);
+    } catch (_) {
+      // Invalid notification data is treated as an ordinary notification.
+    }
+  }
+  return <String, dynamic>{};
+}
+
+Future<Map<String, dynamic>?> loadChatThreadForSession(
+  EmployeeSession session,
+  String threadId,
+) async {
+  final rows = await supabase
+      .from('ansar_chat_threads')
+      .select()
+      .eq('id', threadId)
+      .eq('is_active', true)
+      .limit(1);
+  if (rows.isEmpty) return null;
+  final thread = Map<String, dynamic>.from(rows.first);
+  final participantRows = await supabase
+      .from('ansar_chat_participants')
+      .select('employee_id')
+      .eq('thread_id', threadId);
+  final participantIds = participantRows
+      .map((row) => row['employee_id']?.toString())
+      .whereType<String>()
+      .toList();
+  final type = thread['thread_type']?.toString() ?? 'general';
+  if (type != 'general' && !participantIds.contains(session.id)) return null;
+  thread['participant_ids'] = participantIds;
+
+  if (type == 'direct') {
+    final otherIds = participantIds.where((id) => id != session.id).toList();
+    if (otherIds.isNotEmpty) {
+      final employeeRows = await supabase
+          .from('ansar_employees')
+          .select('display_name, full_name, username, avatar_url')
+          .eq('id', otherIds.first)
+          .limit(1);
+      if (employeeRows.isNotEmpty) {
+        final employee = employeeRows.first;
+        final name = employeeDisplayName(employee);
+        thread['title'] = name;
+        thread['thread_avatar_name'] = name;
+        thread['thread_avatar_url'] = employee['avatar_url'];
+      }
+    }
+  }
+  return thread;
+}
+
+Future<void> openChatNotification(
+  BuildContext context,
+  EmployeeSession session,
+  Map<String, dynamic> data,
+) async {
+  if (data['type'] != 'chat_message') return;
+  final threadId = data['thread_id']?.toString();
+  if (threadId == null || threadId.isEmpty) return;
+  try {
+    final thread = await loadChatThreadForSession(session, threadId);
+    if (!context.mounted) return;
+    if (thread == null) {
+      showSnack(context, 'تعذر فتح المحادثة أو لم تعد متاحة لهذا الحساب');
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: ChatThreadPage(session: session, thread: thread),
+        ),
+      ),
+    );
+  } catch (error) {
+    if (context.mounted) showSnack(context, cleanError(error));
+  }
 }
 
 Future<void> openOrCreateDirectChat(
@@ -10332,11 +10658,14 @@ Future<void> enqueueChatNotification({
   final threadId = thread['id'] as String?;
   if (threadId == null) return;
   final type = thread['thread_type'] as String? ?? 'general';
-  final title = type == 'general' ? 'رسالة جديدة في الدردشة العامة' : 'رسالة جديدة من ${sender.name}';
+  final title = type == 'general' ? '${sender.name} في الدردشة العامة' : 'رسالة جديدة من ${sender.name}';
   final data = {
     'type': 'chat_message',
     'thread_id': threadId,
     'sender_id': sender.id,
+    'sender_name': sender.name,
+    'sender_avatar_url': sender.avatarUrl ?? '',
+    'message_preview': body,
   };
 
   List<Map<String, dynamic>> participants;
@@ -10496,7 +10825,8 @@ String chatUpgradeError(Object? error) {
       text.contains('edited_by') ||
       text.contains('deleted_by') ||
       text.contains('forwarded_from_id') ||
-      text.contains('is_muted')) {
+      text.contains('is_muted') ||
+      text.contains('ansar_chat_message_hidden')) {
     return 'يلزم تنفيذ ملف تحديث الدردشة الجديد في Supabase أولاً.';
   }
   return cleanError(error);

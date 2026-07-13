@@ -17,6 +17,17 @@ alter table public.ansar_chat_participants
   add column if not exists is_muted boolean not null default false,
   add column if not exists last_read_at timestamptz;
 
+-- الرسائل التي أخفاها كل موظف من حسابه فقط.
+create table if not exists public.ansar_chat_message_hidden (
+  employee_id text not null,
+  message_id text not null,
+  hidden_at timestamptz not null default now(),
+  primary key (employee_id, message_id)
+);
+
+grant select, insert, update, delete on table public.ansar_chat_message_hidden
+  to anon, authenticated, service_role;
+
 create index if not exists ansar_chat_messages_reply_to_idx
   on public.ansar_chat_messages (reply_to_id)
   where reply_to_id is not null;
@@ -27,6 +38,9 @@ create index if not exists ansar_chat_messages_forwarded_from_idx
 
 create index if not exists ansar_chat_participants_employee_thread_idx
   on public.ansar_chat_participants (employee_id, thread_id);
+
+-- يضمن أن تحديث الرسالة أو حذفها المنطقي يصل كاملاً إلى الأجهزة المشتركة.
+alter table public.ansar_chat_messages replica identity full;
 
 -- تأكد من وصول تحديثات الرسائل والمشاركين فورياً إلى الأجهزة.
 do $$
