@@ -2805,7 +2805,7 @@ class _QueriesPageState extends State<QueriesPage> {
     final todayKey = formatDateKey(today);
     startDate = TextEditingController(text: todayKey);
     endDate = TextEditingController(text: todayKey);
-    unawaited(warmQueriesCache());
+    unawaited(warmQueriesCache().catchError((_) {}));
   }
 
   @override
@@ -2823,20 +2823,31 @@ class _QueriesPageState extends State<QueriesPage> {
 
     final productRows = await searchProductsLikeLegacy(value, limit: 60);
 
-    final branches = await loadLegacyBranchesMap();
+    Map<int, BranchOption> branches = <int, BranchOption>{};
+    try {
+      branches = await loadLegacyBranchesMap();
+    } catch (_) {
+      // Product names remain useful even if warehouse labels are temporarily unavailable.
+    }
     final matNums = productRows
         .take(40)
         .map((product) => nullableIntValue(product['mat_num']))
         .whereType<int>()
         .toList();
-    final stockRows = matNums.isEmpty
-        ? <Map<String, dynamic>>[]
-        : await supabase
+    List<Map<String, dynamic>> stockRows = <Map<String, dynamic>>[];
+    if (matNums.isNotEmpty) {
+      try {
+        final rows = await supabase
             .from('product_stock')
             .select('mat_num, sto_num, quantity')
             .inFilter('mat_num', matNums);
+        stockRows = rows.cast<Map<String, dynamic>>();
+      } catch (_) {
+        // A stock failure must never hide matching books from search results.
+      }
+    }
     final stockByMat = <int, List<StockResult>>{};
-    for (final row in stockRows.cast<Map<String, dynamic>>()) {
+    for (final row in stockRows) {
       final matNum = nullableIntValue(row['mat_num']);
       final branchNum = nullableIntValue(row['sto_num']);
       if (matNum == null || branchNum == null) continue;
@@ -7278,9 +7289,13 @@ class ChatThreadPage extends StatefulWidget {
 
 class _ChatThreadPageState extends State<ChatThreadPage> {
   final message = TextEditingController();
+  final composerFocus = FocusNode();
   final scrollController = ScrollController();
+  final messageKeys = <String, GlobalKey>{};
   late Future<List<Map<String, dynamic>>> future;
   List<Map<String, dynamic>>? latestMessages;
+  Map<String, dynamic>? replyingTo;
+  Map<String, dynamic>? editingMessage;
   Timer? timer;
   RealtimeChannel? channel;
   bool sendingMessage = false;
@@ -7314,6 +7329,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     scrollController
       ..removeListener(handleMessageScroll)
       ..dispose();
+    composerFocus.dispose();
     message.dispose();
     super.dispose();
   }
@@ -7378,11 +7394,32 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
         .from('ansar_chat_messages')
         .select()
         .eq('thread_id', widget.thread['id'])
-        .isFilter('deleted_at', null)
         .order('created_at', ascending: true)
         .limit(120);
     final messages = rows.cast<Map<String, dynamic>>();
-    final senderIds = messages.map((row) => row['sender_id'] as String?).whereType<String>().toSet().toList();
+    final messageById = <String, Map<String, dynamic>>{
+      for (final row in messages) if (row['id'] != null) '${row['id']}': row,
+    };
+    final missingReplyIds = messages
+        .map((row) => row['reply_to_id']?.toString())
+        .whereType<String>()
+        .where((id) => !messageById.containsKey(id))
+        .toSet()
+        .toList();
+    if (missingReplyIds.isNotEmpty) {
+      try {
+        final replyRows = await supabase.from('ansar_chat_messages').select().inFilter('id', missingReplyIds);
+        for (final row in replyRows.cast<Map<String, dynamic>>()) {
+          if (row['id'] != null) messageById['${row['id']}'] = row;
+        }
+      } catch (_) {
+        // Replies still render with a generic preview if the original is outside the loaded page.
+      }
+    }
+    final senderIds = <String>{
+      ...messages.map((row) => row['sender_id']?.toString()).whereType<String>(),
+      ...messageById.values.map((row) => row['sender_id']?.toString()).whereType<String>(),
+    }.toList();
     final employeeRows = senderIds.isEmpty
         ? <Map<String, dynamic>>[]
         : await supabase
@@ -7395,12 +7432,20 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     };
     return messages.map((row) {
       final employee = employees[row['sender_id']];
+      final reply = messageById[row['reply_to_id']?.toString()];
+      final replyEmployee = reply == null ? null : employees[reply['sender_id']];
       return {
         ...row,
         'sender_name': employee == null
             ? 'موظف'
             : (employee['display_name'] ?? employee['full_name'] ?? employee['username'] ?? 'موظف').toString(),
         'sender_avatar_url': employee?['avatar_url'],
+        'reply_preview_body': reply == null
+            ? null
+            : (reply['deleted_at'] == null ? reply['body']?.toString() : 'تم حذف هذه الرسالة'),
+        'reply_preview_sender': reply == null
+            ? null
+            : (replyEmployee?['display_name'] ?? replyEmployee?['full_name'] ?? replyEmployee?['username'] ?? 'موظف').toString(),
       };
     }).toList();
   }
@@ -7408,8 +7453,13 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   Future<void> sendMessage() async {
     final body = message.text.trim();
     if (body.isEmpty || sendingMessage) return;
+    if (editingMessage != null) {
+      await saveEditedMessage(body);
+      return;
+    }
     setState(() => sendingMessage = true);
     try {
+      final reply = replyingTo;
       final inserted = await supabase
           .from('ansar_chat_messages')
           .insert({
@@ -7417,6 +7467,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
             'sender_id': widget.session.id,
             'body': body,
             'message_type': 'text',
+            if (reply?['id'] != null) 'reply_to_id': '${reply!['id']}',
           })
           .select()
           .single();
@@ -7429,9 +7480,14 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
             ...inserted,
             'sender_name': widget.session.name,
             'sender_avatar_url': widget.session.avatarUrl,
+            'reply_preview_body': reply?['body']?.toString(),
+            'reply_preview_sender': reply == null
+                ? null
+                : (reply['sender_id'] == widget.session.id ? 'أنت' : reply['sender_name']?.toString() ?? 'موظف'),
           },
         ];
         setState(() {
+          replyingTo = null;
           latestMessages = updated;
           future = Future.value(updated);
         });
@@ -7446,7 +7502,36 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
         body: body.length > 80 ? '${body.substring(0, 80)}...' : body,
       ));
     } catch (error) {
-      if (mounted) showSnack(context, cleanError(error));
+      if (mounted) showSnack(context, chatUpgradeError(error));
+    } finally {
+      if (mounted) setState(() => sendingMessage = false);
+    }
+  }
+
+  Future<void> saveEditedMessage(String body) async {
+    final target = editingMessage;
+    if (target == null || sendingMessage) return;
+    setState(() => sendingMessage = true);
+    final editedAt = DateTime.now().toUtc().toIso8601String();
+    try {
+      await supabase.from('ansar_chat_messages').update({
+        'body': body,
+        'edited_at': editedAt,
+        'edited_by': widget.session.id,
+      }).eq('id', target['id']);
+      if (!mounted) return;
+      message.clear();
+      final updated = (latestMessages ?? <Map<String, dynamic>>[])
+          .map((row) => '${row['id']}' == '${target['id']}' ? {...row, 'body': body, 'edited_at': editedAt} : row)
+          .toList();
+      setState(() {
+        editingMessage = null;
+        latestMessages = updated;
+        future = Future.value(updated);
+      });
+      unawaited(touchThread());
+    } catch (error) {
+      if (mounted) showSnack(context, chatUpgradeError(error));
     } finally {
       if (mounted) setState(() => sendingMessage = false);
     }
@@ -7464,14 +7549,188 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
 
   Future<void> deleteMessage(Map<String, dynamic> row) async {
     if (row['sender_id'] != widget.session.id && !widget.session.isAdmin) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('حذف الرسالة لدى الجميع؟'),
+        content: const Text('ستظهر للمشاركين عبارة تفيد بأن الرسالة حُذفت.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('إلغاء')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: dangerColor),
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('حذف لدى الجميع'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final deletedAt = DateTime.now().toUtc().toIso8601String();
     try {
-      await supabase
-          .from('ansar_chat_messages')
-          .update({'deleted_at': DateTime.now().toUtc().toIso8601String()}).eq('id', row['id']);
-      refreshMessages();
+      await supabase.from('ansar_chat_messages').update({
+        'deleted_at': deletedAt,
+        'deleted_by': widget.session.id,
+      }).eq('id', row['id']);
+      if (!mounted) return;
+      final updated = (latestMessages ?? <Map<String, dynamic>>[])
+          .map((item) => '${item['id']}' == '${row['id']}' ? {...item, 'deleted_at': deletedAt} : item)
+          .toList();
+      setState(() {
+        latestMessages = updated;
+        future = Future.value(updated);
+        if ('${editingMessage?['id']}' == '${row['id']}') editingMessage = null;
+        if ('${replyingTo?['id']}' == '${row['id']}') replyingTo = null;
+      });
     } catch (error) {
-      if (mounted) showSnack(context, cleanError(error));
+      if (mounted) showSnack(context, chatUpgradeError(error));
     }
+  }
+
+  void beginReply(Map<String, dynamic> row) {
+    if (row['deleted_at'] != null) return;
+    setState(() {
+      replyingTo = row;
+      editingMessage = null;
+    });
+    composerFocus.requestFocus();
+  }
+
+  void beginEdit(Map<String, dynamic> row) {
+    if (row['sender_id'] != widget.session.id || row['deleted_at'] != null) return;
+    message.text = row['body']?.toString() ?? '';
+    message.selection = TextSelection.collapsed(offset: message.text.length);
+    setState(() {
+      editingMessage = row;
+      replyingTo = null;
+    });
+    composerFocus.requestFocus();
+  }
+
+  void cancelComposerAction() {
+    message.clear();
+    setState(() {
+      replyingTo = null;
+      editingMessage = null;
+    });
+  }
+
+  Future<void> showMessageActions(Map<String, dynamic> row) async {
+    final deleted = row['deleted_at'] != null;
+    final mine = row['sender_id'] == widget.session.id;
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(10, 0, 10, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (!deleted)
+                ListTile(
+                  leading: const Icon(Icons.reply_rounded, color: brandColor),
+                  title: const Text('رد'),
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    beginReply(row);
+                  },
+                ),
+              if (!deleted)
+                ListTile(
+                  leading: const Icon(Icons.forward_rounded, color: infoColor),
+                  title: const Text('تحويل إلى محادثة'),
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    unawaited(forwardMessage(row));
+                  },
+                ),
+              if (!deleted)
+                ListTile(
+                  leading: const Icon(Icons.copy_rounded),
+                  title: const Text('نسخ النص'),
+                  onTap: () {
+                    Clipboard.setData(ClipboardData(text: row['body']?.toString() ?? ''));
+                    Navigator.pop(sheetContext);
+                    showSnack(context, 'تم نسخ الرسالة');
+                  },
+                ),
+              if (mine && !deleted)
+                ListTile(
+                  leading: const Icon(Icons.edit_rounded, color: accentColor),
+                  title: const Text('تعديل الرسالة'),
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    beginEdit(row);
+                  },
+                ),
+              if ((mine || widget.session.isAdmin) && !deleted)
+                ListTile(
+                  leading: const Icon(Icons.delete_outline_rounded, color: dangerColor),
+                  title: const Text('حذف لدى الجميع', style: TextStyle(color: dangerColor)),
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    unawaited(deleteMessage(row));
+                  },
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> forwardMessage(Map<String, dynamic> row) async {
+    final count = await Navigator.of(context).push<int>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: ForwardMessagePage(session: widget.session, sourceMessage: row),
+        ),
+      ),
+    );
+    if (mounted && count != null) showSnack(context, 'تم تحويل الرسالة إلى $count محادثة');
+  }
+
+  Future<void> openSenderChat(Map<String, dynamic> row) async {
+    final senderId = row['sender_id']?.toString();
+    if (senderId == null || senderId == widget.session.id) return;
+    final employee = EmployeeLite(
+      id: senderId,
+      name: row['sender_name']?.toString() ?? 'موظف',
+      username: '',
+      branchNum: 0,
+      role: 'employee',
+      isActive: true,
+      avatarUrl: row['sender_avatar_url']?.toString(),
+    );
+    await openOrCreateDirectChat(context, widget.session, employee);
+  }
+
+  Future<void> openThreadInfo() async {
+    final result = await Navigator.of(context).push<ChatInfoResult>(
+      MaterialPageRoute(
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: ChatInfoPage(session: widget.session, thread: widget.thread),
+        ),
+      ),
+    );
+    if (!mounted || result == null) return;
+    if (result.leftThread) {
+      Navigator.pop(context);
+      return;
+    }
+    if (result.title != null) setState(() => widget.thread['title'] = result.title);
+  }
+
+  void scrollToReply(String? messageId) {
+    if (messageId == null) return;
+    final targetContext = messageKeys[messageId]?.currentContext;
+    if (targetContext == null) {
+      showSnack(context, 'الرسالة الأصلية أقدم من الرسائل المعروضة');
+      return;
+    }
+    Scrollable.ensureVisible(targetContext, duration: const Duration(milliseconds: 280), alignment: 0.35);
   }
 
   @override
@@ -7479,39 +7738,52 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     return Scaffold(
       backgroundColor: const Color(0xffeef3f1),
       appBar: AppBar(
-        title: Row(
-          children: [
-            CircleAvatar(
-              radius: 17,
-              backgroundColor: accentColor.withValues(alpha: 0.12),
-              child: Icon(
-                widget.thread['thread_type'] == 'general' ? Icons.campaign_rounded : Icons.forum_rounded,
-                color: widget.thread['thread_type'] == 'general' ? accentColor : brandColor,
-                size: 19,
+        title: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: openThreadInfo,
+          child: Row(
+            children: [
+              CircleAvatar(
+                radius: 17,
+                backgroundColor: accentColor.withValues(alpha: 0.12),
+                child: widget.thread['thread_type'] == 'direct'
+                    ? EmployeeAvatar(
+                        name: widget.thread['thread_avatar_name']?.toString() ?? widget.thread['title']?.toString() ?? 'محادثة',
+                        imageUrl: widget.thread['thread_avatar_url']?.toString(),
+                        radius: 17,
+                      )
+                    : Icon(
+                        widget.thread['thread_type'] == 'general' ? Icons.campaign_rounded : Icons.forum_rounded,
+                        color: widget.thread['thread_type'] == 'general' ? accentColor : brandColor,
+                        size: 19,
+                      ),
               ),
-            ),
-            const SizedBox(width: 9),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    widget.thread['title'] as String? ?? 'محادثة',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900),
-                  ),
-                  Text(
-                    widget.thread['thread_type'] == 'group'
-                        ? '${(widget.thread['participant_ids'] as List?)?.length ?? 0} أعضاء'
-                        : chatTypeLabel(widget.thread['thread_type'] as String? ?? 'general'),
-                    style: const TextStyle(color: mutedInk, fontSize: 10, fontWeight: FontWeight.w500),
-                  ),
-                ],
+              const SizedBox(width: 9),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      widget.thread['title'] as String? ?? 'محادثة',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900),
+                    ),
+                    Text(
+                      widget.thread['thread_type'] == 'group'
+                          ? '${(widget.thread['participant_ids'] as List?)?.length ?? 0} أعضاء'
+                          : chatTypeLabel(widget.thread['thread_type'] as String? ?? 'general'),
+                      style: const TextStyle(color: mutedInk, fontSize: 10, fontWeight: FontWeight.w500),
+                    ),
+                  ],
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
+        actions: [
+          IconButton(tooltip: 'معلومات المحادثة', onPressed: openThreadInfo, icon: const Icon(Icons.info_outline_rounded)),
+        ],
       ),
       body: Column(
         children: [
@@ -7552,14 +7824,21 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                             previousSender != row['sender_id'] ||
                             previousDate == null ||
                             !sameCalendarDay(previousDate, currentDate);
-                        return ChatMessageBubble(
-                          row: row,
-                          mine: mine,
-                          senderName: mine ? 'أنت' : row['sender_name'] as String? ?? 'موظف',
-                          avatarUrl: mine ? widget.session.avatarUrl : row['sender_avatar_url'] as String?,
-                          showDate: previousDate == null || !sameCalendarDay(previousDate, currentDate),
-                          showIdentity: !mine && startsSenderGroup,
-                          onLongPress: () => deleteMessage(row),
+                        final messageId = '${row['id']}';
+                        final itemKey = messageKeys.putIfAbsent(messageId, () => GlobalKey());
+                        return KeyedSubtree(
+                          key: itemKey,
+                          child: ChatMessageBubble(
+                            row: row,
+                            mine: mine,
+                            senderName: mine ? 'أنت' : row['sender_name'] as String? ?? 'موظف',
+                            avatarUrl: mine ? widget.session.avatarUrl : row['sender_avatar_url'] as String?,
+                            showDate: previousDate == null || !sameCalendarDay(previousDate, currentDate),
+                            showIdentity: !mine && startsSenderGroup,
+                            onLongPress: row['deleted_at'] == null ? () => showMessageActions(row) : null,
+                            onAvatarTap: mine ? null : () => openSenderChat(row),
+                            onReplyTap: () => scrollToReply(row['reply_to_id']?.toString()),
+                          ),
                         );
                       },
                     ),
@@ -7608,51 +7887,70 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                 color: panelSurface,
                 boxShadow: [BoxShadow(color: Color(0x16000000), blurRadius: 10, offset: Offset(0, -2))],
               ),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Expanded(
-                    child: Container(
-                      decoration: BoxDecoration(
-                        color: softSurface,
-                        borderRadius: BorderRadius.circular(24),
-                        border: Border.all(color: borderColor),
-                      ),
-                      child: TextField(
-                        controller: message,
-                        minLines: 1,
-                        maxLines: 5,
-                        textInputAction: TextInputAction.newline,
-                        decoration: const InputDecoration(
-                          hintText: 'اكتب رسالة',
-                          border: InputBorder.none,
-                          enabledBorder: InputBorder.none,
-                          focusedBorder: InputBorder.none,
-                          contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+                  if (replyingTo != null || editingMessage != null) ...[
+                    ChatComposerContextBar(
+                      editing: editingMessage != null,
+                      senderName: editingMessage != null
+                          ? 'تعديل رسالتك'
+                          : (replyingTo?['sender_id'] == widget.session.id
+                              ? 'الرد على نفسك'
+                              : 'الرد على ${replyingTo?['sender_name'] ?? 'موظف'}'),
+                      body: (editingMessage ?? replyingTo)?['body']?.toString() ?? '',
+                      onClose: cancelComposerAction,
+                    ),
+                    const SizedBox(height: 8),
+                  ],
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Expanded(
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: softSurface,
+                            borderRadius: BorderRadius.circular(24),
+                            border: Border.all(color: borderColor),
+                          ),
+                          child: TextField(
+                            controller: message,
+                            focusNode: composerFocus,
+                            minLines: 1,
+                            maxLines: 5,
+                            textInputAction: TextInputAction.newline,
+                            decoration: InputDecoration(
+                              hintText: editingMessage != null ? 'عدّل الرسالة' : 'اكتب رسالة',
+                              border: InputBorder.none,
+                              enabledBorder: InputBorder.none,
+                              focusedBorder: InputBorder.none,
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+                            ),
+                            onTap: () {
+                              unawaited(Future<void>.delayed(const Duration(milliseconds: 260), () {
+                                if (mounted) scrollToMessageBottom();
+                              }));
+                            },
+                          ),
                         ),
-                        onTap: () {
-                          unawaited(Future<void>.delayed(const Duration(milliseconds: 260), () {
-                            if (mounted) scrollToMessageBottom();
-                          }));
-                        },
                       ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  SizedBox(
-                    width: 48,
-                    height: 48,
-                    child: IconButton.filled(
-                      tooltip: 'إرسال',
-                      onPressed: sendingMessage ? null : sendMessage,
-                      icon: sendingMessage
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                            )
-                          : const Icon(Icons.send_rounded),
-                    ),
+                      const SizedBox(width: 8),
+                      SizedBox(
+                        width: 48,
+                        height: 48,
+                        child: IconButton.filled(
+                          tooltip: editingMessage != null ? 'حفظ التعديل' : 'إرسال',
+                          onPressed: sendingMessage ? null : sendMessage,
+                          icon: sendingMessage
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                                )
+                              : Icon(editingMessage != null ? Icons.check_rounded : Icons.send_rounded),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -7674,6 +7972,8 @@ class ChatMessageBubble extends StatelessWidget {
     required this.showDate,
     required this.showIdentity,
     required this.onLongPress,
+    this.onAvatarTap,
+    this.onReplyTap,
   });
 
   final Map<String, dynamic> row;
@@ -7682,11 +7982,17 @@ class ChatMessageBubble extends StatelessWidget {
   final String? avatarUrl;
   final bool showDate;
   final bool showIdentity;
-  final VoidCallback onLongPress;
+  final VoidCallback? onLongPress;
+  final VoidCallback? onAvatarTap;
+  final VoidCallback? onReplyTap;
 
   @override
   Widget build(BuildContext context) {
     final created = parseChatDate(row['created_at']);
+    final deleted = row['deleted_at'] != null;
+    final forwarded = row['forwarded_from_id'] != null || row['message_type'] == 'forwarded';
+    final edited = row['edited_at'] != null;
+    final replyBody = row['reply_preview_body']?.toString();
     return Column(
       children: [
         if (showDate) ...[
@@ -7716,7 +8022,10 @@ class ChatMessageBubble extends StatelessWidget {
                   SizedBox(
                     width: 32,
                     child: showIdentity
-                        ? EmployeeAvatar(name: senderName, imageUrl: avatarUrl, radius: 16)
+                        ? GestureDetector(
+                            onTap: onAvatarTap,
+                            child: EmployeeAvatar(name: senderName, imageUrl: avatarUrl, radius: 16),
+                          )
                         : const SizedBox(width: 32),
                   ),
                   const SizedBox(width: 7),
@@ -7745,24 +8054,64 @@ class ChatMessageBubble extends StatelessWidget {
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
+                                if (forwarded && !deleted) ...[
+                                  const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.forward_rounded, size: 13, color: mutedInk),
+                                      SizedBox(width: 3),
+                                      Text('تم التحويل', style: TextStyle(fontSize: 9, color: mutedInk, fontStyle: FontStyle.italic)),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 4),
+                                ],
                                 if (showIdentity) ...[
-                                  Text(
-                                    senderName,
-                                    style: const TextStyle(
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.w900,
-                                      color: infoColor,
+                                  GestureDetector(
+                                    onTap: onAvatarTap,
+                                    child: Text(
+                                      senderName,
+                                      style: const TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w900,
+                                        color: infoColor,
+                                      ),
                                     ),
                                   ),
                                   const SizedBox(height: 3),
                                 ],
-                                Text(row['body']?.toString() ?? '', style: const TextStyle(height: 1.45)),
+                                if (row['reply_to_id'] != null)
+                                  ChatReplyPreview(
+                                    senderName: row['reply_preview_sender']?.toString() ?? 'رسالة',
+                                    body: replyBody ?? 'الرسالة الأصلية غير معروضة',
+                                    onTap: onReplyTap,
+                                  ),
+                                if (row['reply_to_id'] != null) const SizedBox(height: 6),
+                                if (deleted)
+                                  const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.block_rounded, size: 16, color: mutedInk),
+                                      SizedBox(width: 6),
+                                      Flexible(
+                                        child: Text(
+                                          'تم حذف هذه الرسالة',
+                                          style: TextStyle(height: 1.45, color: mutedInk, fontStyle: FontStyle.italic),
+                                        ),
+                                      ),
+                                    ],
+                                  )
+                                else
+                                  Text(row['body']?.toString() ?? '', style: const TextStyle(height: 1.45)),
                                 const SizedBox(height: 5),
                                 Align(
                                   alignment: Alignment.centerLeft,
                                   child: Row(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
+                                      if (edited && !deleted) ...[
+                                        const Text('معدّلة', style: TextStyle(fontSize: 8, color: mutedInk)),
+                                        const SizedBox(width: 4),
+                                      ],
                                       Text(formatTime(created), style: const TextStyle(fontSize: 9, color: mutedInk)),
                                       if (mine) ...[
                                         const SizedBox(width: 3),
@@ -7785,6 +8134,96 @@ class ChatMessageBubble extends StatelessWidget {
         ),
         const SizedBox(height: 7),
       ],
+    );
+  }
+}
+
+class ChatReplyPreview extends StatelessWidget {
+  const ChatReplyPreview({
+    super.key,
+    required this.senderName,
+    required this.body,
+    this.onTap,
+  });
+
+  final String senderName;
+  final String body;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: brandColor.withValues(alpha: 0.07),
+      borderRadius: BorderRadius.circular(6),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.fromLTRB(9, 7, 10, 7),
+          decoration: const BoxDecoration(
+            border: Border(right: BorderSide(color: brandColor, width: 3)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(senderName, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: brandColor, fontSize: 10, fontWeight: FontWeight.w900)),
+              const SizedBox(height: 2),
+              Text(body, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(color: mutedInk, fontSize: 10, height: 1.35)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ChatComposerContextBar extends StatelessWidget {
+  const ChatComposerContextBar({
+    super.key,
+    required this.editing,
+    required this.senderName,
+    required this.body,
+    required this.onClose,
+  });
+
+  final bool editing;
+  final String senderName;
+  final String body;
+  final VoidCallback onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(8, 7, 11, 7),
+      decoration: BoxDecoration(
+        color: softSurface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: borderColor),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 3,
+            height: 36,
+            decoration: BoxDecoration(color: editing ? accentColor : brandColor, borderRadius: BorderRadius.circular(3)),
+          ),
+          const SizedBox(width: 9),
+          Icon(editing ? Icons.edit_rounded : Icons.reply_rounded, size: 18, color: editing ? accentColor : brandColor),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(senderName, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(color: editing ? accentColor : brandColor, fontSize: 11, fontWeight: FontWeight.w900)),
+                Text(body, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: mutedInk, fontSize: 10)),
+              ],
+            ),
+          ),
+          IconButton(tooltip: 'إلغاء', onPressed: onClose, icon: const Icon(Icons.close_rounded, size: 19)),
+        ],
+      ),
     );
   }
 }
@@ -8047,6 +8486,701 @@ class ChatModeButton extends StatelessWidget {
                 ),
               ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+String employeeDisplayName(Map<String, dynamic> row) {
+  return (row['display_name'] ?? row['full_name'] ?? row['username'] ?? 'موظف').toString();
+}
+
+Future<List<Map<String, dynamic>>> loadVisibleChatThreads(EmployeeSession session) async {
+  final threadRows = await supabase
+      .from('ansar_chat_threads')
+      .select()
+      .eq('is_active', true)
+      .order('updated_at', ascending: false);
+  final joinedRows = await supabase
+      .from('ansar_chat_participants')
+      .select('thread_id')
+      .eq('employee_id', session.id);
+  final joinedIds = joinedRows.map((row) => row['thread_id']?.toString()).whereType<String>().toSet();
+  return threadRows.cast<Map<String, dynamic>>().where((thread) {
+    if (thread['thread_type'] == 'general') return true;
+    return joinedIds.contains(thread['id']?.toString());
+  }).toList();
+}
+
+Future<void> openOrCreateDirectChat(
+  BuildContext context,
+  EmployeeSession session,
+  EmployeeLite employee,
+) async {
+  if (employee.id == session.id) return;
+  try {
+    final matchingRows = await supabase
+        .from('ansar_chat_participants')
+        .select('thread_id, employee_id')
+        .inFilter('employee_id', [session.id, employee.id]);
+    final candidateIds = <String, Set<String>>{};
+    for (final row in matchingRows) {
+      final threadId = row['thread_id']?.toString();
+      final employeeId = row['employee_id']?.toString();
+      if (threadId != null && employeeId != null) {
+        candidateIds.putIfAbsent(threadId, () => <String>{}).add(employeeId);
+      }
+    }
+    final candidates = candidateIds.entries
+        .where((entry) => entry.value.contains(session.id) && entry.value.contains(employee.id))
+        .map((entry) => entry.key)
+        .toList();
+    Map<String, dynamic>? directThread;
+    if (candidates.isNotEmpty) {
+      final fullParticipants = await supabase
+          .from('ansar_chat_participants')
+          .select('thread_id, employee_id')
+          .inFilter('thread_id', candidates);
+      final allByThread = <String, Set<String>>{};
+      for (final row in fullParticipants) {
+        final threadId = row['thread_id']?.toString();
+        final employeeId = row['employee_id']?.toString();
+        if (threadId != null && employeeId != null) {
+          allByThread.putIfAbsent(threadId, () => <String>{}).add(employeeId);
+        }
+      }
+      final exactIds = allByThread.entries
+          .where((entry) => entry.value.length == 2 && entry.value.contains(session.id) && entry.value.contains(employee.id))
+          .map((entry) => entry.key)
+          .toList();
+      if (exactIds.isNotEmpty) {
+        final rows = await supabase
+            .from('ansar_chat_threads')
+            .select()
+            .inFilter('id', exactIds)
+            .eq('thread_type', 'direct')
+            .eq('is_active', true)
+            .limit(1);
+        if (rows.isNotEmpty) directThread = Map<String, dynamic>.from(rows.first);
+      }
+    }
+
+    if (directThread == null) {
+      final inserted = await supabase.from('ansar_chat_threads').insert({
+        'title': employee.name,
+        'thread_type': 'direct',
+        'created_by': session.id,
+      }).select().single();
+      await supabase.from('ansar_chat_participants').insert([
+        {'thread_id': inserted['id'], 'employee_id': session.id, 'role': 'admin'},
+        {'thread_id': inserted['id'], 'employee_id': employee.id, 'role': 'member'},
+      ]);
+      directThread = Map<String, dynamic>.from(inserted);
+    }
+
+    directThread['participant_ids'] = [session.id, employee.id];
+    directThread['thread_avatar_url'] = employee.avatarUrl;
+    directThread['thread_avatar_name'] = employee.name;
+    if (!context.mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: ChatThreadPage(session: session, thread: directThread!),
+        ),
+      ),
+    );
+  } catch (error) {
+    if (context.mounted) showSnack(context, cleanError(error));
+  }
+}
+
+class ForwardMessagePage extends StatefulWidget {
+  const ForwardMessagePage({super.key, required this.session, required this.sourceMessage});
+
+  final EmployeeSession session;
+  final Map<String, dynamic> sourceMessage;
+
+  @override
+  State<ForwardMessagePage> createState() => _ForwardMessagePageState();
+}
+
+class _ForwardMessagePageState extends State<ForwardMessagePage> {
+  final search = TextEditingController();
+  final selected = <String>{};
+  late final Future<List<Map<String, dynamic>>> future;
+  bool sending = false;
+
+  @override
+  void initState() {
+    super.initState();
+    future = loadVisibleChatThreads(widget.session);
+  }
+
+  @override
+  void dispose() {
+    search.dispose();
+    super.dispose();
+  }
+
+  Future<void> submit() async {
+    if (selected.isEmpty || sending) return;
+    setState(() => sending = true);
+    try {
+      final body = widget.sourceMessage['body']?.toString() ?? '';
+      await supabase.from('ansar_chat_messages').insert(
+            selected
+                .map((threadId) => {
+                      'thread_id': threadId,
+                      'sender_id': widget.session.id,
+                      'body': body,
+                      'message_type': 'forwarded',
+                      'forwarded_from_id': '${widget.sourceMessage['id']}',
+                    })
+                .toList(),
+          );
+      final now = DateTime.now().toUtc().toIso8601String();
+      final threads = await loadVisibleChatThreads(widget.session);
+      for (final threadId in selected) {
+        unawaited(supabase.from('ansar_chat_threads').update({'updated_at': now}).eq('id', threadId));
+        Map<String, dynamic>? thread;
+        for (final item in threads) {
+          if ('${item['id']}' == threadId) {
+            thread = item;
+            break;
+          }
+        }
+        if (thread != null) {
+          unawaited(enqueueChatNotification(thread: thread, sender: widget.session, body: body));
+        }
+      }
+      if (mounted) Navigator.pop(context, selected.length);
+    } catch (error) {
+      if (mounted) showSnack(context, chatUpgradeError(error));
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('تحويل الرسالة')),
+      body: FutureBuilder<List<Map<String, dynamic>>>(
+        future: future,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) return const Center(child: CircularProgressIndicator());
+          if (snapshot.hasError) return ErrorState(message: cleanError(snapshot.error), onRetry: () {});
+          final query = normalizeSearch(search.text);
+          final threads = snapshot.data!
+              .where((thread) => query.isEmpty || normalizeSearch(thread['title']?.toString() ?? '').contains(query))
+              .toList();
+          return Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(14),
+                child: TextField(
+                  controller: search,
+                  onChanged: (_) => setState(() {}),
+                  decoration: const InputDecoration(hintText: 'ابحث عن محادثة', prefixIcon: Icon(Icons.search_rounded)),
+                ),
+              ),
+              Expanded(
+                child: ListView.separated(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 100),
+                  itemCount: threads.length,
+                  separatorBuilder: (_, __) => const Divider(indent: 64),
+                  itemBuilder: (context, index) {
+                    final thread = threads[index];
+                    final id = '${thread['id']}';
+                    final active = selected.contains(id);
+                    return ListTile(
+                      onTap: () => setState(() => active ? selected.remove(id) : selected.add(id)),
+                      leading: CircleAvatar(
+                        backgroundColor: successSurface,
+                        child: Icon(thread['thread_type'] == 'group' ? Icons.groups_rounded : Icons.chat_rounded, color: brandColor),
+                      ),
+                      title: Text(thread['title']?.toString() ?? 'محادثة', style: const TextStyle(fontWeight: FontWeight.w800)),
+                      subtitle: Text(chatTypeLabel(thread['thread_type']?.toString() ?? 'general')),
+                      trailing: Icon(active ? Icons.check_circle_rounded : Icons.circle_outlined, color: active ? brandColor : mutedInk),
+                    );
+                  },
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: FilledButton.icon(
+            onPressed: selected.isEmpty || sending ? null : submit,
+            icon: sending
+                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : const Icon(Icons.forward_rounded),
+            label: Text(selected.isEmpty ? 'اختر محادثة' : 'تحويل إلى ${selected.length}'),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ChatInfoResult {
+  const ChatInfoResult({this.title, this.leftThread = false});
+
+  final String? title;
+  final bool leftThread;
+}
+
+class ChatInfoPage extends StatefulWidget {
+  const ChatInfoPage({super.key, required this.session, required this.thread});
+
+  final EmployeeSession session;
+  final Map<String, dynamic> thread;
+
+  @override
+  State<ChatInfoPage> createState() => _ChatInfoPageState();
+}
+
+class _ChatInfoPageState extends State<ChatInfoPage> {
+  late Future<List<Map<String, dynamic>>> future;
+  late String currentTitle;
+  late String currentDescription;
+
+  String get threadId => '${widget.thread['id']}';
+  String get threadType => widget.thread['thread_type']?.toString() ?? 'general';
+  bool get isGroup => threadType == 'group';
+
+  @override
+  void initState() {
+    super.initState();
+    currentTitle = widget.thread['title']?.toString() ?? 'محادثة';
+    currentDescription = widget.thread['description']?.toString() ?? '';
+    future = loadParticipants();
+  }
+
+  Future<List<Map<String, dynamic>>> loadParticipants() async {
+    final rows = await supabase
+        .from('ansar_chat_participants')
+        .select()
+        .eq('thread_id', threadId);
+    final participantRows = rows.cast<Map<String, dynamic>>().toList();
+    if (threadType == 'general' && !participantRows.any((row) => '${row['employee_id']}' == widget.session.id)) {
+      try {
+        await supabase.from('ansar_chat_participants').upsert({
+          'thread_id': threadId,
+          'employee_id': widget.session.id,
+          'role': 'member',
+        }, onConflict: 'thread_id,employee_id');
+        participantRows.add({
+          'thread_id': threadId,
+          'employee_id': widget.session.id,
+          'role': 'member',
+          'is_muted': false,
+        });
+      } catch (_) {
+        // Older installations may not register general-chat participants yet.
+      }
+    }
+    final ids = participantRows.map((row) => row['employee_id']?.toString()).whereType<String>().toList();
+    final employeeRows = ids.isEmpty
+        ? <Map<String, dynamic>>[]
+        : await supabase
+            .from('ansar_employees')
+            .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url')
+            .inFilter('id', ids);
+    final employees = {
+      for (final row in employeeRows.cast<Map<String, dynamic>>()) '${row['id']}': row,
+    };
+    return participantRows.map((participant) {
+      final employee = employees['${participant['employee_id']}'];
+      return {
+        ...participant,
+        if (employee != null) ...employee,
+        'participant_role': participant['role']?.toString() ?? 'member',
+      };
+    }).toList()
+      ..sort((a, b) {
+        final aAdmin = a['participant_role'] == 'admin' ? 0 : 1;
+        final bAdmin = b['participant_role'] == 'admin' ? 0 : 1;
+        if (aAdmin != bAdmin) return aAdmin.compareTo(bAdmin);
+        return employeeDisplayName(a).compareTo(employeeDisplayName(b));
+      });
+  }
+
+  Map<String, dynamic>? currentParticipant(List<Map<String, dynamic>> participants) {
+    for (final participant in participants) {
+      if ('${participant['employee_id']}' == widget.session.id) return participant;
+    }
+    return null;
+  }
+
+  bool canManage(List<Map<String, dynamic>> participants) {
+    final participant = currentParticipant(participants);
+    return widget.session.isAdmin ||
+        widget.thread['created_by'] == widget.session.id ||
+        participant?['participant_role'] == 'admin';
+  }
+
+  void reload() {
+    if (mounted) setState(() => future = loadParticipants());
+  }
+
+  Future<void> editTitle() async {
+    final controller = TextEditingController(text: currentTitle);
+    final value = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('اسم المجموعة'),
+        content: TextField(controller: controller, autofocus: true, maxLength: 80),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text.trim()), child: const Text('حفظ')),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (value == null || value.isEmpty || !mounted) return;
+    try {
+      await supabase.from('ansar_chat_threads').update({'title': value}).eq('id', threadId);
+      setState(() => currentTitle = value);
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    }
+  }
+
+  Future<void> editDescription() async {
+    final controller = TextEditingController(text: currentDescription);
+    final value = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('وصف المجموعة'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 180,
+          minLines: 2,
+          maxLines: 4,
+          decoration: const InputDecoration(hintText: 'اكتب وصفاً مختصراً للمجموعة'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text.trim()), child: const Text('حفظ')),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (value == null || !mounted) return;
+    try {
+      await supabase.from('ansar_chat_threads').update({'description': value}).eq('id', threadId);
+      setState(() => currentDescription = value);
+    } catch (error) {
+      if (mounted) showSnack(context, chatUpgradeError(error));
+    }
+  }
+
+  Future<void> toggleMute(Map<String, dynamic>? participant, bool value) async {
+    if (participant == null) return;
+    try {
+      await supabase
+          .from('ansar_chat_participants')
+          .update({'is_muted': value})
+          .eq('thread_id', threadId)
+          .eq('employee_id', widget.session.id);
+      reload();
+    } catch (error) {
+      if (mounted) showSnack(context, chatUpgradeError(error));
+    }
+  }
+
+  Future<void> addMembers(List<Map<String, dynamic>> participants) async {
+    final existingIds = participants.map((row) => '${row['employee_id']}').toSet();
+    final employees = (await loadAllActiveEmployees()).where((employee) => !existingIds.contains(employee.id)).toList();
+    if (!mounted) return;
+    final selected = await Navigator.of(context).push<List<EmployeeLite>>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: SelectChatMembersPage(title: 'إضافة أعضاء', employees: employees),
+        ),
+      ),
+    );
+    if (selected == null || selected.isEmpty) return;
+    try {
+      await supabase.from('ansar_chat_participants').insert(
+            selected
+                .map((employee) => {'thread_id': threadId, 'employee_id': employee.id, 'role': 'member'})
+                .toList(),
+          );
+      final ids = (widget.thread['participant_ids'] as List?)?.map((value) => '$value').toSet() ?? <String>{};
+      ids.addAll(selected.map((employee) => employee.id));
+      widget.thread['participant_ids'] = ids.toList();
+      reload();
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    }
+  }
+
+  Future<void> removeMember(Map<String, dynamic> participant) async {
+    final name = employeeDisplayName(participant);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('إزالة $name؟'),
+        content: const Text('لن يتمكن الموظف من فتح هذه المجموعة بعد إزالته.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('إزالة')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await supabase
+        .from('ansar_chat_participants')
+        .delete()
+        .eq('thread_id', threadId)
+        .eq('employee_id', participant['employee_id']);
+    final ids = (widget.thread['participant_ids'] as List?)?.map((value) => '$value').toSet() ?? <String>{};
+    ids.remove('${participant['employee_id']}');
+    widget.thread['participant_ids'] = ids.toList();
+    reload();
+  }
+
+  Future<void> leaveThread() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('مغادرة المحادثة؟'),
+        content: const Text('لن تظهر لك الرسائل الجديدة بعد المغادرة.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('إلغاء')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: dangerColor),
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('مغادرة'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await supabase
+        .from('ansar_chat_participants')
+        .delete()
+        .eq('thread_id', threadId)
+        .eq('employee_id', widget.session.id);
+    if (mounted) Navigator.pop(context, const ChatInfoResult(leftThread: true));
+  }
+
+  Future<void> openMember(Map<String, dynamic> row) async {
+    final employee = EmployeeLite.fromRow({...row, 'id': row['employee_id']});
+    await openOrCreateDirectChat(context, widget.session, employee);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('معلومات المحادثة'),
+        leading: IconButton(
+          tooltip: 'رجوع',
+          onPressed: () => Navigator.pop(context, ChatInfoResult(title: currentTitle)),
+          icon: const Icon(Icons.arrow_back_rounded),
+        ),
+      ),
+      body: FutureBuilder<List<Map<String, dynamic>>>(
+        future: future,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done && !snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snapshot.hasError && !snapshot.hasData) {
+            return ErrorState(message: chatUpgradeError(snapshot.error), onRetry: reload);
+          }
+          final participants = snapshot.data ?? <Map<String, dynamic>>[];
+          final mine = currentParticipant(participants);
+          final manager = canManage(participants);
+          return ListView(
+            padding: const EdgeInsets.fromLTRB(16, 18, 16, 32),
+            children: [
+              Center(
+                child: threadType == 'direct'
+                    ? EmployeeAvatar(
+                        name: widget.thread['thread_avatar_name']?.toString() ?? currentTitle,
+                        imageUrl: widget.thread['thread_avatar_url']?.toString(),
+                        radius: 44,
+                      )
+                    : Container(
+                        width: 88,
+                        height: 88,
+                        decoration: BoxDecoration(color: successSurface, shape: BoxShape.circle, border: Border.all(color: borderColor)),
+                        child: Icon(isGroup ? Icons.groups_rounded : Icons.forum_rounded, color: brandColor, size: 42),
+                      ),
+              ),
+              const SizedBox(height: 12),
+              Text(currentTitle, textAlign: TextAlign.center, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900)),
+              Text(chatTypeLabel(threadType), textAlign: TextAlign.center, style: const TextStyle(color: mutedInk)),
+              if (currentDescription.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 7),
+                  child: Text(currentDescription, textAlign: TextAlign.center, style: const TextStyle(color: mutedInk, height: 1.45)),
+                ),
+              const SizedBox(height: 18),
+              Card(
+                child: Column(
+                  children: [
+                    SwitchListTile(
+                      value: mine?['is_muted'] == true,
+                      onChanged: mine == null ? null : (value) => toggleMute(mine, value),
+                      secondary: const Icon(Icons.notifications_off_outlined),
+                      title: const Text('كتم الإشعارات'),
+                      subtitle: const Text('إيقاف إشعارات هذه المحادثة فقط'),
+                    ),
+                    if (isGroup && manager) ...[
+                      const Divider(),
+                      ListTile(
+                        onTap: editTitle,
+                        leading: const Icon(Icons.edit_rounded, color: brandColor),
+                        title: const Text('تعديل اسم المجموعة'),
+                        trailing: const Icon(Icons.chevron_left_rounded),
+                      ),
+                      const Divider(),
+                      ListTile(
+                        onTap: editDescription,
+                        leading: const Icon(Icons.subject_rounded, color: brandColor),
+                        title: const Text('وصف المجموعة'),
+                        subtitle: Text(currentDescription.isEmpty ? 'أضف وصفاً للمجموعة' : currentDescription, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        trailing: const Icon(Icons.chevron_left_rounded),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(height: 14),
+              SectionHeader(
+                title: 'الأعضاء (${participants.length})',
+                action: isGroup && manager
+                    ? IconButton.filledTonal(tooltip: 'إضافة أعضاء', onPressed: () => addMembers(participants), icon: const Icon(Icons.person_add_alt_1_rounded))
+                    : null,
+              ),
+              Container(
+                clipBehavior: Clip.antiAlias,
+                decoration: BoxDecoration(color: panelSurface, borderRadius: BorderRadius.circular(8), border: Border.all(color: borderColor)),
+                child: Column(
+                  children: [
+                    for (var index = 0; index < participants.length; index++) ...[
+                      Builder(builder: (context) {
+                        final participant = participants[index];
+                        final isMe = '${participant['employee_id']}' == widget.session.id;
+                        return ListTile(
+                          onTap: isMe ? null : () => openMember(participant),
+                          leading: EmployeeAvatar(
+                            name: employeeDisplayName(participant),
+                            imageUrl: participant['avatar_url']?.toString(),
+                            radius: 22,
+                          ),
+                          title: Text(isMe ? '${employeeDisplayName(participant)} (أنت)' : employeeDisplayName(participant), style: const TextStyle(fontWeight: FontWeight.w800)),
+                          subtitle: Text(participant['participant_role'] == 'admin' ? 'مشرف المجموعة' : '@${participant['username'] ?? ''}'),
+                          trailing: isGroup && manager && !isMe
+                              ? IconButton(tooltip: 'إزالة من المجموعة', onPressed: () => removeMember(participant), icon: const Icon(Icons.person_remove_outlined, color: dangerColor))
+                              : (!isMe ? const Icon(Icons.chat_bubble_outline_rounded, color: brandColor) : null),
+                        );
+                      }),
+                      if (index != participants.length - 1) const Divider(indent: 64),
+                    ],
+                  ],
+                ),
+              ),
+              if (threadType != 'general') ...[
+                const SizedBox(height: 20),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(foregroundColor: dangerColor),
+                  onPressed: leaveThread,
+                  icon: const Icon(Icons.logout_rounded),
+                  label: const Text('مغادرة المحادثة'),
+                ),
+              ],
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class SelectChatMembersPage extends StatefulWidget {
+  const SelectChatMembersPage({super.key, required this.title, required this.employees});
+
+  final String title;
+  final List<EmployeeLite> employees;
+
+  @override
+  State<SelectChatMembersPage> createState() => _SelectChatMembersPageState();
+}
+
+class _SelectChatMembersPageState extends State<SelectChatMembersPage> {
+  final search = TextEditingController();
+  final selected = <String>{};
+
+  @override
+  void dispose() {
+    search.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final query = normalizeSearch(search.text);
+    final employees = widget.employees
+        .where((employee) => query.isEmpty || normalizeSearch('${employee.name} ${employee.username}').contains(query))
+        .toList();
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.title)),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(14),
+            child: TextField(
+              controller: search,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(hintText: 'ابحث عن موظف', prefixIcon: Icon(Icons.search_rounded)),
+            ),
+          ),
+          Expanded(
+            child: ListView.separated(
+              itemCount: employees.length,
+              separatorBuilder: (_, __) => const Divider(indent: 66),
+              itemBuilder: (context, index) {
+                final employee = employees[index];
+                final active = selected.contains(employee.id);
+                return ListTile(
+                  onTap: () => setState(() => active ? selected.remove(employee.id) : selected.add(employee.id)),
+                  leading: EmployeeAvatar(name: employee.name, imageUrl: employee.avatarUrl, radius: 23),
+                  title: Text(employee.name, style: const TextStyle(fontWeight: FontWeight.w800)),
+                  subtitle: Text('@${employee.username} · فرع رقم ${employee.branchNum}'),
+                  trailing: Icon(active ? Icons.check_circle_rounded : Icons.circle_outlined, color: active ? brandColor : mutedInk),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: FilledButton.icon(
+            onPressed: selected.isEmpty
+                ? null
+                : () => Navigator.pop(
+                      context,
+                      widget.employees.where((employee) => selected.contains(employee.id)).toList(),
+                    ),
+            icon: const Icon(Icons.person_add_alt_1_rounded),
+            label: Text(selected.isEmpty ? 'اختر أعضاء' : 'إضافة ${selected.length}'),
           ),
         ),
       ),
@@ -8762,8 +9896,112 @@ Future<List<Map<String, dynamic>>> searchProductsLikeLegacy(
   String query, {
   required int limit,
 }) async {
+  final readyProducts = cachedProducts;
+  if (readyProducts != null) {
+    return rankProductRows(
+      readyProducts,
+      query,
+      cachedBarcodes ?? const <int, String>{},
+      limit: limit,
+    );
+  }
+
+  try {
+    final direct = await searchProductsDirect(query, limit: limit);
+    if (direct.isNotEmpty) return direct;
+  } catch (_) {
+    // Fall through to the complete local index when the direct request is unavailable.
+  }
+
   final products = await loadAllProductsCached();
-  final barcodes = await loadAllBarcodesCached();
+  Map<int, String> barcodes = const <int, String>{};
+  try {
+    barcodes = await loadAllBarcodesCached();
+  } catch (_) {
+    // Searching by title and material number still works without the barcode index.
+  }
+  return rankProductRows(products, query, barcodes, limit: limit);
+}
+
+Future<List<Map<String, dynamic>>> searchProductsDirect(
+  String query, {
+  required int limit,
+}) async {
+  final trimmed = query.trim();
+  if (trimmed.isEmpty) return <Map<String, dynamic>>[];
+  final numeric = int.tryParse(trimmed);
+  final collected = <Map<String, dynamic>>[];
+  final directBarcodes = <int, String>{};
+
+  if (numeric != null) {
+    final exactRows = await supabase.from('products').select().eq('mat_num', numeric).limit(limit);
+    collected.addAll(exactRows.cast<Map<String, dynamic>>());
+
+    try {
+      final barcodeRows = await supabase
+          .from('product_barcodes')
+          .select('mat_num, barcode')
+          .ilike('barcode', '%${safeSearchPattern(trimmed)}%')
+          .limit(limit);
+      final barcodeMatNums = barcodeRows
+          .map((row) {
+            final matNum = nullableIntValue(row['mat_num']);
+            if (matNum != null) directBarcodes[matNum] = row['barcode']?.toString() ?? '';
+            return matNum;
+          })
+          .whereType<int>()
+          .toSet()
+          .toList();
+      if (barcodeMatNums.isNotEmpty) {
+        final barcodeProducts = await supabase.from('products').select().inFilter('mat_num', barcodeMatNums).limit(limit);
+        collected.addAll(barcodeProducts.cast<Map<String, dynamic>>());
+      }
+    } catch (_) {
+      // Material-number results should survive an unavailable barcode table.
+    }
+  } else {
+    final words = trimmed
+        .split(RegExp(r'\s+'))
+        .map(safeSearchPattern)
+        .where((word) => word.isNotEmpty)
+        .take(6)
+        .toList();
+    if (words.isEmpty) return <Map<String, dynamic>>[];
+    dynamic request = supabase.from('products').select();
+    for (final word in words) {
+      request = request.ilike('name', '%$word%');
+    }
+    final rows = await request.limit(limit * 2);
+    collected.addAll((rows as List).cast<Map<String, dynamic>>());
+  }
+
+  return rankProductRows(
+    deduplicateProducts(collected),
+    query,
+    {...?cachedBarcodes, ...directBarcodes},
+    limit: limit,
+  );
+}
+
+String safeSearchPattern(String value) {
+  return value.replaceAll('%', '').replaceAll('_', '').trim();
+}
+
+List<Map<String, dynamic>> deduplicateProducts(Iterable<Map<String, dynamic>> products) {
+  final unique = <int, Map<String, dynamic>>{};
+  for (final product in products) {
+    final matNum = nullableIntValue(product['mat_num']);
+    if (matNum != null) unique.putIfAbsent(matNum, () => product);
+  }
+  return unique.values.toList();
+}
+
+List<Map<String, dynamic>> rankProductRows(
+  Iterable<Map<String, dynamic>> products,
+  String query,
+  Map<int, String> barcodes, {
+  required int limit,
+}) {
   final normalized = normalizeSearch(query);
   final words = normalized.split(RegExp(r'\s+')).where((word) => word.isNotEmpty).toList();
   final scored = <({Map<String, dynamic> product, double score})>[];
@@ -9101,22 +10339,47 @@ Future<void> enqueueChatNotification({
     'sender_id': sender.id,
   };
 
+  List<Map<String, dynamic>> participants;
+  try {
+    final rows = await supabase
+        .from('ansar_chat_participants')
+        .select('employee_id, is_muted')
+        .eq('thread_id', threadId)
+        .neq('employee_id', sender.id);
+    participants = rows.cast<Map<String, dynamic>>();
+  } catch (_) {
+    final rows = await supabase
+        .from('ansar_chat_participants')
+        .select('employee_id')
+        .eq('thread_id', threadId)
+        .neq('employee_id', sender.id);
+    participants = rows.cast<Map<String, dynamic>>();
+  }
   if (type == 'general') {
-    await enqueueNotification(
+    final mutedIds = participants
+        .where((row) => row['is_muted'] == true)
+        .map((row) => row['employee_id']?.toString())
+        .whereType<String>()
+        .toSet();
+    final employees = await supabase
+        .from('ansar_employees')
+        .select('id')
+        .eq('is_active', true)
+        .neq('id', sender.id);
+    await enqueueNotificationsForEmployees(
+      employeeIds: employees
+          .map((row) => row['id']?.toString() ?? '')
+          .where((id) => id.isNotEmpty && !mutedIds.contains(id)),
       title: title,
       body: body,
       data: data,
     );
     return;
   }
-
-  final participants = await supabase
-      .from('ansar_chat_participants')
-      .select('employee_id')
-      .eq('thread_id', threadId)
-      .neq('employee_id', sender.id);
   await enqueueNotificationsForEmployees(
-    employeeIds: participants.map((row) => row['employee_id'] as String? ?? ''),
+    employeeIds: participants
+        .where((row) => row['is_muted'] != true)
+        .map((row) => row['employee_id']?.toString() ?? ''),
     title: title,
     body: body,
     data: data,
@@ -9224,6 +10487,19 @@ String cleanError(Object? error) {
     return 'تعذر تنفيذ العملية الآن. حاول مرة أخرى.';
   }
   return text;
+}
+
+String chatUpgradeError(Object? error) {
+  final text = error.toString();
+  if (text.contains('reply_to_id') ||
+      text.contains('edited_at') ||
+      text.contains('edited_by') ||
+      text.contains('deleted_by') ||
+      text.contains('forwarded_from_id') ||
+      text.contains('is_muted')) {
+    return 'يلزم تنفيذ ملف تحديث الدردشة الجديد في Supabase أولاً.';
+  }
+  return cleanError(error);
 }
 
 String? branchLogoAsset(String branchName) {

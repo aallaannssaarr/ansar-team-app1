@@ -190,6 +190,19 @@ void main() {
       ),
       greaterThan(0),
     );
+    expect(safeSearchPattern('كتاب_%'), 'كتاب');
+    expect(
+      rankProductRows(
+        [
+          {'mat_num': '2', 'name': 'شرح رياض الصالحين'},
+          {'mat_num': '1', 'name': 'رياض الصالحين'},
+        ],
+        'رياض الصالحين',
+        const {},
+        limit: 10,
+      ).first['mat_num'],
+      '1',
+    );
   });
 
   testWidgets('product detail tables render compact rows without overflow', (tester) async {
@@ -223,6 +236,11 @@ void main() {
           row: {
             'body': 'رسالة تجريبية',
             'created_at': '2026-07-12T10:30:00Z',
+            'reply_to_id': 'old-message',
+            'reply_preview_sender': 'محمد',
+            'reply_preview_body': 'الرسالة الأصلية',
+            'forwarded_from_id': 'forwarded-message',
+            'edited_at': '2026-07-12T10:35:00Z',
           },
           mine: false,
           senderName: 'إبراهيم عسكر',
@@ -237,6 +255,35 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(find.text('إبراهيم عسكر'), findsOneWidget);
     expect(find.text('رسالة تجريبية'), findsOneWidget);
+    expect(find.text('الرسالة الأصلية'), findsOneWidget);
+    expect(find.text('تم التحويل'), findsOneWidget);
+    expect(find.text('معدّلة'), findsOneWidget);
+  });
+
+  testWidgets('deleted chat message renders a stable tombstone', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 760));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      _testShell(
+        ChatMessageBubble(
+          row: const {
+            'body': 'نص يجب ألا يظهر',
+            'created_at': '2026-07-12T10:30:00Z',
+            'deleted_at': '2026-07-12T10:31:00Z',
+          },
+          mine: true,
+          senderName: 'أنت',
+          avatarUrl: null,
+          showDate: false,
+          showIdentity: false,
+          onLongPress: null,
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('تم حذف هذه الرسالة'), findsOneWidget);
+    expect(find.text('نص يجب ألا يظهر'), findsNothing);
   });
 
   testWidgets('invoice table fits a mobile screen without horizontal scrolling', (tester) async {
