@@ -1,26 +1,24 @@
-# Notifications setup
+# إعداد الإشعارات والتوزيع
 
-This app now has the mobile side and the Supabase sender side for Firebase push notifications.
+يدعم التطبيق Firebase كمزود أساسي وPushy كمزود احتياطي للأجهزة التي لا تتوفر فيها خدمات Google أو يتكرر فشل Firebase عليها. يسجل كل تثبيت بصورة مستقلة، ويحفظ نتيجة الإرسال لكل جهاز، ويعيد المحاولة من دون اعتبار الإشعار ناجحاً قبل معالجة الأجهزة المستهدفة.
 
-## What is already wired
+## الإعداد لمرة واحدة
 
-- Android asks for notification permission.
-- Each logged-in employee device is saved in `ansar_device_tokens`.
-- Attendance check-in/check-out creates branch notifications.
-- Transfer creation/status/item updates create targeted notifications.
-- Chat messages create notifications for conversation participants. General chat notifies all active employees except the sender.
-- `supabase/functions/send-notifications` sends pending rows from `ansar_notification_queue` through Firebase Cloud Messaging.
+1. افتح **Supabase SQL Editor** ونفذ الملف `docs/ansar-platform-upgrade.sql` كاملاً. الملف إضافي وقابل لإعادة التنفيذ ولا يحذف الجداول القديمة.
+2. نفذ `docs/ansar-notification-scheduler.sql` لتشغيل التذكيرات ومرسل الإشعارات كل دقيقة.
+3. في [Pushy](https://dashboard.pushy.me/) أنشئ تطبيق Android باسم فريق الأنصار وباسم الحزمة `com.example.ansar_team_app`، ثم انسخ **Secret API Key**.
+4. في GitHub افتح **Settings > Secrets and variables > Actions** وأضف:
+   - `SUPABASE_ACCESS_TOKEN`: رمز حساب Supabase.
+   - `FIREBASE_SERVICE_ACCOUNT_JSON`: كامل محتوى ملف خدمة Firebase بصيغة JSON.
+   - `PUSHY_SECRET_API_KEY`: مفتاح Pushy السري.
+   - `FIREBASE_TESTER_GROUPS`: اسم مجموعة المختبرين، والقيمة المقترحة `ansar-testers`.
+5. شغّل **Deploy Notification Sender** من GitHub Actions مرة واحدة بعد إضافة الأسرار.
+6. في Firebase App Distribution أنشئ مجموعة مختبرين باسم `ansar-testers` وأضف عناوينهم. كل بناء ناجح سيبقى كملف APK في GitHub وسيُرسل أيضاً إلى المجموعة تلقائياً.
 
-## One-time setup
+## اختبار القبول
 
-1. In Firebase Console, open the `ansar team` project.
-2. Go to Project settings, then Service accounts.
-3. Press Generate new private key and download the JSON file.
-4. In GitHub, open the repository settings, then Secrets and variables, then Actions.
-5. Add these repository secrets:
-   - `SUPABASE_ACCESS_TOKEN`: a Supabase access token from your Supabase account settings.
-   - `FIREBASE_SERVICE_ACCOUNT_JSON`: the full content of the Firebase private key JSON file.
-6. In GitHub Actions, run `Deploy Notification Sender`.
-7. In Supabase SQL Editor, run `docs/ansar-notification-scheduler.sql`.
-
-After this, build and install the APK on two phones, log in on both, and test attendance, transfers, and chat.
+1. ثبّت نفس البناء على هاتفين وسجّل بحسابين مختلفين.
+2. وافق على إذن الإشعارات عند أول دخول. لا يحتاج الموظف إلى زر تفعيل يدوي.
+3. اختبر التطبيق مفتوحاً وفي الخلفية وبعد إغلاقه: الدوام، المناقلات، والدردشة الخاصة والعامة.
+4. افتح **إدارة النظام > الإشعارات** وتأكد أن الهاتفين ظاهران وأن لكل إرسال نتيجة مستقلة باسم Firebase أو Pushy.
+5. إذا رُفض إذن النظام أو أُوقف التطبيق بالقوة فلن يستطيع أي مزود تجاوز قرار الهاتف، لكن الإشعارات ستظل محفوظة في صندوق التطبيق وتُزامن عند فتحه.

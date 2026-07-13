@@ -1,22 +1,80 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:fl_chart/fl_chart.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart' as intl;
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
+import 'package:pushy_flutter/pushy_flutter.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'ansar_config.dart';
+
+@pragma('vm:entry-point')
+Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp();
+  await markBackgroundChatDelivered(message.data);
+}
+
+@pragma('vm:entry-point')
+void backgroundPushyNotificationListener(Map<String, dynamic> data) {
+  final title = data['title']?.toString() ?? 'فريق الأنصار';
+  final body = data['message']?.toString() ?? data['body']?.toString() ?? '';
+  if (Platform.isAndroid) Pushy.notify(title, body, data);
+  Pushy.clearBadge();
+  unawaited(markBackgroundChatDelivered(data));
+}
+
+Future<void> markBackgroundChatDelivered(Map<String, dynamic> data) async {
+  if (data['type'] != 'chat_message' || data['thread_id'] == null) return;
+  try {
+    final preferences = await SharedPreferences.getInstance();
+    final employeeId = preferences.getString('ansar_employee_id');
+    if (employeeId == null || employeeId.isEmpty) return;
+    final client = SupabaseClient(AnsarConfig.supabaseUrl, AnsarConfig.supabaseServiceKey);
+    await client.rpc('ansar_mark_chat_delivered', params: {
+      'p_employee_id': employeeId,
+      'p_thread_id': '${data['thread_id']}',
+    });
+  } catch (_) {
+    // Background delivery acknowledgement is retried when the app opens.
+  }
+}
+
+final pushyNotificationClicks = StreamController<Map<String, dynamic>>.broadcast();
+bool pushyInitialized = false;
+Map<String, dynamic>? pendingPushyNotificationClick;
+
+void initializePushyService() {
+  if (pushyInitialized) return;
+  Pushy.listen();
+  Pushy.toggleInAppBanner(true);
+  Pushy.setNotificationListener(backgroundPushyNotificationListener);
+  Pushy.setNotificationClickListener((Map<String, dynamic> data) {
+    final payload = Map<String, dynamic>.from(data);
+    pendingPushyNotificationClick = payload;
+    if (pushyNotificationClicks.hasListener) {
+      pushyNotificationClicks.add(payload);
+      pendingPushyNotificationClick = null;
+    }
+    Pushy.clearBadge();
+  });
+  pushyInitialized = true;
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -42,10 +100,12 @@ Future<void> main() async {
         ),
       );
   await Firebase.initializeApp();
+  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
   await Supabase.initialize(
     url: AnsarConfig.supabaseUrl,
     publishableKey: AnsarConfig.supabaseServiceKey,
   );
+  initializePushyService();
   runApp(const AnsarApp());
 }
 
@@ -658,9 +718,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   int index = 0;
   StreamSubscription<RemoteMessage>? foregroundMessages;
   StreamSubscription<RemoteMessage>? openedMessages;
+  StreamSubscription<Map<String, dynamic>>? pushyClicks;
   Timer? notificationRegistrationTimer;
   Timer? inAppNotificationsTimer;
-  bool openingChatNotification = false;
+  Timer? unreadMessagesTimer;
+  RealtimeChannel? unreadMessagesChannel;
+  bool openingNotification = false;
+  bool notificationPermissionWarningShown = false;
+  int unreadChatMessages = 0;
   final seenInAppNotificationIds = <String>{};
   DateTime inAppNotificationCursor = DateTime.now().toUtc();
 
@@ -669,11 +734,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     session = widget.initialSession;
+    initializePushyNotifications();
+    unawaited(touchEmployeePresence(session.id, online: true));
     startNotificationRegistrationMonitor();
     startInAppNotificationMonitor();
+    startUnreadMessagesMonitor();
     foregroundMessages = FirebaseMessaging.onMessage.listen((message) {
       if (!mounted) return;
-      if (message.data['sender_id'] == session.id || message.data['employee_id'] == session.id) return;
+      if (message.data['sender_id'] == session.id) return;
       final notificationId = message.data['notification_id']?.toString();
       if (notificationId != null && notificationId.isNotEmpty) seenInAppNotificationIds.add(notificationId);
       if (message.data['type'] == 'chat_message' && message.data['thread_id'] == activeChatThreadId) return;
@@ -681,6 +749,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final body = message.notification?.body ?? '';
       final data = Map<String, dynamic>.from(message.data);
       final isChat = data['type'] == 'chat_message';
+      if (isChat && data['thread_id'] != null) {
+        unawaited(markChatNotificationDelivered(session.id, '${data['thread_id']}'));
+      }
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
         ..showSnackBar(
@@ -721,37 +792,122 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }));
   }
 
+  void initializePushyNotifications() {
+    initializePushyService();
+    pushyClicks?.cancel();
+    pushyClicks = pushyNotificationClicks.stream.listen((data) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(openNotificationData(data));
+      });
+    });
+    final pending = pendingPushyNotificationClick;
+    pendingPushyNotificationClick = null;
+    if (pending != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(openNotificationData(pending));
+      });
+    }
+  }
+
   void handleOpenedNotification(RemoteMessage message) {
-    if (message.data['type'] != 'chat_message') return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      unawaited(openChatFromNotification(message.data));
+      unawaited(openNotificationData(message.data));
     });
   }
 
-  Future<void> openChatFromNotification(Map<String, dynamic> data) async {
-    if (openingChatNotification || !mounted) return;
-    openingChatNotification = true;
+  Future<void> openNotificationData(Map<String, dynamic> data) async {
+    if (openingNotification || !mounted) return;
+    openingNotification = true;
     try {
-      setState(() => index = 4);
-      await openChatNotification(context, session, data);
+      final type = data['type']?.toString() ?? '';
+      final route = data['route']?.toString() ?? '';
+      if (type == 'chat_message' || route == 'chat') {
+        setState(() => index = 4);
+        await openChatNotification(context, session, data);
+      } else if (type.contains('transfer') || route == 'transfer') {
+        setState(() => index = 2);
+        await openTransferNotification(context, session, data);
+      } else {
+        setState(() => index = 0);
+      }
+      await markNotificationOpened(data, session.id);
+      unawaited(refreshUnreadChatMessages());
     } finally {
-      openingChatNotification = false;
+      openingNotification = false;
     }
+  }
+
+  Future<void> openChatFromNotification(Map<String, dynamic> data) async {
+    await openNotificationData(data);
   }
 
   void updateSession(EmployeeSession value) {
     setState(() => session = value);
     startNotificationRegistrationMonitor();
     startInAppNotificationMonitor();
+    startUnreadMessagesMonitor();
+  }
+
+  void startUnreadMessagesMonitor() {
+    unreadMessagesTimer?.cancel();
+    if (unreadMessagesChannel != null) supabase.removeChannel(unreadMessagesChannel!);
+    unawaited(refreshUnreadChatMessages());
+    unreadMessagesTimer = Timer.periodic(const Duration(seconds: 5), (_) => refreshUnreadChatMessages());
+    unreadMessagesChannel = supabase.channel('chat-unread-${session.id}')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_chat_message_receipts',
+        callback: (_) => unawaited(refreshUnreadChatMessages()),
+      ).subscribe();
+  }
+
+  Future<void> refreshUnreadChatMessages() async {
+    try {
+      final rows = await supabase
+          .from('ansar_chat_message_receipts')
+          .select('message_id')
+          .eq('employee_id', session.id)
+          .neq('status', 'read');
+      if (mounted && unreadChatMessages != rows.length) {
+        setState(() => unreadChatMessages = rows.length);
+      }
+    } catch (_) {
+      // The badge appears automatically after the additive chat migration is installed.
+    }
   }
 
   void startNotificationRegistrationMonitor() {
     notificationRegistrationTimer?.cancel();
-    unawaited(registerDeviceForNotifications(session));
+    unawaited(registerDeviceAndWarn());
     notificationRegistrationTimer = Timer.periodic(const Duration(seconds: 45), (_) {
-      registerDeviceForNotifications(session);
+      unawaited(registerDeviceAndWarn());
     });
+  }
+
+  Future<void> registerDeviceAndWarn() async {
+    await registerDeviceForNotifications(session);
+    final error = lastNotificationRegistrationError ?? '';
+    if (!mounted || notificationPermissionWarningShown || !error.contains('مرفوض')) return;
+    notificationPermissionWarningShown = true;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        icon: const Icon(Icons.notifications_off_rounded, color: dangerColor, size: 34),
+        title: const Text('الإشعارات متوقفة'),
+        content: const Text(
+          'رفض الهاتف إذن الإشعارات. سيبقى صندوق الإشعارات داخل التطبيق متاحاً، '
+          'لكن يلزم السماح بالإشعارات من إعدادات الهاتف لاستقبالها خارج التطبيق.',
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('فهمت'),
+          ),
+        ],
+      ),
+    );
   }
 
   void startInAppNotificationMonitor() {
@@ -782,6 +938,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         if (id.isEmpty || seenInAppNotificationIds.contains(id)) continue;
         seenInAppNotificationIds.add(id);
         final data = notificationData(row['data']);
+        if (data['type'] == 'chat_message' && data['thread_id'] != null) {
+          unawaited(markChatNotificationDelivered(session.id, '${data['thread_id']}'));
+        }
         if (data['type'] == 'chat_message' && data['thread_id']?.toString() == activeChatThreadId) continue;
         if (!mounted) return;
         final title = row['title'] as String? ?? 'إشعار جديد';
@@ -798,8 +957,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     foregroundMessages?.cancel();
     openedMessages?.cancel();
+    pushyClicks?.cancel();
     notificationRegistrationTimer?.cancel();
     inAppNotificationsTimer?.cancel();
+    unreadMessagesTimer?.cancel();
+    if (unreadMessagesChannel != null) supabase.removeChannel(unreadMessagesChannel!);
+    unawaited(touchEmployeePresence(session.id, online: false));
     super.dispose();
   }
 
@@ -808,6 +971,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       startNotificationRegistrationMonitor();
       startInAppNotificationMonitor();
+      unawaited(touchEmployeePresence(session.id, online: true));
+      unawaited(refreshUnreadChatMessages());
+    } else if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
+      unawaited(touchEmployeePresence(session.id, online: false));
     }
   }
 
@@ -853,7 +1020,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  void logout() {
+  Future<void> logout() async {
+    await notificationTokenRefreshSubscription?.cancel();
+    notificationTokenRefreshSubscription = null;
+    try {
+      final installationId = await stableInstallationId();
+      await supabase
+          .from('ansar_device_installations')
+          .update({'is_active': false, 'updated_at': DateTime.now().toUtc().toIso8601String()})
+          .eq('installation_id', installationId)
+          .eq('employee_id', session.id);
+    } catch (_) {
+      // Older installations continue to work until the additive device migration is applied.
+    }
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.remove('ansar_employee_id');
+    if (!mounted) return;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(
         builder: (_) => const Directionality(
@@ -873,7 +1055,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       await openManagement();
       return;
     }
-    if (value == 'logout') logout();
+    if (value == 'logout') await logout();
   }
 
   @override
@@ -907,9 +1089,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         selectedIcon: Icon(Icons.manage_search_rounded),
         label: 'استعلام',
       ),
-      const NavigationDestination(
-        icon: Icon(Icons.chat_bubble_outline_rounded),
-        selectedIcon: Icon(Icons.chat_rounded),
+      NavigationDestination(
+        icon: ChatNavigationIcon(count: unreadChatMessages, selected: false),
+        selectedIcon: ChatNavigationIcon(count: unreadChatMessages, selected: true),
         label: 'الدردشة',
       ),
     ];
@@ -934,9 +1116,28 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: index,
-        onDestinationSelected: (value) => setState(() => index = value),
+        onDestinationSelected: (value) {
+          setState(() => index = value);
+          if (value == 4) unawaited(refreshUnreadChatMessages());
+        },
         destinations: destinations,
       ),
+    );
+  }
+}
+
+class ChatNavigationIcon extends StatelessWidget {
+  const ChatNavigationIcon({super.key, required this.count, required this.selected});
+
+  final int count;
+  final bool selected;
+
+  @override
+  Widget build(BuildContext context) {
+    return Badge(
+      isLabelVisible: count > 0,
+      label: Text(count > 99 ? '99+' : '$count'),
+      child: Icon(selected ? Icons.chat_rounded : Icons.chat_bubble_outline_rounded),
     );
   }
 }
@@ -1106,7 +1307,12 @@ class _NotificationInboxPageState extends State<NotificationInboxPage> {
     final data = notificationData(row['data']);
     if (data['type'] == 'chat_message') {
       await openChatNotification(context, widget.session, data);
+    } else if ((data['type']?.toString() ?? '').contains('transfer')) {
+      await openTransferNotification(context, widget.session, data);
+    } else if ((data['route']?.toString() ?? '') == 'attendance' && mounted) {
+      Navigator.pop(context);
     }
+    await markNotificationOpened({...data, 'notification_id': '${row['id']}'}, widget.session.id);
   }
 
   @override
@@ -1174,7 +1380,7 @@ class NotificationInboxTile extends StatelessWidget {
     final type = data['type'] as String? ?? '';
     final isChat = type.contains('chat');
     final isTransfer = type.contains('transfer');
-    final effectiveOnTap = isChat ? onTap : null;
+    final effectiveOnTap = (isChat || isTransfer || type.contains('attendance')) ? onTap : null;
     final color = isChat
         ? infoColor
         : isTransfer
@@ -1371,21 +1577,42 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<void> checkIn() async {
+    final action = await showAttendanceActionSheet(context, isCheckIn: true);
+    if (action == null || !mounted) return;
+    final validationError = await validateAttendanceAction(
+      employeeId: widget.session.id,
+      effectiveAt: action.effectiveAt,
+      isCheckIn: true,
+    );
+    if (validationError != null) {
+      if (mounted) showSnack(context, validationError);
+      return;
+    }
     setState(() => attendanceBusy = true);
+    final recordedAt = DateTime.now();
+    final backdated = isAttendanceBackdated(action.effectiveAt, recordedAt);
     try {
-      await supabase.from('ansar_attendance_logs').insert({
+      final values = {
         'employee_id': widget.session.id,
         'branch_num': widget.session.branchNum,
-        'check_in_at': DateTime.now().toUtc().toIso8601String(),
+        'check_in_at': action.effectiveAt.toUtc().toIso8601String(),
+        'check_in_recorded_at': recordedAt.toUtc().toIso8601String(),
+        'check_in_is_backdated': backdated,
+        'check_in_note': emptyToNull(action.note),
         'status': 'open',
-      });
+      };
+      await insertAttendanceWithCompatibility(values);
       unawaited(enqueueNotification(
         title: 'تسجيل دخول دوام',
-        body: '${widget.session.name} سجل الدخول إلى الدوام',
+        body: '${widget.session.name} سجل الدخول الساعة ${formatTime(action.effectiveAt)}${backdated ? ' · سُجل لاحقاً' : ''}',
         data: {
           'type': 'attendance_check_in',
+          'route': 'attendance',
+          'sender_id': widget.session.id,
           'employee_id': widget.session.id,
           'branch_num': widget.session.branchNum,
+          'effective_at': action.effectiveAt.toUtc().toIso8601String(),
+          'is_backdated': backdated,
         },
       ));
       if (mounted) {
@@ -1401,19 +1628,46 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<void> checkOut(Map<String, dynamic> openLog) async {
+    final checkInAt = DateTime.parse(openLog['check_in_at'] as String).toLocal();
+    final action = await showAttendanceActionSheet(
+      context,
+      isCheckIn: false,
+      earliest: checkInAt,
+    );
+    if (action == null || !mounted) return;
+    final validationError = await validateAttendanceAction(
+      employeeId: widget.session.id,
+      effectiveAt: action.effectiveAt,
+      isCheckIn: false,
+      openLog: openLog,
+    );
+    if (validationError != null) {
+      if (mounted) showSnack(context, validationError);
+      return;
+    }
     setState(() => attendanceBusy = true);
+    final recordedAt = DateTime.now();
+    final backdated = isAttendanceBackdated(action.effectiveAt, recordedAt);
     try {
-      await supabase.from('ansar_attendance_logs').update({
-        'check_out_at': DateTime.now().toUtc().toIso8601String(),
+      final values = {
+        'check_out_at': action.effectiveAt.toUtc().toIso8601String(),
+        'check_out_recorded_at': recordedAt.toUtc().toIso8601String(),
+        'check_out_is_backdated': backdated,
+        'check_out_note': emptyToNull(action.note),
         'status': 'closed',
-      }).eq('id', openLog['id']);
+      };
+      await updateAttendanceWithCompatibility(openLog['id'], values);
       unawaited(enqueueNotification(
         title: 'تسجيل خروج دوام',
-        body: '${widget.session.name} سجل الخروج من الدوام',
+        body: '${widget.session.name} سجل الخروج الساعة ${formatTime(action.effectiveAt)}${backdated ? ' · سُجل لاحقاً' : ''}',
         data: {
           'type': 'attendance_check_out',
+          'route': 'attendance',
+          'sender_id': widget.session.id,
           'employee_id': widget.session.id,
           'branch_num': widget.session.branchNum,
+          'effective_at': action.effectiveAt.toUtc().toIso8601String(),
+          'is_backdated': backdated,
         },
       ));
       if (mounted) {
@@ -1644,6 +1898,302 @@ class _DashboardPageState extends State<DashboardPage> {
           );
         },
     );
+  }
+}
+
+class AttendanceAction {
+  const AttendanceAction({required this.effectiveAt, required this.note});
+
+  final DateTime effectiveAt;
+  final String note;
+}
+
+Future<AttendanceAction?> showAttendanceActionSheet(
+  BuildContext context, {
+  required bool isCheckIn,
+  DateTime? earliest,
+}) {
+  return showModalBottomSheet<AttendanceAction>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    backgroundColor: panelSurface,
+    builder: (_) => AttendanceActionSheet(isCheckIn: isCheckIn, earliest: earliest),
+  );
+}
+
+class AttendanceActionSheet extends StatefulWidget {
+  const AttendanceActionSheet({super.key, required this.isCheckIn, this.earliest});
+
+  final bool isCheckIn;
+  final DateTime? earliest;
+
+  @override
+  State<AttendanceActionSheet> createState() => _AttendanceActionSheetState();
+}
+
+class _AttendanceActionSheetState extends State<AttendanceActionSheet> {
+  final note = TextEditingController();
+  bool earlier = false;
+  int? selectedShortcut;
+  late DateTime selectedTime = DateTime.now();
+
+  @override
+  void dispose() {
+    note.dispose();
+    super.dispose();
+  }
+
+  DateTime get effectiveTime => earlier ? selectedTime : DateTime.now();
+
+  String? get validationMessage {
+    final value = effectiveTime;
+    final now = DateTime.now();
+    if (!sameCalendarDay(value, now)) return 'يمكن اختيار وقت من اليوم الحالي فقط';
+    if (value.isAfter(now.add(const Duration(minutes: 1)))) return 'لا يمكن اختيار وقت مستقبلي';
+    if (widget.earliest != null && value.isBefore(widget.earliest!)) {
+      return 'وقت الخروج يجب أن يكون بعد الدخول ${formatTime(widget.earliest!)}';
+    }
+    return null;
+  }
+
+  void useShortcut(int minutes) {
+    setState(() {
+      earlier = true;
+      selectedShortcut = minutes;
+      selectedTime = DateTime.now().subtract(Duration(minutes: minutes));
+    });
+  }
+
+  Future<void> pickExactTime() async {
+    final value = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(selectedTime),
+      helpText: widget.isCheckIn ? 'وقت الدخول الفعلي' : 'وقت الخروج الفعلي',
+    );
+    if (value == null) return;
+    final now = DateTime.now();
+    setState(() {
+      earlier = true;
+      selectedShortcut = null;
+      selectedTime = DateTime(now.year, now.month, now.day, value.hour, value.minute);
+    });
+  }
+
+  void submit() {
+    if (validationMessage != null) return;
+    Navigator.pop(
+      context,
+      AttendanceAction(effectiveAt: effectiveTime, note: note.text.trim()),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final keyboard = MediaQuery.viewInsetsOf(context).bottom;
+    final error = validationMessage;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(18, 10, 18, 18 + keyboard),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Center(
+              child: Container(
+                width: 44,
+                height: 4,
+                decoration: BoxDecoration(color: borderColor, borderRadius: BorderRadius.circular(4)),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color: (widget.isCheckIn ? successColor : dangerColor).withValues(alpha: 0.11),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(
+                    widget.isCheckIn ? Icons.login_rounded : Icons.logout_rounded,
+                    color: widget.isCheckIn ? successColor : dangerColor,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        widget.isCheckIn ? 'تسجيل الدخول' : 'تسجيل الخروج',
+                        style: Theme.of(context).textTheme.titleLarge?.copyWith(fontSize: 19),
+                      ),
+                      const Text('حدد الوقت الفعلي للحركة', style: TextStyle(color: mutedInk)),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 18),
+            SegmentedButton<bool>(
+              segments: const [
+                ButtonSegment(value: false, icon: Icon(Icons.schedule_rounded), label: Text('الآن')),
+                ButtonSegment(value: true, icon: Icon(Icons.history_rounded), label: Text('وقت سابق')),
+              ],
+              selected: {earlier},
+              onSelectionChanged: (value) {
+                setState(() {
+                  earlier = value.first;
+                  if (earlier && selectedShortcut == null) {
+                    selectedShortcut = 30;
+                    selectedTime = DateTime.now().subtract(const Duration(minutes: 30));
+                  }
+                });
+              },
+            ),
+            if (earlier) ...[
+              const SizedBox(height: 16),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final shortcut in const [30, 60, 120])
+                    ChoiceChip(
+                      selected: selectedShortcut == shortcut,
+                      label: Text(shortcut == 30 ? 'منذ 30 دقيقة' : shortcut == 60 ? 'منذ ساعة' : 'منذ ساعتين'),
+                      onSelected: (_) => useShortcut(shortcut),
+                    ),
+                  ActionChip(
+                    avatar: const Icon(Icons.access_time_rounded, size: 18),
+                    label: const Text('تحديد وقت'),
+                    onPressed: pickExactTime,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 11),
+                decoration: BoxDecoration(
+                  color: softSurface,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: error == null ? borderColor : dangerColor),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.event_available_rounded, color: brandColor),
+                    const SizedBox(width: 9),
+                    Expanded(
+                      child: Text(
+                        'الوقت المختار: ${formatTime(selectedTime)}',
+                        style: const TextStyle(fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            if (error != null) ...[
+              const SizedBox(height: 8),
+              Text(error, style: const TextStyle(color: dangerColor, fontWeight: FontWeight.w700)),
+            ],
+            const SizedBox(height: 14),
+            TextField(
+              controller: note,
+              maxLines: 2,
+              decoration: const InputDecoration(
+                labelText: 'ملاحظة (اختيارية)',
+                prefixIcon: Icon(Icons.notes_rounded),
+              ),
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              style: FilledButton.styleFrom(backgroundColor: widget.isCheckIn ? successColor : dangerColor),
+              onPressed: error == null ? submit : null,
+              icon: Icon(widget.isCheckIn ? Icons.login_rounded : Icons.logout_rounded),
+              label: Text(widget.isCheckIn ? 'تأكيد الدخول' : 'تأكيد الخروج'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+bool isAttendanceBackdated(DateTime effectiveAt, DateTime recordedAt) {
+  return recordedAt.difference(effectiveAt).abs() > const Duration(minutes: 2);
+}
+
+Future<String?> validateAttendanceAction({
+  required String employeeId,
+  required DateTime effectiveAt,
+  required bool isCheckIn,
+  Map<String, dynamic>? openLog,
+}) async {
+  final now = DateTime.now();
+  if (!sameCalendarDay(effectiveAt, now)) return 'يمكن تسجيل وقت من اليوم الحالي فقط';
+  if (effectiveAt.isAfter(now.add(const Duration(minutes: 1)))) return 'لا يمكن تسجيل وقت مستقبلي';
+  final openStart = openLog == null ? null : DateTime.tryParse(openLog['check_in_at']?.toString() ?? '')?.toLocal();
+  if (!isCheckIn && openStart != null && effectiveAt.isBefore(openStart)) {
+    return 'وقت الخروج يجب أن يكون بعد وقت الدخول';
+  }
+
+  final dayStart = DateTime(now.year, now.month, now.day);
+  final dayEnd = dayStart.add(const Duration(days: 1));
+  final rows = await supabase
+      .from('ansar_attendance_logs')
+      .select('id, check_in_at, check_out_at, status')
+      .eq('employee_id', employeeId)
+      .gte('check_in_at', dayStart.toUtc().toIso8601String())
+      .lt('check_in_at', dayEnd.toUtc().toIso8601String())
+      .order('check_in_at', ascending: true);
+
+  final proposedStart = isCheckIn ? effectiveAt : openStart ?? effectiveAt;
+  final proposedEnd = isCheckIn ? now : effectiveAt;
+  for (final row in rows) {
+    if (openLog != null && '${row['id']}' == '${openLog['id']}') continue;
+    final start = DateTime.tryParse(row['check_in_at']?.toString() ?? '')?.toLocal();
+    if (start == null) continue;
+    final end = DateTime.tryParse(row['check_out_at']?.toString() ?? '')?.toLocal() ?? now.add(const Duration(days: 36500));
+    if (proposedStart.isBefore(end) && proposedEnd.isAfter(start)) {
+      return 'يتداخل الوقت المختار مع دوام مسجل مسبقاً';
+    }
+  }
+  return null;
+}
+
+bool missingAttendanceUpgrade(Object error) {
+  final text = error.toString();
+  return text.contains('check_in_recorded_at') ||
+      text.contains('check_out_recorded_at') ||
+      text.contains('check_in_is_backdated') ||
+      text.contains('check_out_is_backdated');
+}
+
+Future<void> insertAttendanceWithCompatibility(Map<String, Object?> values) async {
+  try {
+    await supabase.from('ansar_attendance_logs').insert(values);
+  } catch (error) {
+    if (!missingAttendanceUpgrade(error)) rethrow;
+    final legacy = Map<String, Object?>.from(values)
+      ..remove('check_in_recorded_at')
+      ..remove('check_in_is_backdated')
+      ..remove('check_in_note');
+    await supabase.from('ansar_attendance_logs').insert(legacy);
+  }
+}
+
+Future<void> updateAttendanceWithCompatibility(Object? id, Map<String, Object?> values) async {
+  try {
+    await supabase.from('ansar_attendance_logs').update(values).eq('id', id!);
+  } catch (error) {
+    if (!missingAttendanceUpgrade(error)) rethrow;
+    final legacy = Map<String, Object?>.from(values)
+      ..remove('check_out_recorded_at')
+      ..remove('check_out_is_backdated')
+      ..remove('check_out_note');
+    await supabase.from('ansar_attendance_logs').update(legacy).eq('id', id!);
   }
 }
 
@@ -4878,20 +5428,39 @@ class _NotificationDiagnosticsPageState extends State<NotificationDiagnosticsPag
   }
 
   Future<NotificationDiagnosticsData> loadDiagnostics() async {
-    final tokens = await supabase
-        .from('ansar_device_tokens')
-        .select('id, employee_id, platform, is_active, last_seen_at, created_at')
-        .order('last_seen_at', ascending: false)
-        .limit(50);
+    List<Map<String, dynamic>> tokens;
+    try {
+      final rows = await supabase
+          .from('ansar_device_installations')
+          .select('id, installation_id, employee_id, platform, device_name, permission_status, preferred_provider, fcm_token, pushy_token, firebase_failures, pushy_failures, is_active, last_seen_at, last_success_at, created_at')
+          .order('last_seen_at', ascending: false)
+          .limit(50);
+      tokens = rows.cast<Map<String, dynamic>>();
+    } catch (_) {
+      final rows = await supabase
+          .from('ansar_device_tokens')
+          .select('id, employee_id, platform, is_active, last_seen_at, created_at')
+          .order('last_seen_at', ascending: false)
+          .limit(50);
+      tokens = rows.cast<Map<String, dynamic>>();
+    }
     final queue = await supabase
         .from('ansar_notification_queue')
         .select('id, title, body, status, error_message, created_at, sent_at')
         .order('created_at', ascending: false)
         .limit(30);
-    return NotificationDiagnosticsData(
-      tokens: tokens.cast<Map<String, dynamic>>(),
-      queue: queue.cast<Map<String, dynamic>>(),
-    );
+    List<Map<String, dynamic>> deliveries = [];
+    try {
+      final rows = await supabase
+          .from('ansar_notification_deliveries')
+          .select('notification_id, installation_id, employee_id, provider, status, attempts, last_error, sent_at, created_at')
+          .order('created_at', ascending: false)
+          .limit(40);
+      deliveries = rows.cast<Map<String, dynamic>>();
+    } catch (_) {
+      // Delivery details appear after the platform migration is installed.
+    }
+    return NotificationDiagnosticsData(tokens: tokens, queue: queue.cast<Map<String, dynamic>>(), deliveries: deliveries);
   }
 
   Future<void> runSenderNow() async {
@@ -4936,7 +5505,7 @@ class _NotificationDiagnosticsPageState extends State<NotificationDiagnosticsPag
 
         final data = snapshot.data!;
         final activeTokens = data.tokens.where((row) => row['is_active'] != false).length;
-        final pending = data.queue.where((row) => row['status'] == 'pending').length;
+        final pending = data.queue.where((row) => {'pending', 'retrying'}.contains(row['status'])).length;
         final failed = data.queue.where((row) => row['status'] == 'failed').length;
 
         return ListView(
@@ -5002,14 +5571,39 @@ class _NotificationDiagnosticsPageState extends State<NotificationDiagnosticsPag
               ...data.tokens.take(8).map(
                     (row) => ListTile(
                       leading: const Icon(Icons.phone_android_rounded),
-                      title: Text(row['platform'] as String? ?? 'android'),
-                      subtitle: Text(row['last_seen_at'] as String? ?? row['created_at'] as String? ?? '-'),
+                      title: Text(row['device_name'] as String? ?? row['platform'] as String? ?? 'android'),
+                      subtitle: Text(
+                        [
+                          'Firebase: ${row['fcm_token'] == null ? 'غير مسجل' : 'مسجل'} · Pushy: ${row['pushy_token'] == null ? 'غير مسجل' : 'مسجل'}',
+                          'الإذن: ${row['permission_status'] ?? 'غير معروف'} · المفضل: ${row['preferred_provider'] ?? 'firebase'}',
+                          row['last_seen_at'] as String? ?? row['created_at'] as String? ?? '-',
+                        ].join('\n'),
+                      ),
                       trailing: Icon(
                         row['is_active'] != false ? Icons.check_circle_rounded : Icons.cancel_rounded,
                         color: row['is_active'] != false ? Colors.green : Colors.red,
                       ),
                     ),
                   ),
+            if (data.deliveries.isNotEmpty) ...[
+              const SizedBox(height: 16),
+              Text('تسليم كل جهاز', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 8),
+              ...data.deliveries.take(12).map(
+                    (row) => ListTile(
+                      leading: Icon(
+                        row['status'] == 'sent' ? Icons.check_circle_rounded : Icons.sync_problem_rounded,
+                        color: row['status'] == 'sent' ? successColor : dangerColor,
+                      ),
+                      title: Text('${row['provider'] ?? 'قيد الاختيار'} · ${row['status'] ?? 'pending'}'),
+                      subtitle: Text(
+                        row['last_error']?.toString() ?? 'المحاولات: ${row['attempts'] ?? 0}',
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ),
+            ],
             const SizedBox(height: 16),
             Text('آخر الإشعارات', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
@@ -5047,10 +5641,11 @@ class _NotificationDiagnosticsPageState extends State<NotificationDiagnosticsPag
 }
 
 class NotificationDiagnosticsData {
-  NotificationDiagnosticsData({required this.tokens, required this.queue});
+  NotificationDiagnosticsData({required this.tokens, required this.queue, required this.deliveries});
 
   final List<Map<String, dynamic>> tokens;
   final List<Map<String, dynamic>> queue;
+  final List<Map<String, dynamic>> deliveries;
 }
 
 class ProfilePage extends StatefulWidget {
@@ -5411,7 +6006,7 @@ class _TransfersPageState extends State<TransfersPage> {
       if (widget.session.isBranchManager) {
         return fromBranch == widget.session.branchNum || toBranch == widget.session.branchNum;
       }
-      return row['requested_by'] == widget.session.id || toBranch == widget.session.branchNum;
+      return fromBranch == widget.session.branchNum || toBranch == widget.session.branchNum;
     }).toList();
     return TransferData(branches: branches, employees: employeeById, orders: visible);
   }
@@ -5421,7 +6016,7 @@ class _TransfersPageState extends State<TransfersPage> {
       final status = order['status'] as String? ?? 'submitted';
       final fromBranch = nullableIntValue(order['from_branch_num']);
       final toBranch = nullableIntValue(order['to_branch_num']);
-      final active = !{'completed', 'cancelled', 'rejected'}.contains(status);
+      final active = !{'received', 'completed', 'cancelled', 'rejected'}.contains(status);
       final statusMatches = statusFilter == 'all' ||
           (statusFilter == 'active' ? active : status == statusFilter);
       final fromMatches = fromBranchFilter == null || fromBranch == fromBranchFilter;
@@ -5508,13 +6103,16 @@ class _TransfersPageState extends State<TransfersPage> {
       builder: (_) => StatusDialog(current: order['status'] as String? ?? 'submitted'),
     );
     if (status == null) return;
+    if (status == 'in_delivery' && !await transferItemsReadyForDelivery('${order['id']}')) {
+      if (mounted) showSnack(context, 'يجب معالجة جميع البنود وتحديد الكمية المتوفرة قبل بدء التوصيل');
+      return;
+    }
     setState(() => transferBusy = true);
     try {
       await supabase.from('ansar_transfer_orders').update({
         'status': status,
         'handled_by': widget.session.id,
         if (status == 'approved') 'approved_at': DateTime.now().toUtc().toIso8601String(),
-        if (status == 'completed') 'completed_at': DateTime.now().toUtc().toIso8601String(),
       }).eq('id', order['id']);
       await supabase.from('ansar_order_events').insert({
         'order_id': order['id'],
@@ -5617,8 +6215,9 @@ class _TransfersPageState extends State<TransfersPage> {
                     final fromBranch = intValue(order['from_branch_num']);
                     final toBranch = intValue(order['to_branch_num']);
                     final requester = data.employees[order['requested_by']];
-                    final canHandle = widget.session.isAdmin || toBranch == widget.session.branchNum;
                     final status = order['status'] as String? ?? 'submitted';
+                    final canHandle = (widget.session.isAdmin || toBranch == widget.session.branchNum) &&
+                        !{'received', 'completed', 'cancelled', 'rejected'}.contains(status);
                     return Card(
                       child: InkWell(
                         borderRadius: BorderRadius.circular(8),
@@ -5723,7 +6322,7 @@ class _TransferFilters extends StatelessWidget {
   int statusCount(String filter) {
     return orders.where((order) {
       final status = order['status'] as String? ?? 'submitted';
-      final active = !{'completed', 'cancelled', 'rejected'}.contains(status);
+      final active = !{'received', 'completed', 'cancelled', 'rejected'}.contains(status);
       if (filter == 'all') return true;
       if (filter == 'active') return active;
       return status == filter;
@@ -5839,11 +6438,27 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
   Timer? detailsTimer;
   bool sharingPdf = false;
   bool statusBusy = false;
+  bool receiptBusy = false;
   String? itemBusyId;
 
   bool get canHandle {
     final toBranch = nullableIntValue(widget.order['to_branch_num']);
     return widget.session.isAdmin || toBranch == widget.session.branchNum;
+  }
+
+  bool get canEditItems {
+    final status = widget.order['status']?.toString() ?? 'submitted';
+    return canHandle && !{'in_delivery', 'received', 'completed', 'cancelled', 'rejected'}.contains(status);
+  }
+
+  bool get canChangeStatus {
+    final status = widget.order['status']?.toString() ?? 'submitted';
+    return canHandle && !{'in_delivery', 'received', 'completed', 'cancelled', 'rejected'}.contains(status);
+  }
+
+  bool get canReceive {
+    final fromBranch = nullableIntValue(widget.order['from_branch_num']);
+    return widget.order['status'] == 'in_delivery' && fromBranch == widget.session.branchNum;
   }
 
   @override
@@ -5953,7 +6568,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
   }
 
   Future<void> updateItem(Map<String, dynamic> item, String status) async {
-    if (!canHandle) return;
+    if (!canEditItems) return;
     final requested = doubleValue(item['requested_quantity']);
     var approved = status == 'unavailable' ? 0.0 : requested;
     if (status == 'partially_available') {
@@ -6013,12 +6628,16 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
   }
 
   Future<void> changeStatus() async {
-    if (!canHandle || statusBusy) return;
+    if (!canChangeStatus || statusBusy) return;
     final status = await showDialog<String>(
       context: context,
       builder: (_) => StatusDialog(current: widget.order['status'] as String? ?? 'submitted'),
     );
     if (status == null) return;
+    if (status == 'in_delivery' && !await transferItemsReadyForDelivery('${widget.order['id']}')) {
+      if (mounted) showSnack(context, 'يجب معالجة جميع البنود وتحديد الكمية المتوفرة قبل بدء التوصيل');
+      return;
+    }
     final oldStatus = widget.order['status'];
     setState(() => statusBusy = true);
     try {
@@ -6026,7 +6645,6 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
         'status': status,
         'handled_by': widget.session.id,
         if (status == 'approved') 'approved_at': DateTime.now().toUtc().toIso8601String(),
-        if (status == 'completed') 'completed_at': DateTime.now().toUtc().toIso8601String(),
       }).eq('id', widget.order['id']);
       await supabase.from('ansar_order_events').insert({
         'order_id': widget.order['id'],
@@ -6047,6 +6665,74 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     } finally {
       if (mounted) setState(() => statusBusy = false);
     }
+  }
+
+  Future<void> confirmReceipt(TransferDetailsData data) async {
+    if (!canReceive || receiptBusy) return;
+    final result = await Navigator.of(context).push<TransferReceiptResult>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: TransferReceiptPage(
+            order: widget.order,
+            items: data.items,
+            branches: widget.branches,
+          ),
+        ),
+      ),
+    );
+    if (result == null || !mounted) return;
+    setState(() => receiptBusy = true);
+    try {
+      final response = await supabase.rpc('ansar_confirm_transfer_receipt', params: {
+        'p_order_id': '${widget.order['id']}',
+        'p_employee_id': widget.session.id,
+        'p_items': result.items,
+        'p_note': emptyToNull(result.note),
+      });
+      final responseMap = response is Map ? Map<String, dynamic>.from(response) : const <String, dynamic>{};
+      final hasDifference = responseMap['has_difference'] == true;
+      widget.order
+        ..['status'] = 'received'
+        ..['received_by'] = widget.session.id
+        ..['received_at'] = DateTime.now().toUtc().toIso8601String()
+        ..['has_receipt_discrepancy'] = hasDifference;
+      unawaited(enqueueNotification(
+        title: 'استلام مناقلة',
+        body: hasDifference
+            ? 'تم استلام المناقلة رقم ${widget.order['order_no'] ?? '-'} مع وجود فروقات'
+            : 'تم استلام المناقلة رقم ${widget.order['order_no'] ?? '-'} بالكامل',
+        data: {
+          'type': 'transfer_received',
+          'route': 'transfer',
+          'order_id': widget.order['id'],
+          'sender_id': widget.session.id,
+          'has_difference': hasDifference,
+        },
+      ));
+      refreshDetails();
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    } finally {
+      if (mounted) setState(() => receiptBusy = false);
+    }
+  }
+
+  Future<void> shareInChat() async {
+    await Navigator.of(context).push<int>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: ShareTransferToChatPage(
+            session: widget.session,
+            order: widget.order,
+            branches: widget.branches,
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> sharePdf(TransferDetailsData data) async {
@@ -6094,7 +6780,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     final document = pw.Document(theme: theme);
     final fromName = branchLabel(widget.branches, fromBranch);
     final toName = branchLabel(widget.branches, toBranch);
-    final headers = ['#', 'الكتاب', 'الرقم', 'المطلوب', 'المتوفر', 'الحالة', 'الملاحظة'];
+    final headers = ['#', 'الكتاب', 'الرقم', 'المطلوب', 'المرسل', 'المستلم', 'التالف', 'الحالة', 'الملاحظة'];
     final rows = data.items.asMap().entries.map((entry) {
       final item = entry.value;
       final product = item['product'] as Map<String, dynamic>?;
@@ -6107,8 +6793,12 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
         '${item['mat_num'] ?? '-'}',
         requested,
         approved,
+        item['received_quantity'] == null ? '-' : formatMoneyValue(item['received_quantity']),
+        item['damaged_quantity'] == null ? '-' : formatMoneyValue(item['damaged_quantity']),
         status,
-        item['note']?.toString() ?? '',
+        [item['note'], item['receipt_note']]
+            .where((value) => value != null && '$value'.isNotEmpty)
+            .join(' · '),
       ];
     }).toList();
     final eventRows = data.events.map((event) {
@@ -6212,8 +6902,10 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
               2: pw.FlexColumnWidth(1.1),
               3: pw.FlexColumnWidth(1.1),
               4: pw.FlexColumnWidth(1.1),
-              5: pw.FlexColumnWidth(1.5),
-              6: pw.FlexColumnWidth(2.2),
+              5: pw.FlexColumnWidth(1.1),
+              6: pw.FlexColumnWidth(1.0),
+              7: pw.FlexColumnWidth(1.5),
+              8: pw.FlexColumnWidth(2.2),
             },
           ),
           if (data.events.isNotEmpty) ...[
@@ -6282,13 +6974,15 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                   2: pw.FlexColumnWidth(1.1),
                   3: pw.FlexColumnWidth(1.1),
                   4: pw.FlexColumnWidth(1.1),
-                  5: pw.FlexColumnWidth(1.6),
-                  6: pw.FlexColumnWidth(2.1),
+                  5: pw.FlexColumnWidth(1.1),
+                  6: pw.FlexColumnWidth(1.0),
+                  7: pw.FlexColumnWidth(1.6),
+                  8: pw.FlexColumnWidth(2.1),
                 },
                 children: [
                   pw.TableRow(
                     decoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
-                    children: ['#', 'الكتاب', 'الرقم', 'المطلوب', 'المتوفر', 'الحالة', 'الملاحظة']
+                    children: ['#', 'الكتاب', 'الرقم', 'المطلوب', 'المرسل', 'المستلم', 'التالف', 'الحالة', 'الملاحظة']
                         .map((text) => fallbackPdfCell(text, header: true))
                         .toList(),
                   ),
@@ -6360,8 +7054,15 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       '${item['mat_num'] ?? '-'}',
       formatMoneyValue(item['requested_quantity']),
       item['approved_quantity'] == null ? '-' : formatMoneyValue(item['approved_quantity']),
+      item['received_quantity'] == null ? '-' : formatMoneyValue(item['received_quantity']),
+      item['damaged_quantity'] == null ? '-' : formatMoneyValue(item['damaged_quantity']),
       itemStatusLabel(item['item_status'] as String? ?? 'requested'),
-      shortPdfText(item['note']?.toString() ?? '', 55),
+      shortPdfText(
+        [item['note'], item['receipt_note']]
+            .where((value) => value != null && '$value'.isNotEmpty)
+            .join(' · '),
+        55,
+      ),
     ];
   }
 
@@ -6390,7 +7091,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       appBar: AppBar(
         title: Text('مناقلة ${widget.order['order_no'] ?? ''}'),
         actions: [
-          if (canHandle)
+          if (canChangeStatus)
             IconButton(
               tooltip: 'تغيير الحالة',
               onPressed: statusBusy ? null : changeStatus,
@@ -6444,6 +7145,13 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                             label: statusLabel(widget.order['status'] as String? ?? 'submitted'),
                             color: transferStatusColor(widget.order['status'] as String? ?? 'submitted'),
                           ),
+                          if (widget.order['status'] == 'received')
+                            StatusPill(
+                              label: widget.order['has_receipt_discrepancy'] == true
+                                  ? 'تم الاستلام مع ملاحظات'
+                                  : 'تم الاستلام كاملاً',
+                              color: widget.order['has_receipt_discrepancy'] == true ? accentColor : successColor,
+                            ),
                         ],
                       ),
                       const SizedBox(height: 10),
@@ -6454,6 +7162,23 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                             : const Icon(Icons.picture_as_pdf_rounded),
                         label: const Text('مشاركة PDF'),
                       ),
+                      const SizedBox(height: 8),
+                      OutlinedButton.icon(
+                        onPressed: shareInChat,
+                        icon: const Icon(Icons.forum_outlined),
+                        label: const Text('مشاركة في الدردشة'),
+                      ),
+                      if (canReceive) ...[
+                        const SizedBox(height: 8),
+                        FilledButton.icon(
+                          style: FilledButton.styleFrom(backgroundColor: successColor),
+                          onPressed: receiptBusy ? null : () => confirmReceipt(details),
+                          icon: receiptBusy
+                              ? const SizedBox(width: 17, height: 17, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                              : const Icon(Icons.inventory_rounded),
+                          label: const Text('مراجعة الاستلام'),
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -6484,6 +7209,10 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                             children: [
                               Chip(label: Text('المطلوب ${item['requested_quantity']}')),
                               Chip(label: Text('المتوفر ${item['approved_quantity'] ?? '-'}')),
+                              if (item['received_quantity'] != null)
+                                Chip(label: Text('المستلم ${formatMoneyValue(item['received_quantity'])}')),
+                              if (item['damaged_quantity'] != null && doubleValue(item['damaged_quantity']) > 0)
+                                Chip(label: Text('التالف ${formatMoneyValue(item['damaged_quantity'])}')),
                               Chip(
                                 avatar: Icon(transferStatusIcon(status), size: 16),
                                 label: Text(itemStatusLabel(status)),
@@ -6491,7 +7220,8 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                             ],
                           ),
                           if (item['note'] != null) Text('ملاحظة: ${item['note']}'),
-                          if (canHandle) ...[
+                          if (item['receipt_note'] != null) Text('ملاحظة الاستلام: ${item['receipt_note']}'),
+                          if (canEditItems) ...[
                             const SizedBox(height: 8),
                             if (busy)
                               const LinearProgressIndicator(minHeight: 2)
@@ -6933,16 +7663,7 @@ class _StatusDialogState extends State<StatusDialog> {
 
   @override
   Widget build(BuildContext context) {
-    const statuses = [
-      'submitted',
-      'approved',
-      'partially_available',
-      'preparing',
-      'in_delivery',
-      'completed',
-      'rejected',
-      'cancelled',
-    ];
+    final statuses = [widget.current, ...transferAllowedNextStatuses(widget.current)];
     return AlertDialog(
       title: const Text('تحديث حالة المناقلة'),
       content: DropdownButtonFormField<String>(
@@ -6954,8 +7675,347 @@ class _StatusDialogState extends State<StatusDialog> {
       ),
       actions: [
         TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
-        FilledButton(onPressed: () => Navigator.pop(context, status), child: const Text('حفظ')),
+        FilledButton(
+          onPressed: status == widget.current ? null : () => Navigator.pop(context, status),
+          child: const Text('حفظ'),
+        ),
       ],
+    );
+  }
+}
+
+class TransferReceiptResult {
+  const TransferReceiptResult({required this.items, required this.note});
+
+  final List<Map<String, Object?>> items;
+  final String note;
+}
+
+class TransferReceiptDraft {
+  TransferReceiptDraft(Map<String, dynamic> item)
+      : item = item,
+        received = TextEditingController(text: formatMoneyValue(item['approved_quantity'] ?? 0)),
+        damaged = TextEditingController(text: '0'),
+        note = TextEditingController();
+
+  final Map<String, dynamic> item;
+  final TextEditingController received;
+  final TextEditingController damaged;
+  final TextEditingController note;
+
+  double get sentQuantity => doubleValue(item['approved_quantity']);
+  double get receivedQuantity => double.tryParse(received.text.trim().replaceAll(',', '.')) ?? -1;
+  double get damagedQuantity => double.tryParse(damaged.text.trim().replaceAll(',', '.')) ?? -1;
+  bool get valid => receivedQuantity >= 0 && damagedQuantity >= 0 && receivedQuantity + damagedQuantity <= sentQuantity;
+  bool get hasDifference => damagedQuantity > 0 || receivedQuantity < sentQuantity || note.text.trim().isNotEmpty;
+
+  void dispose() {
+    received.dispose();
+    damaged.dispose();
+    note.dispose();
+  }
+}
+
+class TransferReceiptPage extends StatefulWidget {
+  const TransferReceiptPage({
+    super.key,
+    required this.order,
+    required this.items,
+    required this.branches,
+  });
+
+  final Map<String, dynamic> order;
+  final List<Map<String, dynamic>> items;
+  final Map<int, BranchOption> branches;
+
+  @override
+  State<TransferReceiptPage> createState() => _TransferReceiptPageState();
+}
+
+class _TransferReceiptPageState extends State<TransferReceiptPage> {
+  final generalNote = TextEditingController();
+  late final List<TransferReceiptDraft> drafts = widget.items.map(TransferReceiptDraft.new).toList();
+
+  @override
+  void dispose() {
+    generalNote.dispose();
+    for (final draft in drafts) {
+      draft.dispose();
+    }
+    super.dispose();
+  }
+
+  bool get valid => drafts.isNotEmpty && drafts.every((draft) => draft.valid);
+  bool get hasDifference => drafts.any((draft) => draft.hasDifference);
+
+  void submit() {
+    if (!valid) return;
+    Navigator.pop(
+      context,
+      TransferReceiptResult(
+        note: generalNote.text.trim(),
+        items: drafts
+            .map((draft) => <String, Object?>{
+                  'item_id': '${draft.item['id']}',
+                  'received_quantity': draft.receivedQuantity,
+                  'damaged_quantity': draft.damagedQuantity,
+                  'note': draft.note.text.trim(),
+                })
+            .toList(),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final from = branchLabel(widget.branches, intValue(widget.order['from_branch_num']));
+    final to = branchLabel(widget.branches, intValue(widget.order['to_branch_num']));
+    return Scaffold(
+      appBar: AppBar(title: const Text('مراجعة الاستلام')),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 110),
+        children: [
+          PageHeading(
+            title: 'استلام مناقلة ${widget.order['order_no'] ?? ''}',
+            subtitle: 'من $to إلى $from · راجع كل بند قبل التأكيد',
+            icon: Icons.inventory_rounded,
+          ),
+          Container(
+            padding: const EdgeInsets.all(13),
+            decoration: BoxDecoration(
+              color: warningSurface,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: accentColor.withValues(alpha: 0.35)),
+            ),
+            child: const Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.info_outline_rounded, color: accentColor),
+                SizedBox(width: 9),
+                Expanded(child: Text('أدخل الكمية السليمة والتالفة. لا يجوز أن يتجاوز مجموعهما الكمية المرسلة.')),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          for (var index = 0; index < drafts.length; index++) ...[
+            Builder(builder: (context) {
+              final draft = drafts[index];
+              final product = draft.item['product'] as Map<String, dynamic>?;
+              return Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(13),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          CircleAvatar(
+                            radius: 18,
+                            backgroundColor: successSurface,
+                            child: Text('${index + 1}', style: const TextStyle(color: brandColor, fontWeight: FontWeight.w900)),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              product?['name']?.toString() ?? 'مادة ${draft.item['mat_num']}',
+                              style: const TextStyle(fontWeight: FontWeight.w900),
+                            ),
+                          ),
+                          StatusPill(label: 'المرسل ${formatMoneyValue(draft.sentQuantity)}', color: infoColor),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: draft.received,
+                              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                              onChanged: (_) => setState(() {}),
+                              decoration: const InputDecoration(labelText: 'المستلم السليم', prefixIcon: Icon(Icons.check_circle_outline_rounded)),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: TextField(
+                              controller: draft.damaged,
+                              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                              onChanged: (_) => setState(() {}),
+                              decoration: const InputDecoration(labelText: 'التالف', prefixIcon: Icon(Icons.warning_amber_rounded)),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: draft.note,
+                        onChanged: (_) => setState(() {}),
+                        decoration: const InputDecoration(labelText: 'ملاحظة البند (اختيارية)', prefixIcon: Icon(Icons.notes_rounded)),
+                      ),
+                      if (!draft.valid) ...[
+                        const SizedBox(height: 7),
+                        const Text('راجع الكميات: المجموع أكبر من المرسل أو توجد قيمة غير صحيحة.', style: TextStyle(color: dangerColor, fontSize: 12, fontWeight: FontWeight.w700)),
+                      ],
+                    ],
+                  ),
+                ),
+              );
+            }),
+            const SizedBox(height: 8),
+          ],
+          TextField(
+            controller: generalNote,
+            maxLines: 3,
+            decoration: const InputDecoration(labelText: 'ملاحظة عامة على الاستلام (اختيارية)', prefixIcon: Icon(Icons.description_outlined)),
+          ),
+        ],
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Container(
+          padding: const EdgeInsets.all(14),
+          decoration: const BoxDecoration(color: panelSurface, border: Border(top: BorderSide(color: borderColor))),
+          child: FilledButton.icon(
+            style: FilledButton.styleFrom(backgroundColor: hasDifference ? accentColor : successColor),
+            onPressed: valid ? submit : null,
+            icon: Icon(hasDifference ? Icons.rule_rounded : Icons.inventory_rounded),
+            label: Text(hasDifference ? 'تأكيد الاستلام مع ملاحظات' : 'تأكيد الاستلام كاملاً'),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ShareTransferToChatPage extends StatefulWidget {
+  const ShareTransferToChatPage({
+    super.key,
+    required this.session,
+    required this.order,
+    required this.branches,
+  });
+
+  final EmployeeSession session;
+  final Map<String, dynamic> order;
+  final Map<int, BranchOption> branches;
+
+  @override
+  State<ShareTransferToChatPage> createState() => _ShareTransferToChatPageState();
+}
+
+class _ShareTransferToChatPageState extends State<ShareTransferToChatPage> {
+  final search = TextEditingController();
+  final selected = <String>{};
+  late final Future<List<Map<String, dynamic>>> future = loadVisibleChatThreads(widget.session);
+  bool sending = false;
+
+  @override
+  void dispose() {
+    search.dispose();
+    super.dispose();
+  }
+
+  Future<void> submit() async {
+    if (selected.isEmpty || sending) return;
+    setState(() => sending = true);
+    try {
+      final from = branchLabel(widget.branches, intValue(widget.order['from_branch_num']));
+      final to = branchLabel(widget.branches, intValue(widget.order['to_branch_num']));
+      final body = 'مناقلة رقم ${widget.order['order_no'] ?? '-'} · من $from إلى $to';
+      await supabase.from('ansar_chat_messages').insert(
+            selected
+                .map((threadId) => {
+                      'thread_id': threadId,
+                      'sender_id': widget.session.id,
+                      'body': body,
+                      'message_type': 'transfer',
+                      'transfer_order_id': '${widget.order['id']}',
+                    })
+                .toList(),
+          );
+      final threads = await loadVisibleChatThreads(widget.session);
+      final now = DateTime.now().toUtc().toIso8601String();
+      for (final threadId in selected) {
+        unawaited(supabase.from('ansar_chat_threads').update({'updated_at': now}).eq('id', threadId));
+        Map<String, dynamic>? thread;
+        for (final item in threads) {
+          if ('${item['id']}' == threadId) {
+            thread = item;
+            break;
+          }
+        }
+        if (thread != null) {
+          unawaited(enqueueChatNotification(thread: thread, sender: widget.session, body: body));
+        }
+      }
+      if (mounted) Navigator.pop(context, selected.length);
+    } catch (error) {
+      if (mounted) showSnack(context, chatUpgradeError(error));
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('مشاركة المناقلة')),
+      body: FutureBuilder<List<Map<String, dynamic>>>(
+        future: future,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) return const Center(child: CircularProgressIndicator());
+          if (snapshot.hasError) return ErrorState(message: cleanError(snapshot.error), onRetry: () {});
+          final query = normalizeSearch(search.text);
+          final threads = snapshot.data!
+              .where((thread) => query.isEmpty || normalizeSearch(thread['title']?.toString() ?? '').contains(query))
+              .toList();
+          return Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(14),
+                child: TextField(
+                  controller: search,
+                  onChanged: (_) => setState(() {}),
+                  decoration: const InputDecoration(hintText: 'ابحث عن محادثة أو مجموعة', prefixIcon: Icon(Icons.search_rounded)),
+                ),
+              ),
+              Expanded(
+                child: ListView.separated(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 100),
+                  itemCount: threads.length,
+                  separatorBuilder: (_, __) => const Divider(indent: 64),
+                  itemBuilder: (context, index) {
+                    final thread = threads[index];
+                    final id = '${thread['id']}';
+                    final active = selected.contains(id);
+                    return ListTile(
+                      onTap: () => setState(() => active ? selected.remove(id) : selected.add(id)),
+                      leading: CircleAvatar(
+                        backgroundColor: successSurface,
+                        child: Icon(thread['thread_type'] == 'group' ? Icons.groups_rounded : Icons.chat_rounded, color: brandColor),
+                      ),
+                      title: Text(thread['title']?.toString() ?? 'محادثة', style: const TextStyle(fontWeight: FontWeight.w800)),
+                      subtitle: Text(chatTypeLabel(thread['thread_type']?.toString() ?? 'general')),
+                      trailing: Icon(active ? Icons.check_circle_rounded : Icons.circle_outlined, color: active ? brandColor : mutedInk),
+                    );
+                  },
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: FilledButton.icon(
+            onPressed: selected.isEmpty || sending ? null : submit,
+            icon: sending
+                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                : const Icon(Icons.send_rounded),
+            label: Text(selected.isEmpty ? 'اختر محادثة' : 'مشاركة في ${selected.length}'),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -6976,6 +8036,7 @@ class _ChatPageState extends State<ChatPage> {
   RealtimeChannel? threadsChannel;
   Timer? threadsTimer;
   bool threadBusy = false;
+  bool showArchived = false;
 
   @override
   void initState() {
@@ -6998,6 +8059,18 @@ class _ChatPageState extends State<ChatPage> {
         event: PostgresChangeEvent.all,
         schema: 'public',
         table: 'ansar_employees',
+        callback: (_) => refreshThreads(),
+      )
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_chat_participants',
+        callback: (_) => refreshThreads(),
+      )
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_chat_message_receipts',
         callback: (_) => refreshThreads(),
       ).subscribe();
     threadsTimer = Timer.periodic(const Duration(seconds: 5), (_) => refreshThreads());
@@ -7030,13 +8103,16 @@ class _ChatPageState extends State<ChatPage> {
         .order('updated_at', ascending: false);
     final joinedParticipantsFuture = supabase
         .from('ansar_chat_participants')
-        .select('thread_id')
+        .select('thread_id, role, is_pinned, is_muted, muted_until, is_archived, last_read_at')
         .eq('employee_id', widget.session.id);
     final employeesFuture = loadAllActiveEmployees();
     final rows = (await threadRowsFuture).cast<Map<String, dynamic>>();
     final joinedParticipants = (await joinedParticipantsFuture).cast<Map<String, dynamic>>();
     final activeEmployees = await employeesFuture;
     final joinedThreadIds = joinedParticipants.map((row) => row['thread_id']).toSet();
+    final settingsByThread = {
+      for (final row in joinedParticipants) '${row['thread_id']}': row,
+    };
 
     final visible = rows.where((row) {
       final type = row['thread_type'] as String? ?? 'general';
@@ -7044,6 +8120,23 @@ class _ChatPageState extends State<ChatPage> {
       return joinedThreadIds.contains(row['id']);
     }).toList();
     final threadIds = visible.map((row) => row['id']).whereType<String>().toList();
+    final unreadByThread = <String, int>{};
+    if (threadIds.isNotEmpty) {
+      try {
+        final receiptRows = await supabase
+            .from('ansar_chat_message_receipts')
+            .select('thread_id')
+            .eq('employee_id', widget.session.id)
+            .neq('status', 'read')
+            .inFilter('thread_id', threadIds);
+        for (final row in receiptRows) {
+          final threadId = '${row['thread_id']}';
+          unreadByThread[threadId] = (unreadByThread[threadId] ?? 0) + 1;
+        }
+      } catch (_) {
+        // Unread counters appear after the additive receipt migration is installed.
+      }
+    }
     final participantRows = threadIds.isEmpty
         ? <Map<String, dynamic>>[]
         : (await supabase
@@ -7103,12 +8196,15 @@ class _ChatPageState extends State<ChatPage> {
       if (thread['thread_type'] == 'direct' && otherId != null) representedDirectEmployees.add(otherId);
       return {
         ...thread,
+        ...?settingsByThread[threadId],
+        'is_muted': settingsByThread[threadId] == null ? false : chatParticipantIsMuted(settingsByThread[threadId]!),
         if (thread['thread_type'] == 'direct' && otherEmployee != null) 'title': otherEmployee.name,
         'last_message': latest,
         'last_sender_name': sender?.name,
         'thread_avatar_url': otherEmployee?.avatarUrl,
         'thread_avatar_name': otherEmployee?.name,
         'participant_ids': participantsByThread[threadId] ?? <String>[],
+        'unread_count': unreadByThread[threadId] ?? 0,
       };
     }).toList();
     final contactThreads = activeEmployees
@@ -7125,7 +8221,100 @@ class _ChatPageState extends State<ChatPage> {
             })
         .toList()
       ..sort((a, b) => normalizeSearch('${a['title']}').compareTo(normalizeSearch('${b['title']}')));
+    enrichedThreads.sort((a, b) {
+      final pinnedCompare = (b['is_pinned'] == true ? 1 : 0).compareTo(a['is_pinned'] == true ? 1 : 0);
+      if (pinnedCompare != 0) return pinnedCompare;
+      final aTime = DateTime.tryParse(a['updated_at']?.toString() ?? '') ?? DateTime.fromMillisecondsSinceEpoch(0);
+      final bTime = DateTime.tryParse(b['updated_at']?.toString() ?? '') ?? DateTime.fromMillisecondsSinceEpoch(0);
+      return bTime.compareTo(aTime);
+    });
     return [...enrichedThreads, ...contactThreads];
+  }
+
+  Future<void> updateThreadPreference(Map<String, dynamic> thread, Map<String, Object?> values) async {
+    if (thread['thread_type'] == 'contact') return;
+    try {
+      await supabase.from('ansar_chat_participants').upsert({
+        'thread_id': thread['id'],
+        'employee_id': widget.session.id,
+        'role': thread['role']?.toString() ?? 'member',
+        ...values,
+      }, onConflict: 'thread_id,employee_id');
+      thread.addAll(values);
+      refreshThreads();
+    } catch (error) {
+      if (mounted) showSnack(context, chatUpgradeError(error));
+    }
+  }
+
+  Future<void> showThreadActions(Map<String, dynamic> thread) async {
+    if (thread['thread_type'] == 'contact') return;
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: Icon(thread['is_pinned'] == true ? Icons.push_pin_rounded : Icons.push_pin_outlined, color: brandColor),
+              title: Text(thread['is_pinned'] == true ? 'إلغاء التثبيت' : 'تثبيت المحادثة'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                unawaited(updateThreadPreference(thread, {'is_pinned': thread['is_pinned'] != true}));
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.notifications_off_outlined, color: accentColor),
+              title: const Text('كتم الإشعارات'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                unawaited(showMuteOptions(thread));
+              },
+            ),
+            ListTile(
+              leading: Icon(thread['is_archived'] == true ? Icons.unarchive_rounded : Icons.archive_outlined, color: infoColor),
+              title: Text(thread['is_archived'] == true ? 'إلغاء الأرشفة' : 'أرشفة المحادثة'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                final archived = thread['is_archived'] != true;
+                unawaited(updateThreadPreference(thread, {
+                  'is_archived': archived,
+                  'archived_at': archived ? DateTime.now().toUtc().toIso8601String() : null,
+                }));
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> showMuteOptions(Map<String, dynamic> thread) async {
+    final option = await showModalBottomSheet<String>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const ListTile(title: Text('مدة كتم الإشعارات', style: TextStyle(fontWeight: FontWeight.w900))),
+            ListTile(title: const Text('8 ساعات'), onTap: () => Navigator.pop(sheetContext, '8h')),
+            ListTile(title: const Text('أسبوع'), onTap: () => Navigator.pop(sheetContext, '1w')),
+            ListTile(title: const Text('دائماً'), onTap: () => Navigator.pop(sheetContext, 'forever')),
+            ListTile(title: const Text('إلغاء الكتم'), onTap: () => Navigator.pop(sheetContext, 'off')),
+          ],
+        ),
+      ),
+    );
+    if (option == null) return;
+    final now = DateTime.now().toUtc();
+    final mutedUntil = option == '8h'
+        ? now.add(const Duration(hours: 8)).toIso8601String()
+        : option == '1w'
+            ? now.add(const Duration(days: 7)).toIso8601String()
+            : option == 'forever'
+                ? DateTime.utc(9999, 12, 31).toIso8601String()
+                : null;
+    await updateThreadPreference(thread, {'is_muted': option != 'off', 'muted_until': mutedUntil});
   }
 
   Future<void> openThread(Map<String, dynamic> thread) async {
@@ -7258,6 +8447,10 @@ class _ChatPageState extends State<ChatPage> {
                 final body = normalizeSearch(latest?['body']?.toString() ?? '');
                 return title.contains(query) || username.contains(query) || body.contains(query);
               }).toList();
+        final filteredThreads = visibleThreads.where((thread) {
+          if (thread['thread_type'] == 'contact') return !showArchived;
+          return (thread['is_archived'] == true) == showArchived;
+        }).toList();
         return Scaffold(
           body: ListView(
             key: const PageStorageKey('chat-list'),
@@ -7265,12 +8458,23 @@ class _ChatPageState extends State<ChatPage> {
             children: [
               PageHeading(
                 title: 'الدردشة',
-                subtitle: 'اختر أي موظف لمراسلته أو أنشئ مجموعة عمل',
+                subtitle: showArchived ? 'المحادثات المؤرشفة' : 'اختر أي موظف لمراسلته أو أنشئ مجموعة عمل',
                 icon: Icons.chat_bubble_outline_rounded,
-                action: IconButton.filled(
-                  tooltip: 'مجموعة جديدة',
-                  onPressed: threadBusy ? null : createThread,
-                  icon: const Icon(Icons.group_add_rounded),
+                action: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton.outlined(
+                      tooltip: showArchived ? 'المحادثات' : 'الأرشيف',
+                      onPressed: () => setState(() => showArchived = !showArchived),
+                      icon: Icon(showArchived ? Icons.chat_bubble_outline_rounded : Icons.archive_outlined),
+                    ),
+                    const SizedBox(width: 6),
+                    IconButton.filled(
+                      tooltip: 'مجموعة جديدة',
+                      onPressed: threadBusy ? null : createThread,
+                      icon: const Icon(Icons.group_add_rounded),
+                    ),
+                  ],
                 ),
               ),
               TextField(
@@ -7292,8 +8496,8 @@ class _ChatPageState extends State<ChatPage> {
                 ),
               ),
               const SizedBox(height: 14),
-              SectionHeader(title: 'المحادثات (${visibleThreads.length})'),
-              if (visibleThreads.isEmpty)
+              SectionHeader(title: '${showArchived ? 'المؤرشفة' : 'المحادثات'} (${filteredThreads.length})'),
+              if (filteredThreads.isEmpty)
                 const EmptyState(icon: Icons.chat_bubble_outline_rounded, text: 'لا توجد محادثات بعد')
               else
                 Container(
@@ -7305,12 +8509,13 @@ class _ChatPageState extends State<ChatPage> {
                   ),
                   child: Column(
                     children: [
-                      for (var i = 0; i < visibleThreads.length; i++) ...[
+                      for (var i = 0; i < filteredThreads.length; i++) ...[
                         ChatThreadTile(
-                          thread: visibleThreads[i],
-                          onTap: () => openThread(visibleThreads[i]),
+                          thread: filteredThreads[i],
+                          onTap: () => openThread(filteredThreads[i]),
+                          onLongPress: () => showThreadActions(filteredThreads[i]),
                         ),
-                        if (i != visibleThreads.length - 1) const Divider(indent: 78, height: 1),
+                        if (i != filteredThreads.length - 1) const Divider(indent: 78, height: 1),
                       ],
                     ],
                   ),
@@ -7324,10 +8529,11 @@ class _ChatPageState extends State<ChatPage> {
 }
 
 class ChatThreadTile extends StatelessWidget {
-  const ChatThreadTile({super.key, required this.thread, required this.onTap});
+  const ChatThreadTile({super.key, required this.thread, required this.onTap, this.onLongPress});
 
   final Map<String, dynamic> thread;
   final VoidCallback onTap;
+  final VoidCallback? onLongPress;
 
   @override
   Widget build(BuildContext context) {
@@ -7338,6 +8544,7 @@ class ChatThreadTile extends StatelessWidget {
     final latest = thread['last_message'] as Map<String, dynamic>?;
     final senderName = thread['last_sender_name']?.toString();
     final contactUsername = thread['contact_username']?.toString() ?? '';
+    final unread = intValue(thread['unread_count']);
     final emptySubtitle = contact
         ? '${contactUsername.isEmpty ? '' : '@$contactUsername · '}بدء محادثة خاصة'
         : chatTypeLabel(type);
@@ -7347,6 +8554,7 @@ class ChatThreadTile extends StatelessWidget {
       color: panelSurface,
       child: InkWell(
         onTap: onTap,
+        onLongPress: onLongPress,
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 12),
           child: Row(
@@ -7383,6 +8591,10 @@ class ChatThreadTile extends StatelessWidget {
                         ),
                         if (latest != null)
                           Text(chatListTime(latest['created_at']), style: const TextStyle(color: mutedInk, fontSize: 10)),
+                        if (thread['is_pinned'] == true) ...[
+                          const SizedBox(width: 5),
+                          const Icon(Icons.push_pin_rounded, size: 14, color: brandColor),
+                        ],
                       ],
                     ),
                     const SizedBox(height: 4),
@@ -7398,12 +8610,60 @@ class ChatThreadTile extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 5),
-              const Icon(Icons.chevron_left_rounded, color: mutedInk, size: 20),
+              Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  if (unread > 0)
+                    Badge(
+                      label: Text(unread > 99 ? '99+' : '$unread'),
+                      backgroundColor: brandColor,
+                    )
+                  else
+                    const Icon(Icons.chevron_left_rounded, color: mutedInk, size: 20),
+                  if (thread['is_muted'] == true)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 4),
+                      child: Icon(Icons.notifications_off_rounded, color: mutedInk, size: 14),
+                    ),
+                ],
+              ),
             ],
           ),
         ),
       ),
     );
+  }
+}
+
+class ChatAttachmentDraft {
+  const ChatAttachmentDraft({required this.name, required this.bytes, required this.mimeType});
+
+  final String name;
+  final Uint8List bytes;
+  final String mimeType;
+}
+
+String chatAttachmentMime(String extension) {
+  switch (extension.toLowerCase()) {
+    case 'jpg':
+    case 'jpeg':
+      return 'image/jpeg';
+    case 'png':
+      return 'image/png';
+    case 'webp':
+      return 'image/webp';
+    case 'pdf':
+      return 'application/pdf';
+    case 'doc':
+      return 'application/msword';
+    case 'docx':
+      return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    case 'xls':
+      return 'application/vnd.ms-excel';
+    case 'xlsx':
+      return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    default:
+      return 'application/octet-stream';
   }
 }
 
@@ -7423,18 +8683,25 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   final scrollController = ScrollController();
   final messageKeys = <String, GlobalKey>{};
   final senderProfiles = <String, Map<String, dynamic>>{};
+  final pendingAttachments = <ChatAttachmentDraft>[];
   late Future<List<Map<String, dynamic>>> future;
   List<Map<String, dynamic>>? latestMessages;
   Map<String, dynamic>? replyingTo;
   Map<String, dynamic>? editingMessage;
   Timer? timer;
+  Timer? typingTimer;
   StreamSubscription<List<Map<String, dynamic>>>? messageChanges;
+  RealtimeChannel? liveChannel;
   bool sendingMessage = false;
   bool refreshingMessages = false;
   bool refreshMessagesAgain = false;
   bool showNewMessageHint = false;
   String? lastRenderedMessageId;
   String? previousActiveChatThreadId;
+  String? typingEmployeeName;
+  bool otherParticipantOnline = false;
+  DateTime? otherParticipantLastSeen;
+  int messageLimit = 120;
 
   @override
   void initState() {
@@ -7442,6 +8709,9 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     previousActiveChatThreadId = activeChatThreadId;
     activeChatThreadId = '${widget.thread['id']}';
     future = loadAndRememberMessages();
+    message.addListener(handleTypingChanged);
+    setupLiveConversation();
+    unawaited(loadOtherParticipantLastSeen());
     scrollController.addListener(handleMessageScroll);
     messageChanges = supabase
         .from('ansar_chat_messages')
@@ -7455,13 +8725,106 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   void dispose() {
     if (activeChatThreadId == '${widget.thread['id']}') activeChatThreadId = previousActiveChatThreadId;
     timer?.cancel();
+    typingTimer?.cancel();
     messageChanges?.cancel();
+    if (liveChannel != null) {
+      liveChannel!.untrack();
+      supabase.removeChannel(liveChannel!);
+    }
+    message.removeListener(handleTypingChanged);
     scrollController
       ..removeListener(handleMessageScroll)
       ..dispose();
     composerFocus.dispose();
     message.dispose();
+    unawaited(touchEmployeePresence(widget.session.id, online: false));
     super.dispose();
+  }
+
+  void setupLiveConversation() {
+    final participantIds = (widget.thread['participant_ids'] as List?)?.map((value) => '$value').toSet() ?? <String>{};
+    liveChannel = supabase.channel('ansar-chat-live-${widget.thread['id']}')
+      ..onBroadcast(
+        event: 'typing',
+        callback: (payload) {
+          final employeeId = payload['employee_id']?.toString();
+          final general = widget.thread['thread_type'] == 'general';
+          if (!mounted || employeeId == null || employeeId == widget.session.id || (!general && !participantIds.contains(employeeId))) return;
+          final active = payload['typing'] == true;
+          typingTimer?.cancel();
+          setState(() => typingEmployeeName = active ? payload['employee_name']?.toString() ?? 'موظف' : null);
+          if (active) {
+            typingTimer = Timer(const Duration(seconds: 3), () {
+              if (mounted) setState(() => typingEmployeeName = null);
+            });
+          }
+        },
+      )
+      ..onPresenceSync((_) => updateOnlinePresence(participantIds))
+      ..onPresenceJoin((_) => updateOnlinePresence(participantIds))
+      ..onPresenceLeave((_) => updateOnlinePresence(participantIds))
+      ..subscribe((status, error) async {
+        if (status == RealtimeSubscribeStatus.subscribed) {
+          await liveChannel?.track({
+            'employee_id': widget.session.id,
+            'employee_name': widget.session.name,
+            'online_at': DateTime.now().toUtc().toIso8601String(),
+          });
+          await touchEmployeePresence(widget.session.id, online: true);
+        }
+      });
+  }
+
+  void updateOnlinePresence(Set<String> participantIds) {
+    if (!mounted || liveChannel == null) return;
+    final state = liveChannel!.presenceState().toString();
+    final others = participantIds.where((id) => id != widget.session.id);
+    final online = others.any(state.contains);
+    if (online != otherParticipantOnline) setState(() => otherParticipantOnline = online);
+    if (!online) unawaited(loadOtherParticipantLastSeen());
+  }
+
+  Future<void> loadOtherParticipantLastSeen() async {
+    if (widget.thread['thread_type'] != 'direct') return;
+    final participantIds = (widget.thread['participant_ids'] as List?)?.map((value) => '$value').toList() ?? <String>[];
+    final others = participantIds.where((id) => id != widget.session.id).toList();
+    if (others.isEmpty) return;
+    try {
+      final rows = await supabase.from('ansar_employees').select('last_seen_at').eq('id', others.first).limit(1);
+      final value = rows.isEmpty ? null : DateTime.tryParse(rows.first['last_seen_at']?.toString() ?? '')?.toLocal();
+      if (mounted) setState(() => otherParticipantLastSeen = value);
+    } catch (_) {
+      // Last seen appears after the platform migration is installed.
+    }
+  }
+
+  String get conversationPresenceLabel {
+    if (typingEmployeeName != null) return '${typingEmployeeName!} يكتب الآن...';
+    if (widget.thread['thread_type'] == 'direct' && otherParticipantOnline) return 'متصل الآن';
+    if (widget.thread['thread_type'] == 'direct' && otherParticipantLastSeen != null) {
+      return 'آخر ظهور ${formatDateTime(otherParticipantLastSeen!)}';
+    }
+    if (widget.thread['thread_type'] == 'group') {
+      return '${(widget.thread['participant_ids'] as List?)?.length ?? 0} أعضاء';
+    }
+    return chatTypeLabel(widget.thread['thread_type'] as String? ?? 'general');
+  }
+
+  void handleTypingChanged() {
+    if (liveChannel == null || editingMessage != null) return;
+    final hasText = message.text.trim().isNotEmpty;
+    unawaited(sendTypingState(hasText));
+  }
+
+  Future<void> sendTypingState(bool typing) async {
+    await liveChannel?.sendBroadcastMessage(
+      event: 'typing',
+      payload: {
+        'employee_id': widget.session.id,
+        'employee_name': widget.session.name,
+        'typing': typing,
+      },
+    );
   }
 
   Future<void> refreshMessages() async {
@@ -7546,7 +8909,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
         .select()
         .eq('thread_id', widget.thread['id'])
         .order('created_at', ascending: false)
-        .limit(120);
+        .limit(messageLimit);
     final allMessages = rows.cast<Map<String, dynamic>>().reversed.toList();
     var hiddenMessageIds = <String>{};
     try {
@@ -7562,6 +8925,47 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       // The chat remains usable before the optional per-user deletion migration is installed.
     }
     final messages = allMessages.where((row) => !hiddenMessageIds.contains('${row['id']}')).toList();
+    List<Map<String, dynamic>> receiptRows = [];
+    try {
+      final messageIds = messages.map((row) => '${row['id']}').toList();
+      if (messageIds.isNotEmpty) {
+        final rows = await supabase
+            .from('ansar_chat_message_receipts')
+            .select('message_id, employee_id, status, sent_at, delivered_at, read_at')
+            .inFilter('message_id', messageIds);
+        receiptRows = rows.cast<Map<String, dynamic>>();
+      }
+      await supabase.rpc('ansar_mark_chat_delivered', params: {
+        'p_employee_id': widget.session.id,
+        'p_thread_id': '${widget.thread['id']}',
+      });
+      await supabase.rpc('ansar_mark_chat_read', params: {
+        'p_employee_id': widget.session.id,
+        'p_thread_id': '${widget.thread['id']}',
+      });
+    } catch (_) {
+      // Receipts are optional until the platform migration is installed.
+    }
+    final transferById = <String, Map<String, dynamic>>{};
+    final transferIds = messages
+        .map((row) => row['transfer_order_id']?.toString())
+        .whereType<String>()
+        .where((id) => id.isNotEmpty)
+        .toSet()
+        .toList();
+    if (transferIds.isNotEmpty) {
+      try {
+        final transferRows = await supabase
+            .from('ansar_transfer_orders')
+            .select('id, order_no, status, from_branch_num, to_branch_num')
+            .inFilter('id', transferIds);
+        for (final transfer in transferRows.cast<Map<String, dynamic>>()) {
+          transferById['${transfer['id']}'] = transfer;
+        }
+      } catch (_) {
+        // The message still opens the transfer even if its live status cannot be fetched briefly.
+      }
+    }
     final messageById = <String, Map<String, dynamic>>{
       for (final row in messages) if (row['id'] != null) '${row['id']}': row,
     };
@@ -7585,6 +8989,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     final senderIds = <String>{
       ...messages.map((row) => row['sender_id']?.toString()).whereType<String>(),
       ...messageById.values.map((row) => row['sender_id']?.toString()).whereType<String>(),
+      ...receiptRows.map((row) => row['employee_id']?.toString()).whereType<String>(),
     }.toList();
     final missingSenderIds = senderIds.where((id) => !senderProfiles.containsKey(id)).toList();
     final employeeRows = missingSenderIds.isEmpty
@@ -7597,10 +9002,22 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       senderProfiles['${row['id']}'] = row;
     }
     final employees = senderProfiles;
+    final receiptsByMessage = <String, List<Map<String, dynamic>>>{};
+    for (final receipt in receiptRows) {
+      receiptsByMessage.putIfAbsent('${receipt['message_id']}', () => <Map<String, dynamic>>[]).add(receipt);
+    }
     return messages.map((row) {
       final employee = employees[row['sender_id']];
       final reply = messageById[row['reply_to_id']?.toString()];
       final replyEmployee = reply == null ? null : employees[reply['sender_id']];
+      final receipts = receiptsByMessage['${row['id']}'] ?? <Map<String, dynamic>>[];
+      final receiptStatus = receipts.isEmpty
+          ? 'sent'
+          : receipts.every((receipt) => receipt['status'] == 'read')
+              ? 'read'
+              : receipts.every((receipt) => {'delivered', 'read'}.contains(receipt['status']))
+                  ? 'delivered'
+                  : 'sent';
       return {
         ...row,
         'sender_name': employee == null
@@ -7613,33 +9030,101 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
         'reply_preview_sender': reply == null
             ? null
             : (replyEmployee?['display_name'] ?? replyEmployee?['full_name'] ?? replyEmployee?['username'] ?? 'موظف').toString(),
+        'receipt_status': receiptStatus,
+        'receipt_details': receipts
+            .map((receipt) => {
+                  ...receipt,
+                  'employee_name': employeeDisplayName(employees['${receipt['employee_id']}'] ?? const <String, dynamic>{}),
+                  'avatar_url': employees['${receipt['employee_id']}']?['avatar_url'],
+                })
+            .toList(),
+        'transfer_status': transferById[row['transfer_order_id']?.toString()]?['status'],
       };
     }).toList();
   }
 
+  Future<void> pickAttachments() async {
+    if (pendingAttachments.length >= 5 || sendingMessage) return;
+    final result = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      withData: true,
+      type: FileType.custom,
+      allowedExtensions: const ['jpg', 'jpeg', 'png', 'webp', 'pdf', 'doc', 'docx', 'xls', 'xlsx'],
+    );
+    if (result == null || !mounted) return;
+    final remaining = 5 - pendingAttachments.length;
+    final selected = <ChatAttachmentDraft>[];
+    for (final file in result.files.take(remaining)) {
+      Uint8List? bytes = file.bytes;
+      if (bytes == null && file.path != null) bytes = await File(file.path!).readAsBytes();
+      if (bytes == null) continue;
+      final mime = chatAttachmentMime(file.extension ?? file.name.split('.').last);
+      if (mime.startsWith('image/') && bytes.length > 1200000 && file.path != null) {
+        final compressed = await FlutterImageCompress.compressWithFile(
+          file.path!,
+          minWidth: 1600,
+          minHeight: 1600,
+          quality: 76,
+        );
+        if (compressed != null) bytes = compressed;
+      }
+      if (bytes.length > 10 * 1024 * 1024) {
+        if (mounted) showSnack(context, 'تم تجاهل ${file.name}: الحد الأقصى 10 ميغابايت');
+        continue;
+      }
+      selected.add(ChatAttachmentDraft(name: file.name, bytes: bytes, mimeType: mime));
+    }
+    if (selected.isNotEmpty) setState(() => pendingAttachments.addAll(selected));
+  }
+
+  Future<List<Map<String, Object?>>> uploadPendingAttachments() async {
+    final uploaded = <Map<String, Object?>>[];
+    for (var index = 0; index < pendingAttachments.length; index++) {
+      final attachment = pendingAttachments[index];
+      final safeName = attachment.name.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+      final path = '${widget.thread['id']}/${DateTime.now().microsecondsSinceEpoch}-$index-$safeName';
+      await supabase.storage.from('ansar-chat').uploadBinary(
+            path,
+            attachment.bytes,
+            fileOptions: FileOptions(contentType: attachment.mimeType, upsert: false),
+          );
+      uploaded.add({
+        'path': path,
+        'name': attachment.name,
+        'size': attachment.bytes.length,
+        'mime_type': attachment.mimeType,
+      });
+    }
+    return uploaded;
+  }
+
   Future<void> sendMessage() async {
     final body = message.text.trim();
-    if (body.isEmpty || sendingMessage) return;
+    if ((body.isEmpty && pendingAttachments.isEmpty) || sendingMessage) return;
     if (editingMessage != null) {
+      if (body.isEmpty) return;
       await saveEditedMessage(body);
       return;
     }
     setState(() => sendingMessage = true);
     try {
       final reply = replyingTo;
+      final attachments = await uploadPendingAttachments();
       final inserted = await supabase
           .from('ansar_chat_messages')
           .insert({
             'thread_id': widget.thread['id'],
             'sender_id': widget.session.id,
             'body': body,
-            'message_type': 'text',
+            'message_type': attachments.isEmpty ? 'text' : 'attachment',
+            if (attachments.isNotEmpty) 'attachments': attachments,
             if (reply?['id'] != null) 'reply_to_id': '${reply!['id']}',
           })
           .select()
           .single();
       if (mounted) {
         message.clear();
+        pendingAttachments.clear();
         final updated = <Map<String, dynamic>>[
           for (final row in latestMessages ?? <Map<String, dynamic>>[])
             if ('${row['id']}' != '${inserted['id']}') row,
@@ -7666,7 +9151,9 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       unawaited(enqueueChatNotification(
         thread: widget.thread,
         sender: widget.session,
-        body: body.length > 80 ? '${body.substring(0, 80)}...' : body,
+        body: body.isEmpty
+            ? 'أرسل ${attachments.length == 1 ? 'مرفقاً' : '${attachments.length} مرفقات'}'
+            : (body.length > 80 ? '${body.substring(0, 80)}...' : body),
       ));
     } catch (error) {
       if (mounted) showSnack(context, chatUpgradeError(error));
@@ -7866,6 +9353,16 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                     beginEdit(row);
                   },
                 ),
+              if (mine && !deleted)
+                ListTile(
+                  leading: const Icon(Icons.info_outline_rounded, color: infoColor),
+                  title: const Text('معلومات الرسالة'),
+                  subtitle: const Text('حالة الوصول والقراءة لكل مستلم'),
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    unawaited(showMessageInfo(row));
+                  },
+                ),
               ListTile(
                 leading: const Icon(Icons.delete_sweep_outlined, color: dangerColor),
                 title: const Text('حذف لدي', style: TextStyle(color: dangerColor)),
@@ -7885,6 +9382,56 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                     unawaited(deleteMessage(row));
                   },
                 ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> showMessageInfo(Map<String, dynamic> row) async {
+    final details = (row['receipt_details'] as List?)?.cast<Map<String, dynamic>>() ?? <Map<String, dynamic>>[];
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) => SafeArea(
+        child: FractionallySizedBox(
+          heightFactor: 0.68,
+          child: Column(
+            children: [
+              ListTile(
+                leading: const Icon(Icons.fact_check_outlined, color: brandColor),
+                title: const Text('معلومات الرسالة', style: TextStyle(fontWeight: FontWeight.w900)),
+                subtitle: Text(row['body']?.toString() ?? 'مرفق'),
+              ),
+              const Divider(height: 1),
+              Expanded(
+                child: details.isEmpty
+                    ? const EmptyState(icon: Icons.schedule_rounded, text: 'لم تتوفر إيصالات المستلمين بعد')
+                    : ListView.separated(
+                        itemCount: details.length,
+                        separatorBuilder: (_, __) => const Divider(indent: 64, height: 1),
+                        itemBuilder: (context, index) {
+                          final detail = details[index];
+                          final status = detail['status']?.toString() ?? 'sent';
+                          final label = status == 'read' ? 'تمت القراءة' : status == 'delivered' ? 'تم الوصول' : 'تم الإرسال';
+                          final time = detail['read_at'] ?? detail['delivered_at'] ?? detail['sent_at'];
+                          return ListTile(
+                            leading: EmployeeAvatar(
+                              name: detail['employee_name']?.toString() ?? 'موظف',
+                              imageUrl: detail['avatar_url']?.toString(),
+                              radius: 21,
+                            ),
+                            title: Text(detail['employee_name']?.toString() ?? 'موظف', style: const TextStyle(fontWeight: FontWeight.w800)),
+                            subtitle: Text('$label · ${formatEventTime(time)}'),
+                            trailing: Icon(
+                              status == 'read' ? Icons.done_all_rounded : status == 'delivered' ? Icons.done_all_rounded : Icons.done_rounded,
+                              color: status == 'read' ? infoColor : mutedInk,
+                            ),
+                          );
+                        },
+                      ),
+              ),
             ],
           ),
         ),
@@ -7937,6 +9484,121 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     if (result.title != null) setState(() => widget.thread['title'] = result.title);
   }
 
+  Future<void> searchConversation() async {
+    final controller = TextEditingController();
+    final query = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('بحث داخل المحادثة'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          textInputAction: TextInputAction.search,
+          decoration: const InputDecoration(hintText: 'اكتب كلمة أو جملة', prefixIcon: Icon(Icons.search_rounded)),
+          onSubmitted: (value) => Navigator.pop(dialogContext, value.trim()),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('إلغاء')),
+          FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text.trim()), child: const Text('بحث')),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (query == null || query.isEmpty || !mounted) return;
+    try {
+      final safeQuery = safeSearchPattern(query);
+      final rows = await supabase
+          .from('ansar_chat_messages')
+          .select('id, body, sender_id, created_at')
+          .eq('thread_id', widget.thread['id'])
+          .isFilter('deleted_at', null)
+          .ilike('body', '%$safeQuery%')
+          .order('created_at', ascending: false)
+          .limit(50);
+      if (!mounted) return;
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        builder: (sheetContext) => SafeArea(
+          child: FractionallySizedBox(
+            heightFactor: 0.75,
+            child: Column(
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.manage_search_rounded, color: brandColor),
+                  title: Text('نتائج البحث عن «$query»', style: const TextStyle(fontWeight: FontWeight.w900)),
+                  subtitle: Text('${rows.length} نتيجة'),
+                ),
+                const Divider(height: 1),
+                Expanded(
+                  child: rows.isEmpty
+                      ? const EmptyState(icon: Icons.search_off_rounded, text: 'لا توجد رسائل مطابقة')
+                      : ListView.separated(
+                          itemCount: rows.length,
+                          separatorBuilder: (_, __) => const Divider(height: 1),
+                          itemBuilder: (context, index) {
+                            final row = rows[index];
+                            return ListTile(
+                              leading: const Icon(Icons.chat_bubble_outline_rounded),
+                              title: Text(row['body']?.toString() ?? '', maxLines: 2, overflow: TextOverflow.ellipsis),
+                              subtitle: Text(formatEventTime(row['created_at'])),
+                              onTap: () {
+                                Navigator.pop(sheetContext);
+                                unawaited(jumpToMessage('${row['id']}'));
+                              },
+                            );
+                          },
+                        ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    }
+  }
+
+  Future<void> jumpToMessage(String messageId) async {
+    if (messageKeys[messageId]?.currentContext == null) {
+      messageLimit = 500;
+      final loaded = await loadMessages();
+      if (!mounted) return;
+      setState(() {
+        latestMessages = loaded;
+        future = Future.value(loaded);
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+    }
+    final targetContext = messageKeys[messageId]?.currentContext;
+    if (targetContext == null) {
+      if (mounted) showSnack(context, 'الرسالة أقدم من النطاق المحمل حالياً');
+      return;
+    }
+    await Scrollable.ensureVisible(targetContext, duration: const Duration(milliseconds: 320), alignment: 0.35);
+  }
+
+  Future<void> openTransferMessage(Map<String, dynamic> row) async {
+    await openTransferNotification(context, widget.session, {
+      'type': 'transfer_shared',
+      'route': 'transfer',
+      'order_id': row['transfer_order_id'],
+    });
+  }
+
+  Future<void> openAttachment(Map<String, dynamic> attachment) async {
+    final path = attachment['path']?.toString();
+    if (path == null || path.isEmpty) return;
+    try {
+      final url = await supabase.storage.from('ansar-chat').createSignedUrl(path, 600);
+      final opened = await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+      if (!opened && mounted) showSnack(context, 'تعذر فتح المرفق على هذا الجهاز');
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
+    }
+  }
+
   void scrollToReply(String? messageId) {
     if (messageId == null) return;
     final targetContext = messageKeys[messageId]?.currentContext;
@@ -7984,10 +9646,14 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                       style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900),
                     ),
                     Text(
-                      widget.thread['thread_type'] == 'group'
-                          ? '${(widget.thread['participant_ids'] as List?)?.length ?? 0} أعضاء'
-                          : chatTypeLabel(widget.thread['thread_type'] as String? ?? 'general'),
-                      style: const TextStyle(color: mutedInk, fontSize: 10, fontWeight: FontWeight.w500),
+                      conversationPresenceLabel,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: typingEmployeeName != null || otherParticipantOnline ? successColor : mutedInk,
+                        fontSize: 10,
+                        fontWeight: typingEmployeeName != null || otherParticipantOnline ? FontWeight.w800 : FontWeight.w500,
+                      ),
                     ),
                   ],
                 ),
@@ -7996,6 +9662,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
           ),
         ),
         actions: [
+          IconButton(tooltip: 'بحث في المحادثة', onPressed: searchConversation, icon: const Icon(Icons.search_rounded)),
           IconButton(tooltip: 'معلومات المحادثة', onPressed: openThreadInfo, icon: const Icon(Icons.info_outline_rounded)),
         ],
       ),
@@ -8052,6 +9719,8 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                             onLongPress: () => showMessageActions(row),
                             onAvatarTap: mine ? null : () => openSenderChat(row),
                             onReplyTap: () => scrollToReply(row['reply_to_id']?.toString()),
+                            onTransferTap: row['transfer_order_id'] == null ? null : () => openTransferMessage(row),
+                            onAttachmentTap: openAttachment,
                           ),
                         );
                       },
@@ -8117,9 +9786,41 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                     ),
                     const SizedBox(height: 8),
                   ],
+                  if (pendingAttachments.isNotEmpty) ...[
+                    SizedBox(
+                      width: double.infinity,
+                      child: Wrap(
+                        spacing: 7,
+                        runSpacing: 7,
+                        children: [
+                          for (var index = 0; index < pendingAttachments.length; index++)
+                            InputChip(
+                              avatar: Icon(
+                                pendingAttachments[index].mimeType.startsWith('image/')
+                                    ? Icons.image_outlined
+                                    : Icons.description_outlined,
+                                size: 17,
+                              ),
+                              label: ConstrainedBox(
+                                constraints: const BoxConstraints(maxWidth: 150),
+                                child: Text(pendingAttachments[index].name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                              ),
+                              onDeleted: sendingMessage ? null : () => setState(() => pendingAttachments.removeAt(index)),
+                            ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                  ],
                   Row(
                     crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
+                      IconButton(
+                        tooltip: 'إرفاق صورة أو ملف',
+                        onPressed: sendingMessage || editingMessage != null || pendingAttachments.length >= 5 ? null : pickAttachments,
+                        icon: const Icon(Icons.attach_file_rounded, color: brandColor),
+                      ),
+                      const SizedBox(width: 2),
                       Expanded(
                         child: Container(
                           decoration: BoxDecoration(
@@ -8188,6 +9889,8 @@ class ChatMessageBubble extends StatelessWidget {
     required this.onLongPress,
     this.onAvatarTap,
     this.onReplyTap,
+    this.onTransferTap,
+    this.onAttachmentTap,
   });
 
   final Map<String, dynamic> row;
@@ -8199,6 +9902,8 @@ class ChatMessageBubble extends StatelessWidget {
   final VoidCallback? onLongPress;
   final VoidCallback? onAvatarTap;
   final VoidCallback? onReplyTap;
+  final VoidCallback? onTransferTap;
+  final ValueChanged<Map<String, dynamic>>? onAttachmentTap;
 
   @override
   Widget build(BuildContext context) {
@@ -8207,6 +9912,12 @@ class ChatMessageBubble extends StatelessWidget {
     final forwarded = row['forwarded_from_id'] != null || row['message_type'] == 'forwarded';
     final edited = row['edited_at'] != null;
     final replyBody = row['reply_preview_body']?.toString();
+    final receiptStatus = row['receipt_status']?.toString() ?? 'sent';
+    final attachments = (row['attachments'] as List?)
+            ?.whereType<Map>()
+            .map((value) => Map<String, dynamic>.from(value))
+            .toList() ??
+        <Map<String, dynamic>>[];
     return Column(
       children: [
         if (showDate) ...[
@@ -8314,8 +10025,20 @@ class ChatMessageBubble extends StatelessWidget {
                                       ),
                                     ],
                                   )
-                                else
-                                  Text(row['body']?.toString() ?? '', style: const TextStyle(height: 1.45)),
+                                else ...[
+                                  if (row['transfer_order_id'] != null)
+                                    TransferChatMessageCard(
+                                      body: row['body']?.toString() ?? 'مناقلة مشتركة',
+                                      status: row['transfer_status']?.toString(),
+                                      onTap: onTransferTap,
+                                    )
+                                  else if ((row['body']?.toString() ?? '').isNotEmpty)
+                                    Text(row['body']?.toString() ?? '', style: const TextStyle(height: 1.45)),
+                                  if (attachments.isNotEmpty) ...[
+                                    if ((row['body']?.toString() ?? '').isNotEmpty) const SizedBox(height: 7),
+                                    ChatAttachmentList(attachments: attachments, onTap: onAttachmentTap),
+                                  ],
+                                ],
                                 const SizedBox(height: 5),
                                 Align(
                                   alignment: Alignment.centerLeft,
@@ -8329,7 +10052,11 @@ class ChatMessageBubble extends StatelessWidget {
                                       Text(formatTime(created), style: const TextStyle(fontSize: 9, color: mutedInk)),
                                       if (mine) ...[
                                         const SizedBox(width: 3),
-                                        const Icon(Icons.done_rounded, size: 13, color: brandColor),
+                                        Icon(
+                                          receiptStatus == 'sent' ? Icons.done_rounded : Icons.done_all_rounded,
+                                          size: 14,
+                                          color: receiptStatus == 'read' ? infoColor : brandColor,
+                                        ),
                                       ],
                                     ],
                                   ),
@@ -8347,6 +10074,105 @@ class ChatMessageBubble extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 7),
+      ],
+    );
+  }
+}
+
+class TransferChatMessageCard extends StatelessWidget {
+  const TransferChatMessageCard({super.key, required this.body, this.status, this.onTap});
+
+  final String body;
+  final String? status;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: infoColor.withValues(alpha: 0.08),
+      borderRadius: BorderRadius.circular(7),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(7),
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Row(
+            children: [
+              Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(color: infoColor.withValues(alpha: 0.13), shape: BoxShape.circle),
+                child: const Icon(Icons.swap_horiz_rounded, color: infoColor),
+              ),
+              const SizedBox(width: 9),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('مناقلة مشتركة', style: TextStyle(color: infoColor, fontWeight: FontWeight.w900, fontSize: 11)),
+                    Text(body, maxLines: 3, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11, height: 1.4)),
+                    if (status != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text(statusLabel(status!), style: const TextStyle(color: brandColor, fontSize: 10, fontWeight: FontWeight.w900)),
+                      ),
+                  ],
+                ),
+              ),
+              const Icon(Icons.chevron_left_rounded, color: infoColor),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ChatAttachmentList extends StatelessWidget {
+  const ChatAttachmentList({super.key, required this.attachments, this.onTap});
+
+  final List<Map<String, dynamic>> attachments;
+  final ValueChanged<Map<String, dynamic>>? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        for (final attachment in attachments)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 5),
+            child: Material(
+              color: softSurface,
+              borderRadius: BorderRadius.circular(7),
+              child: InkWell(
+                onTap: onTap == null ? null : () => onTap!(attachment),
+                borderRadius: BorderRadius.circular(7),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 8),
+                  child: Row(
+                    children: [
+                      Icon(
+                        (attachment['mime_type']?.toString() ?? '').startsWith('image/')
+                            ? Icons.image_outlined
+                            : Icons.description_outlined,
+                        color: brandColor,
+                      ),
+                      const SizedBox(width: 7),
+                      Expanded(
+                        child: Text(
+                          attachment['name']?.toString() ?? 'مرفق',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 11),
+                        ),
+                      ),
+                      const Icon(Icons.open_in_new_rounded, color: mutedInk, size: 16),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
       ],
     );
   }
@@ -8729,7 +10555,17 @@ bool chatMessageSnapshotsEqual(
   List<Map<String, dynamic>> current,
 ) {
   if (previous == null || previous.length != current.length) return false;
-  const watchedKeys = ['id', 'body', 'edited_at', 'deleted_at', 'reply_to_id', 'forwarded_from_id'];
+  const watchedKeys = [
+    'id',
+    'body',
+    'edited_at',
+    'deleted_at',
+    'reply_to_id',
+    'forwarded_from_id',
+    'receipt_status',
+    'attachments',
+    'transfer_order_id',
+  ];
   for (var index = 0; index < current.length; index++) {
     for (final key in watchedKeys) {
       if (previous[index][key]?.toString() != current[index][key]?.toString()) return false;
@@ -8837,6 +10673,87 @@ Future<void> openChatNotification(
     );
   } catch (error) {
     if (context.mounted) showSnack(context, cleanError(error));
+  }
+}
+
+Future<void> openTransferNotification(
+  BuildContext context,
+  EmployeeSession session,
+  Map<String, dynamic> data,
+) async {
+  final orderId = data['order_id']?.toString();
+  if (orderId == null || orderId.isEmpty) return;
+  try {
+    final rows = await supabase
+        .from('ansar_transfer_orders')
+        .select()
+        .eq('id', orderId)
+        .limit(1);
+    if (!context.mounted) return;
+    if (rows.isEmpty) {
+      showSnack(context, 'تعذر العثور على المناقلة المطلوبة');
+      return;
+    }
+    final order = Map<String, dynamic>.from(rows.first);
+    final fromBranch = nullableIntValue(order['from_branch_num']);
+    final toBranch = nullableIntValue(order['to_branch_num']);
+    final visible = session.isAdmin ||
+        session.canManageAllBranches ||
+        fromBranch == session.branchNum ||
+        toBranch == session.branchNum ||
+        order['requested_by']?.toString() == session.id;
+    if (!visible) {
+      showSnack(context, 'هذه المناقلة غير متاحة لهذا الحساب');
+      return;
+    }
+    final branches = await loadAppBranchesMap();
+    if (!context.mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: TransferDetailsPage(session: session, order: order, branches: branches),
+        ),
+      ),
+    );
+  } catch (error) {
+    if (context.mounted) showSnack(context, cleanError(error));
+  }
+}
+
+Future<void> markNotificationOpened(Map<String, dynamic> data, String employeeId) async {
+  final notificationId = data['notification_id']?.toString();
+  if (notificationId == null || notificationId.isEmpty) return;
+  try {
+    await supabase.from('ansar_notification_receipts').upsert({
+      'notification_id': notificationId,
+      'employee_id': employeeId,
+      'opened_at': DateTime.now().toUtc().toIso8601String(),
+      'synced_at': DateTime.now().toUtc().toIso8601String(),
+    }, onConflict: 'notification_id,employee_id');
+  } catch (_) {
+    // Opening the target screen must work before the optional receipt migration is installed.
+  }
+}
+
+Future<void> markChatNotificationDelivered(String employeeId, String threadId) async {
+  try {
+    await supabase.rpc('ansar_mark_chat_delivered', params: {
+      'p_employee_id': employeeId,
+      'p_thread_id': threadId,
+    });
+  } catch (_) {
+    // Delivery receipts become available after the additive chat migration is installed.
+  }
+}
+
+Future<void> touchEmployeePresence(String employeeId, {required bool online}) async {
+  try {
+    await supabase.from('ansar_employees').update({
+      'last_seen_at': DateTime.now().toUtc().toIso8601String(),
+    }).eq('id', employeeId);
+  } catch (_) {
+    // Presence is best effort and must not interrupt the app lifecycle.
   }
 }
 
@@ -9113,16 +11030,31 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
       }
     }
     final ids = participantRows.map((row) => row['employee_id']?.toString()).whereType<String>().toList();
-    final employeeRows = ids.isEmpty
-        ? <Map<String, dynamic>>[]
-        : await supabase
-            .from('ansar_employees')
-            .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url')
-            .inFilter('id', ids);
+    final employeeQuery = supabase
+        .from('ansar_employees')
+        .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url, last_seen_at');
+    final employeeRows = threadType == 'general'
+        ? await employeeQuery.eq('is_active', true)
+        : ids.isEmpty
+            ? <Map<String, dynamic>>[]
+            : await employeeQuery.inFilter('id', ids);
     final employees = {
       for (final row in employeeRows.cast<Map<String, dynamic>>()) '${row['id']}': row,
     };
-    return participantRows.map((participant) {
+    final participantsByEmployee = {
+      for (final row in participantRows) '${row['employee_id']}': row,
+    };
+    final sourceParticipants = threadType == 'general'
+        ? employees.keys
+            .map((employeeId) => participantsByEmployee[employeeId] ?? <String, dynamic>{
+                  'thread_id': threadId,
+                  'employee_id': employeeId,
+                  'role': 'member',
+                  'is_muted': false,
+                })
+            .toList()
+        : participantRows;
+    return sourceParticipants.map((participant) {
       final employee = employees['${participant['employee_id']}'];
       return {
         ...participant,
@@ -9214,7 +11146,10 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
     try {
       await supabase
           .from('ansar_chat_participants')
-          .update({'is_muted': value})
+          .update({
+            'is_muted': value,
+            'muted_until': value ? DateTime.utc(9999, 12, 31).toIso8601String() : null,
+          })
           .eq('thread_id', threadId)
           .eq('employee_id', widget.session.id);
       reload();
@@ -9360,7 +11295,7 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
                 child: Column(
                   children: [
                     SwitchListTile(
-                      value: mine?['is_muted'] == true,
+                      value: mine == null ? false : chatParticipantIsMuted(mine),
                       onChanged: mine == null ? null : (value) => toggleMute(mine, value),
                       secondary: const Icon(Icons.notifications_off_outlined),
                       title: const Text('كتم الإشعارات'),
@@ -9402,6 +11337,8 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
                       Builder(builder: (context) {
                         final participant = participants[index];
                         final isMe = '${participant['employee_id']}' == widget.session.id;
+                        final lastSeen = DateTime.tryParse(participant['last_seen_at']?.toString() ?? '')?.toLocal();
+                        final memberRole = participant['participant_role'] == 'admin' ? 'مشرف المجموعة' : '@${participant['username'] ?? ''}';
                         return ListTile(
                           onTap: isMe ? null : () => openMember(participant),
                           leading: EmployeeAvatar(
@@ -9410,7 +11347,11 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
                             radius: 22,
                           ),
                           title: Text(isMe ? '${employeeDisplayName(participant)} (أنت)' : employeeDisplayName(participant), style: const TextStyle(fontWeight: FontWeight.w800)),
-                          subtitle: Text(participant['participant_role'] == 'admin' ? 'مشرف المجموعة' : '@${participant['username'] ?? ''}'),
+                          subtitle: Text(
+                            lastSeen == null ? memberRole : '$memberRole · آخر ظهور ${formatDateTime(lastSeen)}',
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                           trailing: isGroup && manager && !isMe
                               ? IconButton(tooltip: 'إزالة من المجموعة', onPressed: () => removeMember(participant), icon: const Icon(Icons.person_remove_outlined, color: dangerColor))
                               : (!isMe ? const Icon(Icons.chat_bubble_outline_rounded, color: brandColor) : null),
@@ -10466,6 +12407,8 @@ String statusLabel(String status) {
       return 'قيد التوصيل';
     case 'completed':
       return 'مكتمل';
+    case 'received':
+      return 'تم الاستلام';
     case 'rejected':
       return 'مرفوض';
     case 'cancelled':
@@ -10473,6 +12416,33 @@ String statusLabel(String status) {
     default:
       return status;
   }
+}
+
+List<String> transferAllowedNextStatuses(String current) {
+  switch (current) {
+    case 'submitted':
+      return const ['approved', 'partially_available', 'rejected', 'cancelled'];
+    case 'approved':
+      return const ['partially_available', 'preparing', 'rejected', 'cancelled'];
+    case 'partially_available':
+      return const ['preparing', 'rejected', 'cancelled'];
+    case 'preparing':
+      return const ['in_delivery', 'cancelled'];
+    default:
+      return const [];
+  }
+}
+
+Future<bool> transferItemsReadyForDelivery(String orderId) async {
+  final rows = await supabase
+      .from('ansar_transfer_order_items')
+      .select('item_status, approved_quantity')
+      .eq('order_id', orderId);
+  if (rows.isEmpty) return false;
+  return rows.every((row) {
+    final status = row['item_status']?.toString() ?? 'requested';
+    return status != 'requested' && row['approved_quantity'] != null;
+  });
 }
 
 IconData transferStatusIcon(String status) {
@@ -10491,6 +12461,8 @@ IconData transferStatusIcon(String status) {
       return Icons.local_shipping_rounded;
     case 'completed':
       return Icons.task_alt_rounded;
+    case 'received':
+      return Icons.inventory_rounded;
     case 'rejected':
       return Icons.block_rounded;
     case 'cancelled':
@@ -10505,6 +12477,7 @@ Color transferStatusColor(String status) {
     case 'available':
       return const Color(0xff16834f);
     case 'completed':
+    case 'received':
       return const Color(0xff16834f);
     case 'cancelled':
     case 'rejected':
@@ -10530,6 +12503,7 @@ const transferStatusTabs = <String>[
   'partially_available',
   'preparing',
   'in_delivery',
+  'received',
   'completed',
   'rejected',
   'cancelled',
@@ -10541,6 +12515,8 @@ String transferTabLabel(String value) {
       return 'الكل';
     case 'active':
       return 'النشطة';
+    case 'received':
+      return 'المستلمة';
     default:
       return statusLabel(value);
   }
@@ -10583,16 +12559,22 @@ Future<void> enqueueNotification({
   required String body,
   String? employeeId,
   int? branchNum,
+  String? notificationKey,
   Map<String, Object?> data = const {},
 }) async {
   try {
+    final unifiedData = <String, Object?>{
+      ...data,
+      'route': data['route'] ?? notificationRouteForType(data['type']?.toString() ?? ''),
+    };
     await supabase.from('ansar_notification_queue').insert({
       if (employeeId != null) 'employee_id': employeeId,
       if (branchNum != null) 'branch_num': branchNum,
       'title': title,
       'body': body,
-      'data': data,
+      'data': unifiedData,
       'status': 'pending',
+      if (notificationKey != null) 'notification_key': notificationKey,
     });
     unawaited(kickNotificationSender());
   } catch (_) {
@@ -10609,13 +12591,17 @@ Future<void> enqueueNotificationsForEmployees({
   final ids = employeeIds.toSet().where((id) => id.isNotEmpty).toList();
   if (ids.isEmpty) return;
   try {
+    final unifiedData = <String, Object?>{
+      ...data,
+      'route': data['route'] ?? notificationRouteForType(data['type']?.toString() ?? ''),
+    };
     await supabase.from('ansar_notification_queue').insert(
           ids
               .map((id) => {
                     'employee_id': id,
                     'title': title,
                     'body': body,
-                    'data': data,
+                    'data': unifiedData,
                     'status': 'pending',
                   })
               .toList(),
@@ -10624,6 +12610,13 @@ Future<void> enqueueNotificationsForEmployees({
   } catch (_) {
     // Notifications are helpful, but core workflow should not fail if queue policies are not ready.
   }
+}
+
+String notificationRouteForType(String type) {
+  if (type.contains('chat')) return 'chat';
+  if (type.contains('transfer')) return 'transfer';
+  if (type.contains('attendance')) return 'attendance';
+  return 'home';
 }
 
 Future<void> kickNotificationSender() async {
@@ -10637,7 +12630,6 @@ Future<void> kickNotificationSender() async {
 bool isNotificationForSession(Map<String, dynamic> row, EmployeeSession session) {
   final data = row['data'];
   if (data is Map && data['sender_id'] == session.id) return false;
-  if (data is Map && data['employee_id'] == session.id) return false;
 
   final employeeId = row['employee_id'] as String?;
   if (employeeId != null && employeeId.isNotEmpty) return employeeId == session.id;
@@ -10672,7 +12664,7 @@ Future<void> enqueueChatNotification({
   try {
     final rows = await supabase
         .from('ansar_chat_participants')
-        .select('employee_id, is_muted')
+        .select('employee_id, is_muted, muted_until')
         .eq('thread_id', threadId)
         .neq('employee_id', sender.id);
     participants = rows.cast<Map<String, dynamic>>();
@@ -10686,7 +12678,7 @@ Future<void> enqueueChatNotification({
   }
   if (type == 'general') {
     final mutedIds = participants
-        .where((row) => row['is_muted'] == true)
+        .where(chatParticipantIsMuted)
         .map((row) => row['employee_id']?.toString())
         .whereType<String>()
         .toSet();
@@ -10707,7 +12699,7 @@ Future<void> enqueueChatNotification({
   }
   await enqueueNotificationsForEmployees(
     employeeIds: participants
-        .where((row) => row['is_muted'] != true)
+        .where((row) => !chatParticipantIsMuted(row))
         .map((row) => row['employee_id']?.toString() ?? ''),
     title: title,
     body: body,
@@ -10715,28 +12707,81 @@ Future<void> enqueueChatNotification({
   );
 }
 
+bool chatParticipantIsMuted(Map<String, dynamic> row) {
+  if (row['is_muted'] != true) return false;
+  final until = DateTime.tryParse(row['muted_until']?.toString() ?? '')?.toUtc();
+  return until == null || until.isAfter(DateTime.now().toUtc());
+}
+
 Future<void> registerDeviceForNotifications(EmployeeSession session) async {
+  final messaging = FirebaseMessaging.instance;
+  final installationId = await stableInstallationId();
+  final sessionPreferences = await SharedPreferences.getInstance();
+  await sessionPreferences.setString('ansar_employee_id', session.id);
+  String? fcmToken;
+  String? pushyToken;
+  Object? firebaseError;
+  Object? pushyError;
+  var permissionStatus = 'unknown';
+  lastNotificationRegistrationError = null;
+
   try {
-    final messaging = FirebaseMessaging.instance;
-    lastNotificationRegistrationError = null;
     await messaging.setAutoInitEnabled(true);
     final settings = await messaging.requestPermission(alert: true, badge: true, sound: true);
-    if (settings.authorizationStatus == AuthorizationStatus.denied) {
-      throw Exception('تم رفض إذن الإشعارات من إعدادات الهاتف');
+    permissionStatus = settings.authorizationStatus.name;
+    if (settings.authorizationStatus != AuthorizationStatus.denied) {
+      fcmToken = await getMessagingTokenWithRecovery(messaging);
     }
-    final token = await getMessagingTokenWithRecovery(messaging);
-    await saveDeviceToken(session, token);
-
-    await notificationTokenRefreshSubscription?.cancel();
-    notificationTokenRefreshSubscription = FirebaseMessaging.instance.onTokenRefresh.listen((newToken) async {
-      await saveDeviceToken(session, newToken);
-    });
   } catch (error) {
-    lastNotificationRegistrationError = isTemporaryMessagingServiceError(error)
+    firebaseError = error;
+  }
+
+  try {
+    Pushy.listen();
+    final token = await Pushy.register();
+    if (token.isNotEmpty) {
+      pushyToken = token;
+      final preferences = await SharedPreferences.getInstance();
+      await preferences.setString('ansar_pushy_token', token);
+    }
+  } catch (error) {
+    pushyError = error;
+    final preferences = await SharedPreferences.getInstance();
+    pushyToken = preferences.getString('ansar_pushy_token');
+  }
+
+  try {
+    await saveDeviceInstallation(
+      session,
+      installationId: installationId,
+      permissionStatus: permissionStatus,
+      fcmToken: fcmToken,
+      pushyToken: pushyToken,
+    );
+    if (fcmToken != null) await saveLegacyFirebaseToken(session, fcmToken);
+    await notificationTokenRefreshSubscription?.cancel();
+    notificationTokenRefreshSubscription = messaging.onTokenRefresh.listen((newToken) async {
+      await saveDeviceInstallation(
+        session,
+        installationId: installationId,
+        permissionStatus: permissionStatus,
+        fcmToken: newToken,
+      );
+      await saveLegacyFirebaseToken(session, newToken);
+    });
+
+    if (permissionStatus == AuthorizationStatus.denied.name) {
+      throw Exception('الإشعارات مرفوضة من إعدادات الهاتف. فعّل الإذن حتى تظهر خارج التطبيق.');
+    }
+    if (fcmToken == null && pushyToken == null) {
+      throw Exception('تعذر تسجيل Firebase وPushy لهذا الجهاز');
+    }
+  } catch (error) {
+    final sourceError = firebaseError ?? pushyError ?? error;
+    lastNotificationRegistrationError = isTemporaryMessagingServiceError(sourceError)
         ? 'خدمة إشعارات الهاتف غير متاحة مؤقتاً، سيحاول التطبيق تلقائياً'
         : cleanError(error);
     lastNotificationRegistrationAt = DateTime.now();
-    // Push setup should never block login or daily work.
   }
 }
 
@@ -10771,8 +12816,9 @@ Future<void> resetAndRegisterDeviceForNotifications(EmployeeSession session) asy
     if (settings.authorizationStatus == AuthorizationStatus.denied) {
       throw Exception('تم رفض إذن الإشعارات من إعدادات الهاتف');
     }
-    final token = await getMessagingTokenWithRecovery(messaging);
-    await saveDeviceToken(session, token);
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.remove('ansar_pushy_token');
+    await registerDeviceForNotifications(session);
   } catch (error) {
     lastNotificationRegistrationError = isTemporaryMessagingServiceError(error)
         ? 'خدمة إشعارات الهاتف غير متاحة مؤقتاً، سيحاول التطبيق تلقائياً'
@@ -10791,6 +12837,78 @@ bool isTemporaryMessagingServiceError(Object error) {
 }
 
 Future<void> saveDeviceToken(EmployeeSession session, String token) async {
+  await saveDeviceInstallation(
+    session,
+    installationId: await stableInstallationId(),
+    permissionStatus: 'authorized',
+    fcmToken: token,
+  );
+  await saveLegacyFirebaseToken(session, token);
+}
+
+Future<String> stableInstallationId() async {
+  final preferences = await SharedPreferences.getInstance();
+  final existing = preferences.getString('ansar_installation_id');
+  if (existing != null && existing.isNotEmpty) return existing;
+  final random = Random.secure();
+  final bytes = List<int>.generate(24, (_) => random.nextInt(256));
+  final id = base64Url.encode(bytes).replaceAll('=', '');
+  await preferences.setString('ansar_installation_id', id);
+  return id;
+}
+
+Future<void> saveDeviceInstallation(
+  EmployeeSession session, {
+  required String installationId,
+  required String permissionStatus,
+  String? fcmToken,
+  String? pushyToken,
+}) async {
+  final values = <String, Object?>{
+    'installation_id': installationId,
+    'employee_id': session.id,
+    'platform': Platform.isAndroid ? 'android' : (Platform.isIOS ? 'ios' : 'other'),
+    'device_name': '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+    'permission_status': permissionStatus,
+    'is_active': (fcmToken?.isNotEmpty ?? false) || (pushyToken?.isNotEmpty ?? false),
+    'last_seen_at': DateTime.now().toUtc().toIso8601String(),
+    'updated_at': DateTime.now().toUtc().toIso8601String(),
+    if (fcmToken != null && fcmToken.isNotEmpty) 'fcm_token': fcmToken,
+    if (pushyToken != null && pushyToken.isNotEmpty) 'pushy_token': pushyToken,
+  };
+  try {
+    if (fcmToken != null && fcmToken.isNotEmpty) {
+      await supabase
+          .from('ansar_device_installations')
+          .update({'fcm_token': null, 'pushy_token': null, 'is_active': false})
+          .eq('fcm_token', fcmToken)
+          .neq('installation_id', installationId);
+    }
+    if (pushyToken != null && pushyToken.isNotEmpty) {
+      await supabase
+          .from('ansar_device_installations')
+          .update({'fcm_token': null, 'pushy_token': null, 'is_active': false})
+          .eq('pushy_token', pushyToken)
+          .neq('installation_id', installationId);
+    }
+    await supabase.from('ansar_device_installations').upsert(values, onConflict: 'installation_id');
+  } catch (_) {
+    if (fcmToken == null || fcmToken.isEmpty) rethrow;
+  }
+  final previews = <String>[
+    if (fcmToken != null && fcmToken.isNotEmpty) 'F:${tokenPreview(fcmToken)}',
+    if (pushyToken != null && pushyToken.isNotEmpty) 'P:${tokenPreview(pushyToken)}',
+  ];
+  if (previews.isNotEmpty) lastNotificationTokenPreview = previews.join('  ');
+  lastNotificationRegistrationError = null;
+  lastNotificationRegistrationAt = DateTime.now();
+}
+
+String tokenPreview(String token) {
+  return token.length <= 12 ? token : '${token.substring(0, 6)}...${token.substring(token.length - 6)}';
+}
+
+Future<void> saveLegacyFirebaseToken(EmployeeSession session, String token) async {
   await supabase.from('ansar_device_tokens').upsert(
     {
       'employee_id': session.id,
@@ -10802,9 +12920,6 @@ Future<void> saveDeviceToken(EmployeeSession session, String token) async {
     },
     onConflict: 'token',
   );
-  lastNotificationTokenPreview = token.length <= 12 ? token : '${token.substring(0, 6)}...${token.substring(token.length - 6)}';
-  lastNotificationRegistrationError = null;
-  lastNotificationRegistrationAt = DateTime.now();
 }
 
 String cleanError(Object? error) {
@@ -10825,6 +12940,10 @@ String chatUpgradeError(Object? error) {
       text.contains('edited_by') ||
       text.contains('deleted_by') ||
       text.contains('forwarded_from_id') ||
+      text.contains('attachments') ||
+      text.contains('transfer_order_id') ||
+      text.contains('ansar_chat_message_receipts') ||
+      text.contains('muted_until') ||
       text.contains('is_muted') ||
       text.contains('ansar_chat_message_hidden')) {
     return 'يلزم تنفيذ ملف تحديث الدردشة الجديد في Supabase أولاً.';
@@ -11003,6 +13122,8 @@ String eventLabel(Map<String, dynamic> event) {
       return 'تغيير حالة المناقلة';
     case 'item_changed':
       return note == null ? 'تحديث بند' : 'تحديث بند: $note';
+    case 'receipt_confirmed':
+      return note ?? 'تأكيد استلام المناقلة';
     default:
       return note ?? type;
   }

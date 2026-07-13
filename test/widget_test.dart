@@ -324,6 +324,88 @@ void main() {
     expect(notificationData('not-json'), isEmpty);
   });
 
+  test('direct notifications reach their target and never return to the sender', () {
+    final session = EmployeeSession({
+      'id': 'employee-one',
+      'display_name': 'الموظف الأول',
+      'username': 'one',
+      'branch_num': 1,
+      'role': 'employee',
+    });
+    expect(
+      isNotificationForSession({
+        'employee_id': 'employee-one',
+        'data': {'type': 'attendance_reminder_check_in', 'employee_id': 'employee-one'},
+      }, session),
+      isTrue,
+    );
+    expect(
+      isNotificationForSession({
+        'data': {'type': 'chat_message', 'sender_id': 'employee-one'},
+      }, session),
+      isFalse,
+    );
+    expect(notificationRouteForType('transfer_received'), 'transfer');
+  });
+
+  test('attendance detects backdated actions and transfer receipt validates totals', () {
+    final recorded = DateTime(2026, 7, 13, 12);
+    expect(isAttendanceBackdated(recorded.subtract(const Duration(hours: 2)), recorded), isTrue);
+    expect(isAttendanceBackdated(recorded.subtract(const Duration(minutes: 1)), recorded), isFalse);
+
+    final draft = TransferReceiptDraft({
+      'id': 'item-one',
+      'approved_quantity': 5,
+    });
+    addTearDown(draft.dispose);
+    expect(draft.valid, isTrue);
+    draft.received.text = '4';
+    draft.damaged.text = '1';
+    expect(draft.valid, isTrue);
+    expect(draft.hasDifference, isTrue);
+    draft.damaged.text = '2';
+    expect(draft.valid, isFalse);
+  });
+
+  test('chat mute windows, attachment types, and received transfers are labelled safely', () {
+    expect(chatParticipantIsMuted({'is_muted': false}), isFalse);
+    expect(
+      chatParticipantIsMuted({
+        'is_muted': true,
+        'muted_until': DateTime.now().toUtc().add(const Duration(hours: 1)).toIso8601String(),
+      }),
+      isTrue,
+    );
+    expect(
+      chatParticipantIsMuted({
+        'is_muted': true,
+        'muted_until': DateTime.now().toUtc().subtract(const Duration(hours: 1)).toIso8601String(),
+      }),
+      isFalse,
+    );
+    expect(chatAttachmentMime('PDF'), 'application/pdf');
+    expect(chatAttachmentMime('xlsx'), contains('spreadsheetml'));
+    expect(statusLabel('received'), 'تم الاستلام');
+    expect(transferTabLabel('received'), 'المستلمة');
+    expect(transferAllowedNextStatuses('preparing'), ['in_delivery', 'cancelled']);
+    expect(transferAllowedNextStatuses('in_delivery'), isEmpty);
+  });
+
+  testWidgets('chat navigation displays an unread badge without changing its size', (tester) async {
+    await tester.pumpWidget(
+      _testShell(
+        const SizedBox(
+          width: 48,
+          height: 48,
+          child: ChatNavigationIcon(count: 7, selected: false),
+        ),
+      ),
+    );
+    expect(tester.takeException(), isNull);
+    expect(find.text('7'), findsOneWidget);
+    expect(find.byIcon(Icons.chat_bubble_outline_rounded), findsOneWidget);
+  });
+
   testWidgets('chat contact tile is ready to start a private conversation', (tester) async {
     await tester.pumpWidget(
       _testShell(

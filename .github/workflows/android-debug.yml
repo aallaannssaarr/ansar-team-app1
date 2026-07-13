@@ -13,6 +13,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+      FIREBASE_TESTER_GROUPS: ${{ secrets.FIREBASE_TESTER_GROUPS }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -61,10 +64,56 @@ jobs:
 
           manifest = Path("android/app/src/main/AndroidManifest.xml")
           manifest_text = manifest.read_text(encoding="utf-8")
-          permission = '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
-          if "android.permission.POST_NOTIFICATIONS" not in manifest_text:
-              manifest_text = manifest_text.replace(">\n    <application", ">\n" + permission + "    <application", 1)
-              manifest.write_text(manifest_text, encoding="utf-8")
+          pushy_permissions = [
+              "android.permission.INTERNET",
+              "android.permission.WAKE_LOCK",
+              "android.permission.POST_NOTIFICATIONS",
+              "android.permission.ACCESS_NETWORK_STATE",
+              "android.permission.RECEIVE_BOOT_COMPLETED",
+              "android.permission.SCHEDULE_EXACT_ALARM",
+          ]
+          declarations = "".join(
+              f'    <uses-permission android:name="{name}" />\n'
+              for name in pushy_permissions
+              if name not in manifest_text
+          )
+          if declarations:
+              manifest_text = manifest_text.replace(">\n    <application", ">\n" + declarations + "    <application", 1)
+
+          pushy_declarations = '''
+              <receiver android:name="me.pushy.sdk.flutter.internal.PushyInternalReceiver" android:exported="false">
+                  <intent-filter>
+                      <action android:name="pushy.me" />
+                  </intent-filter>
+              </receiver>
+              <receiver android:name="me.pushy.sdk.receivers.PushyUpdateReceiver" android:exported="false">
+                  <intent-filter>
+                      <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                  </intent-filter>
+              </receiver>
+              <receiver android:name="me.pushy.sdk.receivers.PushyBootReceiver" android:exported="false">
+                  <intent-filter>
+                      <action android:name="android.intent.action.BOOT_COMPLETED" />
+                  </intent-filter>
+              </receiver>
+              <service android:name="me.pushy.sdk.services.PushySocketService" android:stopWithTask="false" />
+              <service
+                  android:name="me.pushy.sdk.services.PushyJobService"
+                  android:permission="android.permission.BIND_JOB_SERVICE"
+                  android:stopWithTask="false" />
+          '''
+          if "me.pushy.sdk.flutter.internal.PushyInternalReceiver" not in manifest_text:
+              manifest_text = manifest_text.replace("    </application>", pushy_declarations + "    </application>", 1)
+          manifest.write_text(manifest_text, encoding="utf-8")
+
+          proguard = Path("android/app/proguard-rules.pro")
+          proguard.write_text(
+              "-dontwarn me.pushy.**\n"
+              "-keep class me.pushy.** { *; }\n"
+              "-keep class androidx.core.app.** { *; }\n"
+              "-keep class android.support.v4.app.** { *; }\n",
+              encoding="utf-8",
+          )
           PY
 
       - name: Set Android app name and icon
@@ -91,6 +140,21 @@ jobs:
         run: |
           mkdir -p release
           cp build/app/outputs/flutter-apk/app-debug.apk release/ansar-team-latest-debug.apk
+
+      - name: Distribute APK to Firebase testers
+        if: ${{ env.FIREBASE_SERVICE_ACCOUNT_JSON != '' }}
+        continue-on-error: true
+        run: |
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/firebase-service-account.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/firebase-service-account.json"
+          npm install --global firebase-tools
+          APP_ID=$(python -c "import json; print(json.load(open('google-services.json'))['client'][0]['client_info']['mobilesdk_app_id'])")
+          GROUPS=${FIREBASE_TESTER_GROUPS:-ansar-testers}
+          RELEASE_NOTES=$(git log -1 --pretty=%s)
+          firebase appdistribution:distribute release/ansar-team-latest-debug.apk \
+            --app "$APP_ID" \
+            --groups "$GROUPS" \
+            --release-notes "$RELEASE_NOTES"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

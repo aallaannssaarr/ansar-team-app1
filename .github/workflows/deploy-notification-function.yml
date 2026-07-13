@@ -26,8 +26,12 @@ jobs:
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          PUSHY_SECRET_API_KEY: ${{ secrets.PUSHY_SECRET_API_KEY }}
         run: |
           supabase secrets set FIREBASE_SERVICE_ACCOUNT_JSON="$FIREBASE_SERVICE_ACCOUNT_JSON" --project-ref dktukfkitlfwpporhjsm
+          if [ -n "$PUSHY_SECRET_API_KEY" ]; then
+            supabase secrets set PUSHY_SECRET_API_KEY="$PUSHY_SECRET_API_KEY" --project-ref dktukfkitlfwpporhjsm
+          fi
 
       - name: Deploy sender
         env:
