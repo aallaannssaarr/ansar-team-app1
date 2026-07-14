@@ -66,7 +66,6 @@ jobs:
 
       - name: Distribute APK to Firebase testers
         if: ${{ env.FIREBASE_SERVICE_ACCOUNT_JSON != '' }}
-        continue-on-error: true
         run: |
           printf '%s' "$FIREBASE_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/firebase-service-account.json"
           export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/firebase-service-account.json"
@@ -74,10 +73,12 @@ jobs:
           APP_ID=$(python -c "import json; print(json.load(open('google-services.json'))['client'][0]['client_info']['mobilesdk_app_id'])")
           GROUPS=${FIREBASE_TESTER_GROUPS:-ansar-testers}
           RELEASE_NOTES=$(git log -1 --pretty=%s)
-          firebase appdistribution:distribute release/ansar-team-latest-debug.apk \
-            --app "$APP_ID" \
-            --groups "$GROUPS" \
-            --release-notes "$RELEASE_NOTES"
+          if ! firebase appdistribution:distribute release/ansar-team-latest-debug.apk \
+              --app "$APP_ID" \
+              --groups "$GROUPS" \
+              --release-notes "$RELEASE_NOTES"; then
+            echo "::warning::Firebase App Distribution was skipped because the service account lacks permission. The GitHub APK is still published normally."
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

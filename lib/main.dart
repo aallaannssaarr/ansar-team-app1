@@ -6830,12 +6830,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     if (result == null || !mounted) return;
     setState(() => receiptBusy = true);
     try {
-      final response = await supabase.rpc('ansar_confirm_transfer_receipt', params: {
-        'p_order_id': '${widget.order['id']}',
-        'p_employee_id': widget.session.id,
-        'p_items': result.items,
-        'p_note': emptyToNull(result.note),
-      });
+      final response = await confirmReceiptWithFallback(result);
       final responseMap = response is Map ? Map<String, dynamic>.from(response) : const <String, dynamic>{};
       final hasDifference = responseMap['has_difference'] == true;
       widget.order
@@ -6860,10 +6855,111 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       ));
       refreshDetails();
     } catch (error) {
-      if (mounted) showSnack(context, cleanError(error));
+      if (mounted) showSnack(context, transferActionError(error, action: 'تأكيد استلام المناقلة'));
     } finally {
       if (mounted) setState(() => receiptBusy = false);
     }
+  }
+
+  Future<dynamic> confirmReceiptWithFallback(TransferReceiptResult result) async {
+    try {
+      return await supabase.rpc('ansar_confirm_transfer_receipt', params: {
+        'p_order_id': '${widget.order['id']}',
+        'p_employee_id': widget.session.id,
+        'p_items': result.items,
+        'p_note': emptyToNull(result.note),
+      });
+    } catch (rpcError) {
+      try {
+        return await confirmReceiptDirectly(result);
+      } catch (fallbackError) {
+        throw Exception(
+          '${transferActionError(fallbackError, action: 'تأكيد استلام المناقلة')} '
+          'أعد تنفيذ ملف ansar-runtime-repair.sql في Supabase. '
+          'السبب الأصلي: ${compactDatabaseError(rpcError)}',
+        );
+      }
+    }
+  }
+
+  Future<Map<String, dynamic>> confirmReceiptDirectly(TransferReceiptResult result) async {
+    final orderRows = await supabase
+        .from('ansar_transfer_orders')
+        .select('id, status, from_branch_num')
+        .eq('id', widget.order['id'])
+        .limit(1);
+    if (orderRows.isEmpty) throw Exception('المناقلة غير موجودة');
+    final order = Map<String, dynamic>.from(orderRows.first);
+    if (order['status'] != 'in_delivery') {
+      throw Exception('لا يمكن تأكيد الاستلام قبل بدء التوصيل');
+    }
+    if (nullableIntValue(order['from_branch_num']) != widget.session.branchNum) {
+      throw Exception('تأكيد الاستلام متاح للفرع الطالب فقط');
+    }
+
+    final itemRows = await supabase
+        .from('ansar_transfer_order_items')
+        .select('id, approved_quantity')
+        .eq('order_id', widget.order['id']);
+    final sentByItem = <String, double>{
+      for (final row in itemRows) '${row['id']}': doubleValue(row['approved_quantity']),
+    };
+    if (sentByItem.length != result.items.length ||
+        result.items.any((item) => !sentByItem.containsKey('${item['item_id']}'))) {
+      throw Exception('يجب مراجعة جميع بنود المناقلة');
+    }
+
+    var hasDifference = false;
+    final now = DateTime.now().toUtc().toIso8601String();
+    for (final item in result.items) {
+      final itemId = '${item['item_id']}';
+      final received = doubleValue(item['received_quantity']);
+      final damaged = doubleValue(item['damaged_quantity']);
+      final sent = sentByItem[itemId] ?? 0;
+      if (received < 0 || damaged < 0 || received + damaged > sent) {
+        throw Exception('الكميات المستلمة والتالفة لا يجوز أن تتجاوز الكمية المرسلة');
+      }
+      final note = emptyToNull(item['note']?.toString() ?? '');
+      hasDifference = hasDifference || damaged > 0 || received < sent || note != null;
+      await supabase.from('ansar_transfer_order_items').update({
+        'received_quantity': received,
+        'damaged_quantity': damaged,
+        'receipt_note': note,
+        'received_at': now,
+        'received_by': widget.session.id,
+      }).eq('id', itemId).eq('order_id', widget.order['id']);
+    }
+
+    await supabase.from('ansar_transfer_orders').update({
+      'status': 'received',
+      'received_at': now,
+      'received_by': widget.session.id,
+      'receipt_note': emptyToNull(result.note),
+      'has_receipt_discrepancy': hasDifference,
+    }).eq('id', widget.order['id']).eq('status', 'in_delivery');
+    final verifiedRows = await supabase
+        .from('ansar_transfer_orders')
+        .select('status, received_by')
+        .eq('id', widget.order['id'])
+        .limit(1);
+    if (verifiedRows.isEmpty ||
+        verifiedRows.first['status'] != 'received' ||
+        '${verifiedRows.first['received_by']}' != widget.session.id) {
+      throw Exception('لم تحفظ قاعدة البيانات حالة الاستلام');
+    }
+    try {
+      await supabase.from('ansar_order_events').insert({
+        'order_id': widget.order['id'],
+        'employee_id': widget.session.id,
+        'event_type': 'receipt_confirmed',
+        'old_status': 'in_delivery',
+        'new_status': 'received',
+        'note': hasDifference ? 'تم الاستلام مع ملاحظات' : 'تم الاستلام كاملاً',
+      });
+    } catch (_) {
+      // The receipt is already committed; an older event constraint must not undo it.
+    }
+    return {'received': true, 'has_difference': hasDifference};
   }
 
   Future<void> shareInChat() async {
@@ -8101,19 +8197,26 @@ class _ShareTransferToChatPageState extends State<ShareTransferToChatPage> {
         });
         sharedAtomically = true;
         unawaited(kickNotificationSender());
-      } catch (error) {
-        if (!error.toString().contains('ansar_share_transfer_to_chat')) rethrow;
-        await supabase.from('ansar_chat_messages').insert(
-              selected
-                  .map((threadId) => {
-                        'thread_id': threadId,
-                        'sender_id': widget.session.id,
-                        'body': body,
-                        'message_type': 'transfer',
-                        'transfer_order_id': '${widget.order['id']}',
-                      })
-                  .toList(),
-            );
+      } catch (rpcError) {
+        try {
+          await supabase.from('ansar_chat_messages').insert(
+                selected
+                    .map((threadId) => {
+                          'thread_id': threadId,
+                          'sender_id': widget.session.id,
+                          'body': body,
+                          'message_type': 'transfer',
+                          'transfer_order_id': '${widget.order['id']}',
+                        })
+                    .toList(),
+              );
+        } catch (fallbackError) {
+          throw Exception(
+            '${transferActionError(fallbackError, action: 'مشاركة المناقلة')} '
+            'أعد تنفيذ ملف ansar-runtime-repair.sql في Supabase. '
+            'السبب الأصلي: ${compactDatabaseError(rpcError)}',
+          );
+        }
       }
       final threads = await loadVisibleChatThreads(widget.session);
       final now = DateTime.now().toUtc().toIso8601String();
@@ -8132,7 +8235,7 @@ class _ShareTransferToChatPageState extends State<ShareTransferToChatPage> {
       }
       if (mounted) Navigator.pop(context, selected.length);
     } catch (error) {
-      if (mounted) showSnack(context, chatUpgradeError(error));
+      if (mounted) showSnack(context, transferActionError(error, action: 'مشاركة المناقلة'));
     } finally {
       if (mounted) setState(() => sending = false);
     }
@@ -8884,9 +8987,10 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     setupMessageChanges();
     unawaited(loadOtherParticipantLastSeen());
     scrollController.addListener(handleMessageScroll);
-    timer = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (!realtimeConnected) unawaited(refreshMessages());
-    });
+    // Realtime can report a connected channel even when a table is not yet
+    // published. Keep a light reconciliation loop so another device's message
+    // still appears without leaving and reopening the conversation.
+    timer = Timer.periodic(const Duration(seconds: 3), (_) => unawaited(refreshMessages()));
   }
 
   @override
@@ -13636,6 +13740,30 @@ String cleanError(Object? error) {
     return 'تعذر تنفيذ العملية الآن. حاول مرة أخرى.';
   }
   return text;
+}
+
+String compactDatabaseError(Object? error) {
+  final text = error.toString().replaceFirst('Exception: ', '');
+  final messageMatch = RegExp(r'message:\s*([^,]+),\s*code:', caseSensitive: false).firstMatch(text);
+  final message = messageMatch?.group(1)?.trim();
+  if (message != null && message.isNotEmpty) return message;
+  if (text.contains('PGRST202') || text.contains('Could not find the function')) {
+    return 'دالة قاعدة البيانات غير مثبتة أو لم يُحدّث مخطط Supabase بعد';
+  }
+  if (text.contains('column') && text.contains('does not exist')) {
+    return 'أعمدة التحديث غير مثبتة في قاعدة البيانات';
+  }
+  if (text.contains('SocketException') || text.contains('TimeoutException') || text.contains('Failed host lookup')) {
+    return 'تعذر الاتصال بقاعدة البيانات';
+  }
+  return text.length > 150 ? '${text.substring(0, 150)}...' : text;
+}
+
+String transferActionError(Object? error, {required String action}) {
+  final message = compactDatabaseError(error);
+  if (message.contains('ansar-runtime-repair.sql')) return message;
+  if (message.isEmpty) return 'تعذر $action الآن. حاول مرة أخرى.';
+  return 'تعذر $action: $message';
 }
 
 String chatUpgradeError(Object? error) {
