@@ -12,6 +12,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart' as intl;
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
@@ -22,24 +23,33 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'ansar_config.dart';
+import 'product_cache.dart';
+import 'rich_notifications.dart';
 
 @pragma('vm:entry-point')
 Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp();
   await markBackgroundChatDelivered(message.data);
+  if (message.data['rich_notification']?.toString() == 'true') {
+    await RichNotificationService.show(Map<String, dynamic>.from(message.data));
+  }
 }
 
 @pragma('vm:entry-point')
 void backgroundPushyNotificationListener(Map<String, dynamic> data) {
   final title = data['title']?.toString() ?? 'فريق الأنصار';
   final body = data['message']?.toString() ?? data['body']?.toString() ?? '';
-  if (Platform.isAndroid) Pushy.notify(title, body, data);
+  if (data['rich_notification']?.toString() == 'true') {
+    unawaited(RichNotificationService.show(Map<String, dynamic>.from(data)));
+  } else if (Platform.isAndroid) {
+    Pushy.notify(title, body, data);
+  }
   Pushy.clearBadge();
   unawaited(markBackgroundChatDelivered(data));
 }
 
 Future<void> markBackgroundChatDelivered(Map<String, dynamic> data) async {
-  if (data['type'] != 'chat_message' || data['thread_id'] == null) return;
+  if (!isChatNotificationType(data['type']?.toString()) || data['thread_id'] == null) return;
   try {
     final preferences = await SharedPreferences.getInstance();
     final employeeId = preferences.getString('ansar_employee_id');
@@ -104,6 +114,7 @@ Future<void> main() async {
     url: AnsarConfig.supabaseUrl,
     publishableKey: AnsarConfig.supabaseServiceKey,
   );
+  await RichNotificationService.initialize();
   initializePushyService();
   runApp(const AnsarApp());
 }
@@ -718,6 +729,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   StreamSubscription<RemoteMessage>? foregroundMessages;
   StreamSubscription<RemoteMessage>? openedMessages;
   StreamSubscription<Map<String, dynamic>>? pushyClicks;
+  StreamSubscription<Map<String, dynamic>>? richNotificationClickSubscription;
   Timer? notificationRegistrationTimer;
   Timer? inAppNotificationsTimer;
   Timer? unreadMessagesTimer;
@@ -734,6 +746,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     session = widget.initialSession;
     initializePushyNotifications();
+    richNotificationClickSubscription = richNotificationClicks.stream.listen((data) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(openNotificationData(data));
+      });
+    });
+    unawaited(RichNotificationService.emitPendingClick());
     unawaited(touchEmployeePresence(session.id, online: true));
     startNotificationRegistrationMonitor();
     startInAppNotificationMonitor();
@@ -743,13 +761,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (message.data['sender_id'] == session.id) return;
       final notificationId = message.data['notification_id']?.toString();
       if (notificationId != null && notificationId.isNotEmpty) seenInAppNotificationIds.add(notificationId);
-      if (message.data['type'] == 'chat_message' && message.data['thread_id'] == activeChatThreadId) return;
+      if (isChatNotificationType(message.data['type']?.toString()) &&
+          message.data['thread_id'] == activeChatThreadId) {
+        return;
+      }
       final title = message.notification?.title ?? 'إشعار جديد';
       final body = message.notification?.body ?? '';
       final data = Map<String, dynamic>.from(message.data);
-      final isChat = data['type'] == 'chat_message';
+      final isChat = isChatNotificationType(data['type']?.toString());
       if (isChat && data['thread_id'] != null) {
         unawaited(markChatNotificationDelivered(session.id, '${data['thread_id']}'));
+      }
+      if (data['rich_notification']?.toString() == 'true') {
+        unawaited(RichNotificationService.show(data));
+        return;
       }
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
@@ -864,13 +889,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> refreshUnreadChatMessages() async {
     try {
-      final rows = await supabase
-          .from('ansar_chat_message_receipts')
-          .select('message_id')
-          .eq('employee_id', session.id)
-          .neq('status', 'read');
-      if (mounted && unreadChatMessages != rows.length) {
-        setState(() => unreadChatMessages = rows.length);
+      final counts = await loadChatUnreadCounts(session.id);
+      final total = counts.values.fold<int>(0, (sum, value) => sum + value);
+      if (mounted && unreadChatMessages != total) {
+        setState(() => unreadChatMessages = total);
       }
     } catch (_) {
       // The badge appears automatically after the additive chat migration is installed.
@@ -937,10 +959,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         if (id.isEmpty || seenInAppNotificationIds.contains(id)) continue;
         seenInAppNotificationIds.add(id);
         final data = notificationData(row['data']);
-        if (data['type'] == 'chat_message' && data['thread_id'] != null) {
+        if (isChatNotificationType(data['type']?.toString()) && data['thread_id'] != null) {
           unawaited(markChatNotificationDelivered(session.id, '${data['thread_id']}'));
         }
-        if (data['type'] == 'chat_message' && data['thread_id']?.toString() == activeChatThreadId) continue;
+        if (isChatNotificationType(data['type']?.toString()) &&
+            data['thread_id']?.toString() == activeChatThreadId) {
+          continue;
+        }
         if (!mounted) return;
         final title = row['title'] as String? ?? 'إشعار جديد';
         final body = row['body'] as String? ?? '';
@@ -957,6 +982,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     foregroundMessages?.cancel();
     openedMessages?.cancel();
     pushyClicks?.cancel();
+    richNotificationClickSubscription?.cancel();
     notificationRegistrationTimer?.cancel();
     inAppNotificationsTimer?.cancel();
     unreadMessagesTimer?.cancel();
@@ -970,6 +996,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       startNotificationRegistrationMonitor();
       startInAppNotificationMonitor();
+      unawaited(RichNotificationService.retryPendingReplies());
       unawaited(touchEmployeePresence(session.id, online: true));
       unawaited(refreshUnreadChatMessages());
     } else if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
@@ -1291,11 +1318,44 @@ class _NotificationInboxPageState extends State<NotificationInboxPage> {
         .select('id, employee_id, branch_num, title, body, data, status, created_at')
         .order('created_at', ascending: false)
         .limit(100);
-    return rows
+    final visible = rows
         .cast<Map<String, dynamic>>()
         .where((row) => isNotificationForSession(row, widget.session))
         .take(50)
         .toList();
+    final senderIds = visible
+        .map((row) => notificationData(row['data'])['sender_id']?.toString())
+        .whereType<String>()
+        .where((id) => id.isNotEmpty)
+        .toSet()
+        .toList();
+    if (senderIds.isEmpty) return visible;
+    try {
+      final employees = await supabase
+          .from('ansar_employees')
+          .select('id, display_name, full_name, avatar_url')
+          .inFilter('id', senderIds);
+      final byId = {
+        for (final employee in employees.cast<Map<String, dynamic>>()) '${employee['id']}': employee,
+      };
+      return visible.map((row) {
+        final data = notificationData(row['data']);
+        final employee = byId[data['sender_id']?.toString()];
+        if (employee == null) return row;
+        return {
+          ...row,
+          'data': {
+            ...data,
+            if ((data['sender_name']?.toString() ?? '').isEmpty)
+              'sender_name': employee['display_name'] ?? employee['full_name'],
+            if ((data['sender_avatar_url']?.toString() ?? '').isEmpty)
+              'sender_avatar_url': employee['avatar_url'],
+          },
+        };
+      }).toList();
+    } catch (_) {
+      return visible;
+    }
   }
 
   void reload() {
@@ -1304,7 +1364,7 @@ class _NotificationInboxPageState extends State<NotificationInboxPage> {
 
   Future<void> openNotification(Map<String, dynamic> row) async {
     final data = notificationData(row['data']);
-    if (data['type'] == 'chat_message') {
+    if (isChatNotificationType(data['type']?.toString())) {
       await openChatNotification(context, widget.session, data);
     } else if ((data['type']?.toString() ?? '').contains('transfer')) {
       await openTransferNotification(context, widget.session, data);
@@ -1393,7 +1453,9 @@ class NotificationInboxTile extends StatelessWidget {
     return ListTile(
       onTap: effectiveOnTap,
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-      leading: isChat
+      leading: (data['sender_id']?.toString().isNotEmpty == true ||
+              data['sender_name']?.toString().isNotEmpty == true ||
+              data['sender_avatar_url']?.toString().isNotEmpty == true)
           ? EmployeeAvatar(
               name: data['sender_name']?.toString() ?? 'موظف',
               imageUrl: data['sender_avatar_url']?.toString(),
@@ -1608,6 +1670,8 @@ class _DashboardPageState extends State<DashboardPage> {
           'type': 'attendance_check_in',
           'route': 'attendance',
           'sender_id': widget.session.id,
+          'sender_name': widget.session.name,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
           'employee_id': widget.session.id,
           'branch_num': widget.session.branchNum,
           'effective_at': action.effectiveAt.toUtc().toIso8601String(),
@@ -1663,6 +1727,8 @@ class _DashboardPageState extends State<DashboardPage> {
           'type': 'attendance_check_out',
           'route': 'attendance',
           'sender_id': widget.session.id,
+          'sender_name': widget.session.name,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
           'employee_id': widget.session.id,
           'branch_num': widget.session.branchNum,
           'effective_at': action.effectiveAt.toUtc().toIso8601String(),
@@ -3439,6 +3505,7 @@ class _QueriesPageState extends State<QueriesPage> {
   Timer? queryDebounce;
   int queryMode = 0;
   String selectedSalesBooks = 'all';
+  String? productCacheNotice;
 
   @override
   void initState() {
@@ -3464,6 +3531,7 @@ class _QueriesPageState extends State<QueriesPage> {
     if (value.isEmpty) return [];
 
     final productRows = await searchProductsLikeLegacy(value, limit: 60);
+    observeProductCacheStatus();
 
     Map<int, BranchOption> branches = <int, BranchOption>{};
     try {
@@ -3509,6 +3577,19 @@ class _QueriesPageState extends State<QueriesPage> {
       results.add(ProductResult(product: product, stock: stock));
     }
     return results;
+  }
+
+  void observeProductCacheStatus() {
+    final cache = ProductSearchCache.instance;
+    unawaited(cache
+        .synchronize(supabase, force: cache.lastSyncError != null)
+        .then<void>((_) {
+      if (mounted && productCacheNotice != null) setState(() => productCacheNotice = null);
+    }, onError: (_) {
+      if (mounted) {
+        setState(() => productCacheNotice = 'تعذر تحديث الكتب الآن. النتائج المعروضة من آخر نسخة محفوظة.');
+      }
+    }));
   }
 
   void submitSearch() {
@@ -3671,6 +3752,24 @@ class _QueriesPageState extends State<QueriesPage> {
               ),
             ),
           ),
+        if (queryMode == 0 && productCacheNotice != null) ...[
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+            decoration: BoxDecoration(
+              color: warningSurface,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: accentColor.withValues(alpha: 0.28)),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.cloud_off_outlined, color: accentColor, size: 18),
+                const SizedBox(width: 8),
+                Expanded(child: Text(productCacheNotice!, style: const TextStyle(color: inkColor, fontSize: 11))),
+              ],
+            ),
+          ),
+        ],
         if (queryMode == 3) ...[
           const SizedBox(height: 10),
           Card(
@@ -5079,7 +5178,7 @@ class _EmployeesPageState extends State<EmployeesPage> {
                   imageUrl: employee['avatar_url'] as String?,
                 ),
                 title: Text(employee['display_name'] ?? employee['full_name'] ?? ''),
-                subtitle: Text('${branchLabel(data.branches, branchNum)} · ${employee['username']}'),
+                subtitle: Text('${branchLabel(data.branches, branchNum)} · ${roleLabel(employee['role']?.toString() ?? 'employee')}'),
                 trailing: PopupMenuButton<String>(
                   onSelected: employeeBusy ? null : (value) {
                     if (value == 'edit') {
@@ -6077,7 +6176,17 @@ class _TransfersPageState extends State<TransfersPage> {
         title: 'مناقلة جديدة',
         body:
             'طلب مناقلة من ${branchLabel(data.branches, widget.session.branchNum)} إلى ${branchLabel(data.branches, result.toBranch)}',
-        data: {'type': 'transfer_created', 'order_id': inserted['id'], 'sender_id': widget.session.id},
+        data: {
+          'type': 'transfer_created',
+          'route': 'transfer',
+          'order_id': inserted['id'],
+          'sender_id': widget.session.id,
+          'sender_name': widget.session.name,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
+          'order_no': inserted['order_no'] ?? '',
+          'from_branch_name': branchLabel(data.branches, widget.session.branchNum),
+          'to_branch_name': branchLabel(data.branches, result.toBranch),
+        },
       ));
       if (mounted) {
         setState(() {
@@ -6122,8 +6231,20 @@ class _TransfersPageState extends State<TransfersPage> {
       });
       unawaited(enqueueNotification(
         title: 'تحديث مناقلة',
-        body: 'تم تحديث حالة المناقلة رقم ${order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
-        data: {'type': 'transfer_updated', 'order_id': order['id'], 'status': status, 'sender_id': widget.session.id},
+        body: '${widget.session.name} حدّث المناقلة رقم ${order['order_no'] ?? '-'} من ${branchLabel(latestTransfers?.branches ?? const <int, BranchOption>{}, intValue(order['from_branch_num']))} إلى ${branchLabel(latestTransfers?.branches ?? const <int, BranchOption>{}, intValue(order['to_branch_num']))}: ${statusLabel(status)}',
+        data: {
+          'type': 'transfer_updated',
+          'route': 'transfer',
+          'order_id': order['id'],
+          'status': status,
+          'sender_id': widget.session.id,
+          'sender_name': widget.session.name,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
+          'order_no': order['order_no'] ?? '',
+          'from_branch_name': branchLabel(latestTransfers?.branches ?? const <int, BranchOption>{}, intValue(order['from_branch_num'])),
+          'to_branch_name': branchLabel(latestTransfers?.branches ?? const <int, BranchOption>{}, intValue(order['to_branch_num'])),
+          'status_label': statusLabel(status),
+        },
       ));
       if (mounted) {
         setState(() {
@@ -6609,8 +6730,21 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       });
       unawaited(enqueueNotification(
         title: 'تحديث بند مناقلة',
-        body: 'تم تحديث بند في طلب المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${itemStatusLabel(status)}',
-        data: {'type': 'transfer_item_updated', 'order_id': widget.order['id'], 'sender_id': widget.session.id},
+        body: 'حدّث ${widget.session.name} كتاب ${(item['product'] as Map<String, dynamic>?)?['name'] ?? 'مادة ${item['mat_num']}'} في المناقلة رقم ${widget.order['order_no'] ?? '-'} من ${branchLabel(widget.branches, intValue(widget.order['from_branch_num']))} إلى ${branchLabel(widget.branches, intValue(widget.order['to_branch_num']))}: ${itemStatusLabel(status)}، الكمية ${formatMoneyValue(approved)}',
+        data: {
+          'type': 'transfer_item_updated',
+          'route': 'transfer',
+          'order_id': widget.order['id'],
+          'sender_id': widget.session.id,
+          'sender_name': widget.session.name,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
+          'item_name': (item['product'] as Map<String, dynamic>?)?['name'] ?? 'مادة ${item['mat_num']}',
+          'order_no': widget.order['order_no'] ?? '',
+          'from_branch_name': branchLabel(widget.branches, intValue(widget.order['from_branch_num'])),
+          'to_branch_name': branchLabel(widget.branches, intValue(widget.order['to_branch_num'])),
+          'status_label': itemStatusLabel(status),
+          'approved_quantity': approved,
+        },
       ));
       item['item_status'] = status;
       item['approved_quantity'] = approved;
@@ -6654,8 +6788,20 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       });
       unawaited(enqueueNotification(
         title: 'تحديث مناقلة',
-        body: 'تم تحديث حالة المناقلة رقم ${widget.order['order_no'] ?? '-'} إلى ${statusLabel(status)}',
-        data: {'type': 'transfer_updated', 'order_id': widget.order['id'], 'status': status, 'sender_id': widget.session.id},
+        body: '${widget.session.name} حدّث المناقلة رقم ${widget.order['order_no'] ?? '-'} من ${branchLabel(widget.branches, intValue(widget.order['from_branch_num']))} إلى ${branchLabel(widget.branches, intValue(widget.order['to_branch_num']))}: ${statusLabel(status)}',
+        data: {
+          'type': 'transfer_updated',
+          'route': 'transfer',
+          'order_id': widget.order['id'],
+          'status': status,
+          'sender_id': widget.session.id,
+          'sender_name': widget.session.name,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
+          'order_no': widget.order['order_no'] ?? '',
+          'from_branch_name': branchLabel(widget.branches, intValue(widget.order['from_branch_num'])),
+          'to_branch_name': branchLabel(widget.branches, intValue(widget.order['to_branch_num'])),
+          'status_label': statusLabel(status),
+        },
       ));
       widget.order['status'] = status;
       refreshDetails();
@@ -6707,6 +6853,8 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
           'route': 'transfer',
           'order_id': widget.order['id'],
           'sender_id': widget.session.id,
+          'sender_name': widget.session.name,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
           'has_difference': hasDifference,
         },
       ));
@@ -7167,6 +7315,29 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                         icon: const Icon(Icons.forum_outlined),
                         label: const Text('مشاركة في الدردشة'),
                       ),
+                      if (fromBranch == widget.session.branchNum && widget.order['status'] == 'preparing') ...[
+                        const SizedBox(height: 10),
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: warningSurface,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: accentColor.withValues(alpha: 0.35)),
+                          ),
+                          child: const Row(
+                            children: [
+                              Icon(Icons.local_shipping_outlined, color: accentColor),
+                              SizedBox(width: 9),
+                              Expanded(
+                                child: Text(
+                                  'الطلب قيد التحضير. سيظهر زر مراجعة الاستلام بعد أن يغيّر الفرع المجهّز حالته إلى قيد التوصيل.',
+                                  style: TextStyle(fontWeight: FontWeight.w700, height: 1.45),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
                       if (canReceive) ...[
                         const SizedBox(height: 8),
                         FilledButton.icon(
@@ -7357,9 +7528,10 @@ class _TransferDialogState extends State<TransferDialog> {
   Future<void> prepareSearchCache() async {
     try {
       await warmProductSearchCache();
+      final count = await ProductSearchCache.instance.productCount;
       if (mounted) {
         setState(() {
-          productsCount = cachedProducts?.length ?? 0;
+          productsCount = count;
           cacheLoading = false;
         });
       }
@@ -7920,17 +8092,29 @@ class _ShareTransferToChatPageState extends State<ShareTransferToChatPage> {
       final from = branchLabel(widget.branches, intValue(widget.order['from_branch_num']));
       final to = branchLabel(widget.branches, intValue(widget.order['to_branch_num']));
       final body = 'مناقلة رقم ${widget.order['order_no'] ?? '-'} · من $from إلى $to';
-      await supabase.from('ansar_chat_messages').insert(
-            selected
-                .map((threadId) => {
-                      'thread_id': threadId,
-                      'sender_id': widget.session.id,
-                      'body': body,
-                      'message_type': 'transfer',
-                      'transfer_order_id': '${widget.order['id']}',
-                    })
-                .toList(),
-          );
+      var sharedAtomically = false;
+      try {
+        await supabase.rpc('ansar_share_transfer_to_chat', params: {
+          'p_order_id': '${widget.order['id']}',
+          'p_thread_ids': selected.toList(),
+          'p_sender_id': widget.session.id,
+        });
+        sharedAtomically = true;
+        unawaited(kickNotificationSender());
+      } catch (error) {
+        if (!error.toString().contains('ansar_share_transfer_to_chat')) rethrow;
+        await supabase.from('ansar_chat_messages').insert(
+              selected
+                  .map((threadId) => {
+                        'thread_id': threadId,
+                        'sender_id': widget.session.id,
+                        'body': body,
+                        'message_type': 'transfer',
+                        'transfer_order_id': '${widget.order['id']}',
+                      })
+                  .toList(),
+            );
+      }
       final threads = await loadVisibleChatThreads(widget.session);
       final now = DateTime.now().toUtc().toIso8601String();
       for (final threadId in selected) {
@@ -7942,7 +8126,7 @@ class _ShareTransferToChatPageState extends State<ShareTransferToChatPage> {
             break;
           }
         }
-        if (thread != null) {
+        if (!sharedAtomically && thread != null) {
           unawaited(enqueueChatNotification(thread: thread, sender: widget.session, body: body));
         }
       }
@@ -8119,23 +8303,7 @@ class _ChatPageState extends State<ChatPage> {
       return joinedThreadIds.contains(row['id']);
     }).toList();
     final threadIds = visible.map((row) => row['id']).whereType<String>().toList();
-    final unreadByThread = <String, int>{};
-    if (threadIds.isNotEmpty) {
-      try {
-        final receiptRows = await supabase
-            .from('ansar_chat_message_receipts')
-            .select('thread_id')
-            .eq('employee_id', widget.session.id)
-            .neq('status', 'read')
-            .inFilter('thread_id', threadIds);
-        for (final row in receiptRows) {
-          final threadId = '${row['thread_id']}';
-          unreadByThread[threadId] = (unreadByThread[threadId] ?? 0) + 1;
-        }
-      } catch (_) {
-        // Unread counters appear after the additive receipt migration is installed.
-      }
-    }
+    final unreadByThread = threadIds.isEmpty ? <String, int>{} : await loadChatUnreadCounts(widget.session.id);
     final participantRows = threadIds.isEmpty
         ? <Map<String, dynamic>>[]
         : (await supabase
@@ -8214,7 +8382,6 @@ class _ChatPageState extends State<ChatPage> {
               'title': employee.name,
               'thread_avatar_url': employee.avatarUrl,
               'thread_avatar_name': employee.name,
-              'contact_username': employee.username,
               'participant_ids': [widget.session.id, employee.id],
               'contact_employee': employee,
             })
@@ -8441,10 +8608,9 @@ class _ChatPageState extends State<ChatPage> {
             ? threads
             : threads.where((thread) {
                 final title = normalizeSearch(thread['title']?.toString() ?? '');
-                final username = normalizeSearch(thread['contact_username']?.toString() ?? '');
                 final latest = thread['last_message'] as Map<String, dynamic>?;
                 final body = normalizeSearch(latest?['body']?.toString() ?? '');
-                return title.contains(query) || username.contains(query) || body.contains(query);
+                return title.contains(query) || body.contains(query);
               }).toList();
         final filteredThreads = visibleThreads.where((thread) {
           if (thread['thread_type'] == 'contact') return !showArchived;
@@ -8542,10 +8708,9 @@ class ChatThreadTile extends StatelessWidget {
     final contact = type == 'contact';
     final latest = thread['last_message'] as Map<String, dynamic>?;
     final senderName = thread['last_sender_name']?.toString();
-    final contactUsername = thread['contact_username']?.toString() ?? '';
     final unread = intValue(thread['unread_count']);
     final emptySubtitle = contact
-        ? '${contactUsername.isEmpty ? '' : '@$contactUsername · '}بدء محادثة خاصة'
+        ? 'بدء محادثة خاصة'
         : chatTypeLabel(type);
     final avatarName = thread['thread_avatar_name']?.toString() ?? thread['title']?.toString() ?? 'محادثة';
     final avatarUrl = thread['thread_avatar_url'] as String?;
@@ -8676,7 +8841,7 @@ class ChatThreadPage extends StatefulWidget {
   State<ChatThreadPage> createState() => _ChatThreadPageState();
 }
 
-class _ChatThreadPageState extends State<ChatThreadPage> {
+class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObserver {
   final message = TextEditingController();
   final composerFocus = FocusNode();
   final scrollController = ScrollController();
@@ -8689,12 +8854,17 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   Map<String, dynamic>? editingMessage;
   Timer? timer;
   Timer? typingTimer;
-  StreamSubscription<List<Map<String, dynamic>>>? messageChanges;
+  Timer? realtimeReconnectTimer;
   RealtimeChannel? liveChannel;
+  RealtimeChannel? messagesChannel;
   bool sendingMessage = false;
+  double? attachmentUploadProgress;
   bool refreshingMessages = false;
   bool refreshMessagesAgain = false;
   bool showNewMessageHint = false;
+  bool realtimeConnected = false;
+  String? messageSyncError;
+  int newMessageCount = 0;
   String? lastRenderedMessageId;
   String? previousActiveChatThreadId;
   String? typingEmployeeName;
@@ -8705,27 +8875,28 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     previousActiveChatThreadId = activeChatThreadId;
     activeChatThreadId = '${widget.thread['id']}';
     future = loadAndRememberMessages();
     message.addListener(handleTypingChanged);
     setupLiveConversation();
+    setupMessageChanges();
     unawaited(loadOtherParticipantLastSeen());
     scrollController.addListener(handleMessageScroll);
-    messageChanges = supabase
-        .from('ansar_chat_messages')
-        .stream(primaryKey: ['id'])
-        .eq('thread_id', '${widget.thread['id']}')
-        .listen((_) => unawaited(refreshMessages()), onError: (_) {});
-    timer = Timer.periodic(const Duration(seconds: 2), (_) => unawaited(refreshMessages()));
+    timer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!realtimeConnected) unawaited(refreshMessages());
+    });
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     if (activeChatThreadId == '${widget.thread['id']}') activeChatThreadId = previousActiveChatThreadId;
     timer?.cancel();
     typingTimer?.cancel();
-    messageChanges?.cancel();
+    realtimeReconnectTimer?.cancel();
+    if (messagesChannel != null) supabase.removeChannel(messagesChannel!);
     if (liveChannel != null) {
       liveChannel!.untrack();
       supabase.removeChannel(liveChannel!);
@@ -8738,6 +8909,102 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     message.dispose();
     unawaited(touchEmployeePresence(widget.session.id, online: false));
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (!realtimeConnected) setupMessageChanges();
+      unawaited(refreshMessages());
+      unawaited(markThreadDelivered());
+    }
+  }
+
+  void setupMessageChanges() {
+    if (messagesChannel != null) supabase.removeChannel(messagesChannel!);
+    messagesChannel = supabase.channel('ansar-chat-messages-${widget.thread['id']}-${widget.session.id}')
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.insert,
+        schema: 'public',
+        table: 'ansar_chat_messages',
+        filter: PostgresChangeFilter(
+          type: PostgresChangeFilterType.eq,
+          column: 'thread_id',
+          value: '${widget.thread['id']}',
+        ),
+        callback: handleInsertedMessage,
+      )
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.update,
+        schema: 'public',
+        table: 'ansar_chat_messages',
+        filter: PostgresChangeFilter(
+          type: PostgresChangeFilterType.eq,
+          column: 'thread_id',
+          value: '${widget.thread['id']}',
+        ),
+        callback: (_) => unawaited(refreshMessages()),
+      )
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.delete,
+        schema: 'public',
+        table: 'ansar_chat_messages',
+        callback: (_) => unawaited(refreshMessages()),
+      )
+      ..subscribe((status, error) {
+        if (!mounted) return;
+        final connected = status == RealtimeSubscribeStatus.subscribed;
+        realtimeReconnectTimer?.cancel();
+        if (realtimeConnected != connected || (connected && messageSyncError != null)) {
+          setState(() {
+            realtimeConnected = connected;
+            if (connected) messageSyncError = null;
+          });
+        }
+        if (connected) {
+          unawaited(refreshMessages());
+        } else {
+          realtimeReconnectTimer = Timer(const Duration(seconds: 3), () {
+            if (mounted && !realtimeConnected) setupMessageChanges();
+          });
+        }
+      });
+  }
+
+  void handleInsertedMessage(PostgresChangePayload payload) {
+    if (!mounted) return;
+    final row = Map<String, dynamic>.from(payload.newRecord);
+    if ('${row['thread_id']}' != '${widget.thread['id']}') return;
+    final current = latestMessages ?? <Map<String, dynamic>>[];
+    if (current.any((message) => '${message['id']}' == '${row['id']}')) {
+      unawaited(refreshMessages());
+      return;
+    }
+    final mine = row['sender_id'] == widget.session.id;
+    final shouldFollow = mine || isNearMessageBottom;
+    final optimistic = {
+      ...row,
+      'sender_name': mine ? widget.session.name : 'موظف',
+      'sender_avatar_url': mine ? widget.session.avatarUrl : null,
+      'receipt_status': 'sent',
+      'receipt_details': const <Map<String, dynamic>>[],
+    };
+    final updated = [...current, optimistic];
+    setState(() {
+      latestMessages = updated;
+      future = Future.value(updated);
+      if (!shouldFollow && !mine) {
+        newMessageCount += 1;
+        showNewMessageHint = true;
+      }
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !shouldFollow) return;
+      scrollToMessageBottom();
+      unawaited(markThreadRead());
+    });
+    unawaited(markThreadDelivered());
+    unawaited(refreshMessages());
   }
 
   void setupLiveConversation() {
@@ -8836,13 +9103,16 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     try {
       final loaded = await loadMessages();
       if (!mounted) return;
+      if (messageSyncError != null) setState(() => messageSyncError = null);
       if (chatMessageSnapshotsEqual(latestMessages, loaded)) return;
       setState(() {
         latestMessages = loaded;
         future = Future.value(loaded);
       });
     } catch (_) {
-      // A short network interruption must not replace the conversation with an error screen.
+      if (mounted && messageSyncError == null) {
+        setState(() => messageSyncError = 'تعذر تحديث الرسائل مؤقتاً، نعرض آخر نسخة محفوظة');
+      }
     } finally {
       refreshingMessages = false;
       if (refreshMessagesAgain && mounted) {
@@ -8859,7 +9129,11 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
 
   void handleMessageScroll() {
     if (showNewMessageHint && isNearMessageBottom && mounted) {
-      setState(() => showNewMessageHint = false);
+      setState(() {
+        showNewMessageHint = false;
+        newMessageCount = 0;
+      });
+      unawaited(markThreadRead());
     }
   }
 
@@ -8868,15 +9142,22 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     final last = messages.last;
     final messageId = '${last['id']}';
     if (messageId == lastRenderedMessageId) return;
-    final initial = lastRenderedMessageId == null;
+    final previousMessageId = lastRenderedMessageId;
+    final initial = previousMessageId == null;
     final shouldFollow = initial || isNearMessageBottom || last['sender_id'] == widget.session.id;
     lastRenderedMessageId = messageId;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       if (shouldFollow) {
         scrollToMessageBottom(jump: initial);
+        unawaited(markThreadRead());
       } else if (!showNewMessageHint) {
-        setState(() => showNewMessageHint = true);
+        final previousIndex = messages.indexWhere((row) => '${row['id']}' == previousMessageId);
+        final added = previousIndex < 0 ? 1 : max(1, messages.length - previousIndex - 1);
+        setState(() {
+          showNewMessageHint = true;
+          newMessageCount = max(newMessageCount, added);
+        });
       }
     });
   }
@@ -8886,14 +9167,44 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     final target = scrollController.position.maxScrollExtent;
     if (jump) {
       scrollController.jumpTo(target);
+      unawaited(markThreadRead());
     } else {
       scrollController.animateTo(
         target,
         duration: const Duration(milliseconds: 280),
         curve: Curves.easeOutCubic,
       );
+      unawaited(Future<void>.delayed(const Duration(milliseconds: 320), markThreadRead));
     }
-    if (showNewMessageHint && mounted) setState(() => showNewMessageHint = false);
+    if (showNewMessageHint && mounted) {
+      setState(() {
+        showNewMessageHint = false;
+        newMessageCount = 0;
+      });
+    }
+  }
+
+  Future<void> markThreadDelivered() async {
+    try {
+      await supabase.rpc('ansar_mark_chat_delivered', params: {
+        'p_employee_id': widget.session.id,
+        'p_thread_id': '${widget.thread['id']}',
+      });
+    } catch (_) {
+      // Delivery is retried by the next message refresh.
+    }
+  }
+
+  Future<void> markThreadRead() async {
+    if (!isNearMessageBottom) return;
+    try {
+      await supabase.rpc('ansar_mark_chat_read', params: {
+        'p_employee_id': widget.session.id,
+        'p_thread_id': '${widget.thread['id']}',
+      });
+    } catch (_) {
+      // Read state is retried when the conversation refreshes.
+    }
   }
 
   Future<List<Map<String, dynamic>>> loadAndRememberMessages() async {
@@ -8934,14 +9245,8 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
             .inFilter('message_id', messageIds);
         receiptRows = rows.cast<Map<String, dynamic>>();
       }
-      await supabase.rpc('ansar_mark_chat_delivered', params: {
-        'p_employee_id': widget.session.id,
-        'p_thread_id': '${widget.thread['id']}',
-      });
-      await supabase.rpc('ansar_mark_chat_read', params: {
-        'p_employee_id': widget.session.id,
-        'p_thread_id': '${widget.thread['id']}',
-      });
+      await markThreadDelivered();
+      if (isNearMessageBottom) await markThreadRead();
     } catch (_) {
       // Receipts are optional until the platform migration is installed.
     }
@@ -8995,7 +9300,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
         ? <Map<String, dynamic>>[]
         : await supabase
             .from('ansar_employees')
-            .select('id, display_name, full_name, username, avatar_url')
+            .select('id, display_name, full_name, avatar_url')
             .inFilter('id', missingSenderIds);
     for (final row in employeeRows.cast<Map<String, dynamic>>()) {
       senderProfiles['${row['id']}'] = row;
@@ -9006,9 +9311,9 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       receiptsByMessage.putIfAbsent('${receipt['message_id']}', () => <Map<String, dynamic>>[]).add(receipt);
     }
     return messages.map((row) {
-      final employee = employees[row['sender_id']];
+      final employee = employees['${row['sender_id']}'];
       final reply = messageById[row['reply_to_id']?.toString()];
-      final replyEmployee = reply == null ? null : employees[reply['sender_id']];
+      final replyEmployee = reply == null ? null : employees['${reply['sender_id']}'];
       final receipts = receiptsByMessage['${row['id']}'] ?? <Map<String, dynamic>>[];
       final receiptStatus = receipts.isEmpty
           ? 'sent'
@@ -9021,14 +9326,14 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
         ...row,
         'sender_name': employee == null
             ? 'موظف'
-            : (employee['display_name'] ?? employee['full_name'] ?? employee['username'] ?? 'موظف').toString(),
+            : (employee['display_name'] ?? employee['full_name'] ?? 'موظف').toString(),
         'sender_avatar_url': employee?['avatar_url'],
         'reply_preview_body': reply == null
             ? null
             : (reply['deleted_at'] == null ? reply['body']?.toString() : 'تم حذف هذه الرسالة'),
         'reply_preview_sender': reply == null
             ? null
-            : (replyEmployee?['display_name'] ?? replyEmployee?['full_name'] ?? replyEmployee?['username'] ?? 'موظف').toString(),
+            : (replyEmployee?['display_name'] ?? replyEmployee?['full_name'] ?? 'موظف').toString(),
         'receipt_status': receiptStatus,
         'receipt_details': receipts
             .map((receipt) => {
@@ -9044,6 +9349,36 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
 
   Future<void> pickAttachments() async {
     if (pendingAttachments.length >= 5 || sendingMessage) return;
+    final source = await showModalBottomSheet<String>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined, color: brandColor),
+              title: const Text('صورة من المعرض'),
+              onTap: () => Navigator.pop(sheetContext, 'gallery'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_camera_outlined, color: brandColor),
+              title: const Text('التقاط صورة'),
+              onTap: () => Navigator.pop(sheetContext, 'camera'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.attach_file_rounded, color: infoColor),
+              title: const Text('اختيار صور أو ملفات'),
+              onTap: () => Navigator.pop(sheetContext, 'files'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (source == null || !mounted) return;
+    if (source == 'gallery' || source == 'camera') {
+      await pickChatImage(source == 'camera' ? ImageSource.camera : ImageSource.gallery);
+      return;
+    }
     final result = await FilePicker.platform.pickFiles(
       allowMultiple: true,
       withData: true,
@@ -9076,25 +9411,62 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     if (selected.isNotEmpty) setState(() => pendingAttachments.addAll(selected));
   }
 
+  Future<void> pickChatImage(ImageSource source) async {
+    try {
+      final picked = await ImagePicker().pickImage(source: source, imageQuality: 92, maxWidth: 2200);
+      if (picked == null || !mounted) return;
+      Uint8List bytes = await picked.readAsBytes();
+      if (bytes.length > 1200000) {
+        bytes = await FlutterImageCompress.compressWithList(bytes, minWidth: 1600, minHeight: 1600, quality: 76);
+      }
+      if (bytes.length > 10 * 1024 * 1024) {
+        showSnack(context, 'حجم الصورة أكبر من 10 ميغابايت');
+        return;
+      }
+      final extension = picked.name.split('.').last.toLowerCase();
+      setState(() => pendingAttachments.add(ChatAttachmentDraft(
+            name: picked.name,
+            bytes: bytes,
+            mimeType: chatAttachmentMime(extension),
+          )));
+    } catch (error) {
+      if (mounted) showSnack(context, chatAttachmentError(error));
+    }
+  }
+
   Future<List<Map<String, Object?>>> uploadPendingAttachments() async {
     final uploaded = <Map<String, Object?>>[];
-    for (var index = 0; index < pendingAttachments.length; index++) {
-      final attachment = pendingAttachments[index];
-      final safeName = attachment.name.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
-      final path = '${widget.thread['id']}/${DateTime.now().microsecondsSinceEpoch}-$index-$safeName';
-      await supabase.storage.from('ansar-chat').uploadBinary(
-            path,
-            attachment.bytes,
-            fileOptions: FileOptions(contentType: attachment.mimeType, upsert: false),
-          );
-      uploaded.add({
-        'path': path,
-        'name': attachment.name,
-        'size': attachment.bytes.length,
-        'mime_type': attachment.mimeType,
-      });
+    try {
+      for (var index = 0; index < pendingAttachments.length; index++) {
+        if (mounted) setState(() => attachmentUploadProgress = index / pendingAttachments.length);
+        final attachment = pendingAttachments[index];
+        final safeName = attachment.name.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+        final path = '${widget.thread['id']}/${DateTime.now().microsecondsSinceEpoch}-$index-$safeName';
+        await supabase.storage.from('ansar-chat').uploadBinary(
+              path,
+              attachment.bytes,
+              fileOptions: FileOptions(contentType: attachment.mimeType, upsert: false),
+            );
+        uploaded.add({
+          'path': path,
+          'name': attachment.name,
+          'size': attachment.bytes.length,
+          'mime_type': attachment.mimeType,
+        });
+      }
+      if (mounted) setState(() => attachmentUploadProgress = 1);
+      return uploaded;
+    } catch (error) {
+      final paths = uploaded.map((item) => item['path']?.toString()).whereType<String>().toList();
+      if (paths.isNotEmpty) {
+        try {
+          await supabase.storage.from('ansar-chat').remove(paths);
+        } catch (_) {
+          // A later maintenance pass can remove an orphan if cleanup is temporarily unavailable.
+        }
+      }
+      throw Exception(chatAttachmentError(error));
     }
-    return uploaded;
   }
 
   Future<void> sendMessage() async {
@@ -9157,7 +9529,12 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     } catch (error) {
       if (mounted) showSnack(context, chatUpgradeError(error));
     } finally {
-      if (mounted) setState(() => sendingMessage = false);
+      if (mounted) {
+        setState(() {
+          sendingMessage = false;
+          attachmentUploadProgress = null;
+        });
+      }
     }
   }
 
@@ -9451,19 +9828,24 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
     if (mounted && count != null) showSnack(context, 'تم تحويل الرسالة إلى $count محادثة');
   }
 
-  Future<void> openSenderChat(Map<String, dynamic> row) async {
+  Future<void> openSenderProfile(Map<String, dynamic> row) async {
     final senderId = row['sender_id']?.toString();
     if (senderId == null || senderId == widget.session.id) return;
-    final employee = EmployeeLite(
-      id: senderId,
-      name: row['sender_name']?.toString() ?? 'موظف',
-      username: '',
-      branchNum: 0,
-      role: 'employee',
-      isActive: true,
-      avatarUrl: row['sender_avatar_url']?.toString(),
-    );
-    await openOrCreateDirectChat(context, widget.session, employee);
+    await openEmployeePublicProfile(context, widget.session, senderId);
+  }
+
+  Future<void> openThreadHeader() async {
+    if (widget.thread['thread_type'] != 'direct') {
+      await openThreadInfo();
+      return;
+    }
+    final ids = (widget.thread['participant_ids'] as List?)?.map((value) => '$value').toList() ?? const <String>[];
+    final others = ids.where((id) => id != widget.session.id).toList();
+    if (others.isEmpty) {
+      await openThreadInfo();
+      return;
+    }
+    await openEmployeePublicProfile(context, widget.session, others.first);
   }
 
   Future<void> openThreadInfo() async {
@@ -9615,7 +9997,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       appBar: AppBar(
         title: InkWell(
           borderRadius: BorderRadius.circular(8),
-          onTap: openThreadInfo,
+          onTap: openThreadHeader,
           child: Row(
             children: [
               CircleAvatar(
@@ -9667,6 +10049,33 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
       ),
       body: Column(
         children: [
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 180),
+            child: realtimeConnected && messageSyncError == null
+                ? const SizedBox.shrink()
+                : Container(
+                    key: ValueKey(messageSyncError ?? 'reconnecting'),
+                    width: double.infinity,
+                    color: warningSurface,
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                    child: Row(
+                      children: [
+                        const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: accentColor),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            messageSyncError ?? 'جار إعادة الاتصال بالمحادثة...',
+                            style: const TextStyle(fontSize: 11, color: inkColor, fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
           Expanded(
             child: FutureBuilder<List<Map<String, dynamic>>>(
               future: future,
@@ -9716,7 +10125,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                             showDate: previousDate == null || !sameCalendarDay(previousDate, currentDate),
                             showIdentity: !mine && startsSenderGroup,
                             onLongPress: () => showMessageActions(row),
-                            onAvatarTap: mine ? null : () => openSenderChat(row),
+                            onAvatarTap: mine ? null : () => openSenderProfile(row),
                             onReplyTap: () => scrollToReply(row['reply_to_id']?.toString()),
                             onTransferTap: row['transfer_order_id'] == null ? null : () => openTransferMessage(row),
                             onAttachmentTap: openAttachment,
@@ -9740,14 +10149,17 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                                   child: InkWell(
                                     borderRadius: BorderRadius.circular(22),
                                     onTap: () => scrollToMessageBottom(),
-                                    child: const Padding(
-                                      padding: EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+                                    child: Padding(
+                                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
                                       child: Row(
                                         mainAxisSize: MainAxisSize.min,
                                         children: [
-                                          Icon(Icons.keyboard_arrow_down_rounded, color: Colors.white, size: 20),
-                                          SizedBox(width: 5),
-                                          Text('رسالة جديدة', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w800)),
+                                          const Icon(Icons.keyboard_arrow_down_rounded, color: Colors.white, size: 20),
+                                          const SizedBox(width: 5),
+                                          Text(
+                                            newMessageCount <= 1 ? 'رسالة جديدة' : '$newMessageCount رسائل جديدة',
+                                            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w800),
+                                          ),
                                         ],
                                       ),
                                     ),
@@ -9808,6 +10220,25 @@ class _ChatThreadPageState extends State<ChatThreadPage> {
                             ),
                         ],
                       ),
+                    ),
+                    const SizedBox(height: 8),
+                  ],
+                  if (attachmentUploadProgress != null) ...[
+                    Row(
+                      children: [
+                        Expanded(
+                          child: LinearProgressIndicator(
+                            value: attachmentUploadProgress == 0 ? null : attachmentUploadProgress,
+                            minHeight: 4,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Text(
+                          '${(attachmentUploadProgress! * 100).round()}%',
+                          style: const TextStyle(color: mutedInk, fontSize: 11, fontWeight: FontWeight.w700),
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 8),
                   ],
@@ -10354,7 +10785,7 @@ class _CreateThreadPageState extends State<CreateThreadPage> {
     final employees = widget.employees.where((employee) {
       if (employee.id == widget.session.id) return false;
       if (query.isEmpty) return true;
-      return normalizeSearch(employee.name).contains(query) || normalizeSearch(employee.username).contains(query);
+      return normalizeSearch(employee.name).contains(query);
     }).toList();
     final canCreate = isGroup ? selected.length >= 2 : selected.length == 1;
     return Scaffold(
@@ -10404,7 +10835,7 @@ class _CreateThreadPageState extends State<CreateThreadPage> {
                   controller: search,
                   onChanged: (_) => setState(() {}),
                   decoration: InputDecoration(
-                    hintText: 'ابحث عن موظف بالاسم أو اسم المستخدم',
+                    hintText: 'ابحث عن موظف بالاسم',
                     prefixIcon: const Icon(Icons.search_rounded),
                     suffixIcon: search.text.isEmpty
                         ? null
@@ -10450,7 +10881,7 @@ class _CreateThreadPageState extends State<CreateThreadPage> {
                         leading: EmployeeAvatar(name: employee.name, imageUrl: employee.avatarUrl, radius: 23),
                         title: Text(employee.name, style: const TextStyle(fontWeight: FontWeight.w800)),
                         subtitle: Text(
-                          '@${employee.username} · ${branchLabel(widget.branches, employee.branchNum)}',
+                          '${roleLabel(employee.role)} · ${branchLabel(widget.branches, employee.branchNum)}',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(color: mutedInk, fontSize: 11),
@@ -10542,7 +10973,7 @@ class ChatModeButton extends StatelessWidget {
 }
 
 String employeeDisplayName(Map<String, dynamic> row) {
-  return (row['display_name'] ?? row['full_name'] ?? row['username'] ?? 'موظف').toString();
+  return (row['display_name'] ?? row['full_name'] ?? 'موظف').toString();
 }
 
 bool canDeleteChatMessageForEveryone(Map<String, dynamic> message, EmployeeSession session) {
@@ -10632,7 +11063,7 @@ Future<Map<String, dynamic>?> loadChatThreadForSession(
     if (otherIds.isNotEmpty) {
       final employeeRows = await supabase
           .from('ansar_employees')
-          .select('display_name, full_name, username, avatar_url')
+          .select('display_name, full_name, avatar_url')
           .eq('id', otherIds.first)
           .limit(1);
       if (employeeRows.isNotEmpty) {
@@ -10652,7 +11083,7 @@ Future<void> openChatNotification(
   EmployeeSession session,
   Map<String, dynamic> data,
 ) async {
-  if (data['type'] != 'chat_message') return;
+  if (!isChatNotificationType(data['type']?.toString())) return;
   final threadId = data['thread_id']?.toString();
   if (threadId == null || threadId.isEmpty) return;
   try {
@@ -10744,6 +11175,34 @@ Future<void> markChatNotificationDelivered(String employeeId, String threadId) a
   } catch (_) {
     // Delivery receipts become available after the additive chat migration is installed.
   }
+}
+
+Future<Map<String, int>> loadChatUnreadCounts(String employeeId) async {
+  try {
+    final response = await supabase.rpc('ansar_chat_unread_counts', params: {
+      'p_employee_id': employeeId,
+    });
+    if (response is List) {
+      return {
+        for (final item in response)
+          if (item is Map && item['thread_id'] != null)
+            '${item['thread_id']}': nullableIntValue(item['unread_count']) ?? 0,
+      };
+    }
+  } catch (_) {
+    // Fall back to the receipt table while the RPC migration is being deployed.
+  }
+  final rows = await supabase
+      .from('ansar_chat_message_receipts')
+      .select('thread_id')
+      .eq('employee_id', employeeId)
+      .neq('status', 'read');
+  final counts = <String, int>{};
+  for (final row in rows) {
+    final threadId = '${row['thread_id']}';
+    counts[threadId] = (counts[threadId] ?? 0) + 1;
+  }
+  return counts;
 }
 
 Future<void> touchEmployeePresence(String employeeId, {required bool online}) async {
@@ -10971,6 +11430,221 @@ class _ForwardMessagePageState extends State<ForwardMessagePage> {
   }
 }
 
+Future<void> openEmployeePublicProfile(
+  BuildContext context,
+  EmployeeSession session,
+  String employeeId,
+) async {
+  await Navigator.of(context).push(
+    MaterialPageRoute(
+      builder: (_) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: EmployeePublicProfilePage(session: session, employeeId: employeeId),
+      ),
+    ),
+  );
+}
+
+class EmployeePublicProfilePage extends StatefulWidget {
+  const EmployeePublicProfilePage({super.key, required this.session, required this.employeeId});
+
+  final EmployeeSession session;
+  final String employeeId;
+
+  @override
+  State<EmployeePublicProfilePage> createState() => _EmployeePublicProfilePageState();
+}
+
+class _EmployeePublicProfilePageState extends State<EmployeePublicProfilePage> {
+  late Future<Map<String, dynamic>> future = loadProfile();
+
+  Future<Map<String, dynamic>> loadProfile() async {
+    try {
+      final response = await supabase.rpc('ansar_employee_public_profile', params: {
+        'p_employee_id': widget.employeeId,
+      });
+      if (response is Map && response.isNotEmpty) return Map<String, dynamic>.from(response);
+    } catch (_) {
+      // Use the same public field list while the RPC migration is being installed.
+    }
+    final rows = await supabase
+        .from('ansar_employees')
+        .select('id, display_name, full_name, avatar_url, phone, email, job_title, branch_num, role, last_seen_at')
+        .eq('id', widget.employeeId)
+        .eq('is_active', true)
+        .limit(1);
+    if (rows.isEmpty) throw Exception('تعذر العثور على بيانات الموظف');
+    final row = Map<String, dynamic>.from(rows.first);
+    try {
+      final branches = await loadAppBranchesMap();
+      row['branch_name'] = branchLabel(branches, nullableIntValue(row['branch_num']) ?? 0);
+    } catch (_) {
+      // The branch number remains available if the branch lookup is offline.
+    }
+    return row;
+  }
+
+  Future<void> showAvatar(Map<String, dynamic> profile) async {
+    final url = profile['avatar_url']?.toString();
+    if (url == null || url.isEmpty) return;
+    await showDialog<void>(
+      context: context,
+      barrierColor: Colors.black87,
+      builder: (dialogContext) => Dialog.fullscreen(
+        backgroundColor: Colors.black,
+        child: SafeArea(
+          child: Stack(
+            children: [
+              Center(
+                child: InteractiveViewer(
+                  minScale: 0.8,
+                  maxScale: 4,
+                  child: Image.network(url, fit: BoxFit.contain),
+                ),
+              ),
+              Positioned(
+                top: 8,
+                right: 8,
+                child: IconButton.filledTonal(
+                  tooltip: 'إغلاق',
+                  onPressed: () => Navigator.pop(dialogContext),
+                  icon: const Icon(Icons.close_rounded),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> startChat(Map<String, dynamic> profile) async {
+    if (widget.employeeId == widget.session.id) return;
+    await openOrCreateDirectChat(
+      context,
+      widget.session,
+      EmployeeLite(
+        id: widget.employeeId,
+        name: employeeDisplayName(profile),
+        username: '',
+        branchNum: nullableIntValue(profile['branch_num']) ?? 0,
+        role: profile['role']?.toString() ?? 'employee',
+        isActive: true,
+        avatarUrl: profile['avatar_url']?.toString(),
+      ),
+    );
+  }
+
+  Future<void> launchContact(Uri uri) async {
+    if (!await launchUrl(uri, mode: LaunchMode.externalApplication) && mounted) {
+      showSnack(context, 'لا يوجد تطبيق مناسب لتنفيذ هذا الإجراء');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('معلومات الموظف')),
+      body: FutureBuilder<Map<String, dynamic>>(
+        future: future,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snapshot.hasError) {
+            return ErrorState(
+              message: cleanError(snapshot.error),
+              onRetry: () => setState(() => future = loadProfile()),
+            );
+          }
+          final profile = snapshot.data!;
+          final name = employeeDisplayName(profile);
+          final avatarUrl = profile['avatar_url']?.toString();
+          final phone = profile['phone']?.toString().trim() ?? '';
+          final email = profile['email']?.toString().trim() ?? '';
+          final jobTitle = profile['job_title']?.toString().trim() ?? '';
+          final branch = profile['branch_name']?.toString().trim().isNotEmpty == true
+              ? profile['branch_name'].toString()
+              : 'فرع رقم ${profile['branch_num'] ?? '-'}';
+          final lastSeen = DateTime.tryParse(profile['last_seen_at']?.toString() ?? '')?.toLocal();
+          return ListView(
+            padding: const EdgeInsets.fromLTRB(18, 24, 18, 32),
+            children: [
+              Center(
+                child: GestureDetector(
+                  onTap: avatarUrl == null || avatarUrl.isEmpty ? null : () => showAvatar(profile),
+                  child: Hero(
+                    tag: 'employee-avatar-${widget.employeeId}',
+                    child: EmployeeAvatar(name: name, imageUrl: avatarUrl, radius: 58),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 14),
+              Text(name, textAlign: TextAlign.center, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w900)),
+              Text(
+                [if (jobTitle.isNotEmpty) jobTitle, branch].join(' · '),
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: mutedInk),
+              ),
+              if (lastSeen != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 5),
+                  child: Text('آخر ظهور ${formatDateTime(lastSeen)}', textAlign: TextAlign.center, style: const TextStyle(color: mutedInk, fontSize: 12)),
+                ),
+              if (widget.employeeId != widget.session.id) ...[
+                const SizedBox(height: 18),
+                FilledButton.icon(
+                  onPressed: () => startChat(profile),
+                  icon: const Icon(Icons.chat_bubble_outline_rounded),
+                  label: const Text('بدء محادثة خاصة'),
+                ),
+              ],
+              const SizedBox(height: 18),
+              Card(
+                child: Column(
+                  children: [
+                    ListTile(
+                      leading: const Icon(Icons.badge_outlined, color: brandColor),
+                      title: const Text('المسمى الوظيفي'),
+                      subtitle: Text(jobTitle.isEmpty ? 'غير محدد' : jobTitle),
+                    ),
+                    const Divider(indent: 58),
+                    ListTile(
+                      leading: const Icon(Icons.storefront_outlined, color: brandColor),
+                      title: const Text('الفرع'),
+                      subtitle: Text(branch),
+                    ),
+                    if (phone.isNotEmpty) ...[
+                      const Divider(indent: 58),
+                      ListTile(
+                        onTap: () => launchContact(Uri(scheme: 'tel', path: phone)),
+                        leading: const Icon(Icons.phone_outlined, color: infoColor),
+                        title: const Text('الهاتف'),
+                        subtitle: Text(phone),
+                        trailing: const Icon(Icons.call_rounded, color: infoColor),
+                      ),
+                    ],
+                    if (email.isNotEmpty) ...[
+                      const Divider(indent: 58),
+                      ListTile(
+                        onTap: () => launchContact(Uri(scheme: 'mailto', path: email)),
+                        leading: const Icon(Icons.email_outlined, color: accentColor),
+                        title: const Text('البريد الإلكتروني'),
+                        subtitle: Text(email),
+                        trailing: const Icon(Icons.open_in_new_rounded, color: mutedInk),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
 class ChatInfoResult {
   const ChatInfoResult({this.title, this.leftThread = false});
 
@@ -11031,7 +11705,7 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
     final ids = participantRows.map((row) => row['employee_id']?.toString()).whereType<String>().toList();
     final employeeQuery = supabase
         .from('ansar_employees')
-        .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url, last_seen_at');
+        .select('id, display_name, full_name, branch_num, role, is_active, avatar_url, last_seen_at');
     final employeeRows = threadType == 'general'
         ? await employeeQuery.eq('is_active', true)
         : ids.isEmpty
@@ -11237,7 +11911,11 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
   }
 
   Future<void> openMember(Map<String, dynamic> row) async {
-    final employee = EmployeeLite.fromRow({...row, 'id': row['employee_id']});
+    await openEmployeePublicProfile(context, widget.session, '${row['employee_id']}');
+  }
+
+  Future<void> messageMember(Map<String, dynamic> row) async {
+    final employee = EmployeeLite.fromRow({...row, 'id': row['employee_id'], 'username': ''});
     await openOrCreateDirectChat(context, widget.session, employee);
   }
 
@@ -11337,7 +12015,9 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
                         final participant = participants[index];
                         final isMe = '${participant['employee_id']}' == widget.session.id;
                         final lastSeen = DateTime.tryParse(participant['last_seen_at']?.toString() ?? '')?.toLocal();
-                        final memberRole = participant['participant_role'] == 'admin' ? 'مشرف المجموعة' : '@${participant['username'] ?? ''}';
+                        final memberRole = participant['participant_role'] == 'admin'
+                            ? 'مشرف المجموعة'
+                            : roleLabel(participant['role']?.toString() ?? 'employee');
                         return ListTile(
                           onTap: isMe ? null : () => openMember(participant),
                           leading: EmployeeAvatar(
@@ -11352,8 +12032,24 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
                             overflow: TextOverflow.ellipsis,
                           ),
                           trailing: isGroup && manager && !isMe
-                              ? IconButton(tooltip: 'إزالة من المجموعة', onPressed: () => removeMember(participant), icon: const Icon(Icons.person_remove_outlined, color: dangerColor))
-                              : (!isMe ? const Icon(Icons.chat_bubble_outline_rounded, color: brandColor) : null),
+                              ? PopupMenuButton<String>(
+                                  tooltip: 'خيارات العضو',
+                                  onSelected: (value) {
+                                    if (value == 'chat') unawaited(messageMember(participant));
+                                    if (value == 'remove') unawaited(removeMember(participant));
+                                  },
+                                  itemBuilder: (_) => const [
+                                    PopupMenuItem(value: 'chat', child: Text('مراسلة الموظف')),
+                                    PopupMenuItem(value: 'remove', child: Text('إزالة من المجموعة')),
+                                  ],
+                                )
+                              : (!isMe
+                                  ? IconButton(
+                                      tooltip: 'مراسلة الموظف',
+                                      onPressed: () => messageMember(participant),
+                                      icon: const Icon(Icons.chat_bubble_outline_rounded, color: brandColor),
+                                    )
+                                  : null),
                         );
                       }),
                       if (index != participants.length - 1) const Divider(indent: 64),
@@ -11402,7 +12098,7 @@ class _SelectChatMembersPageState extends State<SelectChatMembersPage> {
   Widget build(BuildContext context) {
     final query = normalizeSearch(search.text);
     final employees = widget.employees
-        .where((employee) => query.isEmpty || normalizeSearch('${employee.name} ${employee.username}').contains(query))
+        .where((employee) => query.isEmpty || normalizeSearch(employee.name).contains(query))
         .toList();
     return Scaffold(
       appBar: AppBar(title: Text(widget.title)),
@@ -11427,7 +12123,7 @@ class _SelectChatMembersPageState extends State<SelectChatMembersPage> {
                   onTap: () => setState(() => active ? selected.remove(employee.id) : selected.add(employee.id)),
                   leading: EmployeeAvatar(name: employee.name, imageUrl: employee.avatarUrl, radius: 23),
                   title: Text(employee.name, style: const TextStyle(fontWeight: FontWeight.w800)),
-                  subtitle: Text('@${employee.username} · فرع رقم ${employee.branchNum}'),
+                  subtitle: Text('${roleLabel(employee.role)} · فرع رقم ${employee.branchNum}'),
                   trailing: Icon(active ? Icons.check_circle_rounded : Icons.circle_outlined, color: active ? brandColor : mutedInk),
                 );
               },
@@ -12070,25 +12766,9 @@ Future<List<Map<String, dynamic>>> loadAllProductsCached() async {
 }
 
 Future<List<Map<String, dynamic>>> _loadAllProducts() async {
-  final all = <Map<String, dynamic>>[];
-  var from = 0;
-  const pageSize = 1000;
-  while (true) {
-    final rows = await supabase
-        .from('products')
-        .select()
-        .range(from, from + pageSize - 1);
-    final page = rows.cast<Map<String, dynamic>>();
-    all.addAll(page);
-    if (page.length < pageSize) break;
-    from += pageSize;
-  }
-  final unique = <int, Map<String, dynamic>>{};
-  for (final product in all) {
-    final matNum = nullableIntValue(product['mat_num']);
-    if (matNum != null) unique.putIfAbsent(matNum, () => product);
-  }
-  return unique.values.toList();
+  final cache = ProductSearchCache.instance;
+  if (!await cache.hasData) await cache.synchronize(supabase, force: true);
+  return cache.allProducts();
 }
 
 Future<Map<int, String>> loadAllBarcodesCached() async {
@@ -12105,32 +12785,19 @@ Future<Map<int, String>> loadAllBarcodesCached() async {
 }
 
 Future<Map<int, String>> _loadAllBarcodes() async {
-  final all = <Map<String, dynamic>>[];
-  var from = 0;
-  const pageSize = 1000;
-  while (true) {
-    final rows = await supabase
-        .from('product_barcodes')
-        .select('mat_num, barcode')
-        .range(from, from + pageSize - 1);
-    final page = rows.cast<Map<String, dynamic>>();
-    all.addAll(page);
-    if (page.length < pageSize) break;
-    from += pageSize;
-  }
-  final map = <int, String>{};
-  for (final row in all) {
-    final matNum = nullableIntValue(row['mat_num']);
-    final barcode = row['barcode']?.toString();
-    if (matNum != null && barcode != null && barcode.isNotEmpty) {
-      map[matNum] = barcode;
-    }
-  }
-  return map;
+  final cache = ProductSearchCache.instance;
+  if (!await cache.hasData) await cache.synchronize(supabase, force: true);
+  return cache.allBarcodes();
 }
 
 Future<void> warmProductSearchCache() async {
-  await Future.wait([loadAllProductsCached(), loadAllBarcodesCached()]);
+  final cache = ProductSearchCache.instance;
+  await cache.database;
+  if (!await cache.hasData) {
+    await cache.synchronize(supabase, force: true);
+  } else {
+    unawaited(cache.synchronize(supabase).catchError((_) {}));
+  }
 }
 
 Future<List<Map<String, dynamic>>> loadAccountsCached() async {
@@ -12162,31 +12829,54 @@ Future<List<Map<String, dynamic>>> searchProductsLikeLegacy(
   String query, {
   required int limit,
 }) async {
-  final readyProducts = cachedProducts;
-  if (readyProducts != null) {
-    return rankProductRows(
-      readyProducts,
-      query,
-      cachedBarcodes ?? const <int, String>{},
-      limit: limit,
-    );
+  final cache = ProductSearchCache.instance;
+  var hadLocalData = false;
+  var localRows = <Map<String, dynamic>>[];
+  Object? localCacheError;
+  try {
+    hadLocalData = await cache.hasData;
+    localRows = await cache.search(query, limit: max(250, limit * 8));
+  } catch (error) {
+    localCacheError = error;
+  }
+  if (localRows.isNotEmpty) {
+    unawaited(cache.synchronize(supabase).catchError((_) {}));
+    final localBarcodes = <int, String>{};
+    for (final product in localRows) {
+      final matNum = nullableIntValue(product['mat_num']);
+      final barcode = product['_cached_barcode']?.toString();
+      if (matNum != null && barcode != null && barcode.isNotEmpty) localBarcodes[matNum] = barcode;
+    }
+    return rankProductRows(localRows, query, localBarcodes, limit: limit);
   }
 
+  Object? directError;
   try {
     final direct = await searchProductsDirect(query, limit: limit);
-    if (direct.isNotEmpty) return direct;
-  } catch (_) {
-    // Fall through to the complete local index when the direct request is unavailable.
+    if (direct.isNotEmpty) {
+      unawaited(cache.synchronize(supabase, force: true).catchError((_) {}));
+      return direct;
+    }
+  } catch (error) {
+    directError = error;
   }
 
-  final products = await loadAllProductsCached();
-  Map<int, String> barcodes = const <int, String>{};
   try {
-    barcodes = await loadAllBarcodesCached();
+    await cache.synchronize(supabase, force: true);
+    final refreshed = await cache.search(query, limit: max(250, limit * 8));
+    final refreshedBarcodes = <int, String>{};
+    for (final product in refreshed) {
+      final matNum = nullableIntValue(product['mat_num']);
+      final barcode = product['_cached_barcode']?.toString();
+      if (matNum != null && barcode != null && barcode.isNotEmpty) refreshedBarcodes[matNum] = barcode;
+    }
+    return rankProductRows(refreshed, query, refreshedBarcodes, limit: limit);
   } catch (_) {
-    // Searching by title and material number still works without the barcode index.
+    if (hadLocalData) return <Map<String, dynamic>>[];
+    if (directError != null) throw directError;
+    if (localCacheError != null) throw localCacheError;
+    rethrow;
   }
-  return rankProductRows(products, query, barcodes, limit: limit);
 }
 
 Future<List<Map<String, dynamic>>> searchProductsDirect(
@@ -12304,14 +12994,7 @@ double productSearchScore(
 }
 
 String normalizeSearch(String value) {
-  return value
-      .toLowerCase()
-      .replaceAll('أ', 'ا')
-      .replaceAll('إ', 'ا')
-      .replaceAll('آ', 'ا')
-      .replaceAll('ة', 'ه')
-      .replaceAll('ى', 'ي')
-      .trim();
+  return normalizeProductSearch(value);
 }
 
 Future<List<EmployeeLite>> loadEmployeesForScope(
@@ -12334,7 +13017,7 @@ Future<List<EmployeeLite>> loadEmployeesForScope(
 Future<List<EmployeeLite>> loadAllActiveEmployees() async {
   final rows = await supabase
       .from('ansar_employees')
-      .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url')
+      .select('id, display_name, full_name, branch_num, role, is_active, avatar_url')
       .eq('is_active', true)
       .order('display_name', ascending: true);
   return rows.cast<Map<String, dynamic>>().map(EmployeeLite.fromRow).toList();
@@ -12618,6 +13301,8 @@ String notificationRouteForType(String type) {
   return 'home';
 }
 
+bool isChatNotificationType(String? type) => type?.startsWith('chat') == true;
+
 Future<void> kickNotificationSender() async {
   try {
     await supabase.functions.invoke('send-notifications', body: {'source': 'app'});
@@ -12657,6 +13342,8 @@ Future<void> enqueueChatNotification({
     'sender_name': sender.name,
     'sender_avatar_url': sender.avatarUrl ?? '',
     'message_preview': body,
+    'thread_title': thread['title']?.toString() ?? '',
+    'thread_type': type,
   };
 
   List<Map<String, dynamic>> participants;
@@ -12863,11 +13550,24 @@ Future<void> saveDeviceInstallation(
   String? fcmToken,
   String? pushyToken,
 }) async {
+  String appVersion = '0.4.0+4';
+  try {
+    final info = await PackageInfo.fromPlatform();
+    appVersion = '${info.version}+${info.buildNumber}';
+  } catch (_) {
+    // Keep the declared package version when platform metadata is unavailable.
+  }
   final values = <String, Object?>{
     'installation_id': installationId,
     'employee_id': session.id,
     'platform': Platform.isAndroid ? 'android' : (Platform.isIOS ? 'ios' : 'other'),
     'device_name': '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+    'app_version': appVersion,
+    'notification_capabilities': const {
+      'rich_notifications_v1': true,
+      'inline_reply_v1': true,
+      'notification_deduplication_v1': true,
+    },
     'permission_status': permissionStatus,
     'is_active': (fcmToken?.isNotEmpty ?? false) || (pushyToken?.isNotEmpty ?? false),
     'last_seen_at': DateTime.now().toUtc().toIso8601String(),
@@ -12890,7 +13590,13 @@ Future<void> saveDeviceInstallation(
           .eq('pushy_token', pushyToken)
           .neq('installation_id', installationId);
     }
-    await supabase.from('ansar_device_installations').upsert(values, onConflict: 'installation_id');
+    try {
+      await supabase.from('ansar_device_installations').upsert(values, onConflict: 'installation_id');
+    } catch (error) {
+      if (!error.toString().contains('notification_capabilities')) rethrow;
+      final compatibleValues = Map<String, Object?>.from(values)..remove('notification_capabilities');
+      await supabase.from('ansar_device_installations').upsert(compatibleValues, onConflict: 'installation_id');
+    }
   } catch (_) {
     if (fcmToken == null || fcmToken.isEmpty) rethrow;
   }
@@ -12948,6 +13654,24 @@ String chatUpgradeError(Object? error) {
     return 'يلزم تنفيذ ملف تحديث الدردشة الجديد في Supabase أولاً.';
   }
   return cleanError(error);
+}
+
+String chatAttachmentError(Object? error) {
+  final text = error.toString();
+  if (text.contains('Bucket not found') || text.contains('ansar-chat')) {
+    return 'مساحة مرفقات الدردشة غير مهيأة. نفّذ ملف ansar-realtime-rich-upgrade.sql في Supabase.';
+  }
+  if (text.contains('row-level security') || text.contains('Unauthorized') || text.contains('403')) {
+    return 'رفضت قاعدة البيانات رفع المرفق. أعد تنفيذ سياسات مساحة ansar-chat.';
+  }
+  if (text.contains('SocketException') || text.contains('TimeoutException') || text.contains('Failed host lookup')) {
+    return 'انقطع الاتصال أثناء رفع المرفق. بقي الملف جاهزاً لإعادة الإرسال.';
+  }
+  if (text.contains('Payload too large') || text.contains('413')) {
+    return 'حجم المرفق أكبر من 10 ميغابايت.';
+  }
+  final cleaned = cleanError(error);
+  return cleaned.isEmpty ? 'تعذر رفع المرفق. بقي جاهزاً لإعادة المحاولة.' : cleaned;
 }
 
 String? branchLogoAsset(String branchName) {

@@ -20,113 +20,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: "3.44.6"
           channel: stable
 
-      - name: Generate Android platform
-        run: flutter create --platforms=android .
+      - name: Configure Android environment
+        run: |
+          printf 'flutter.sdk=%s\n' "$FLUTTER_ROOT" > android/local.properties
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" >> android/local.properties
+          chmod +x android/gradlew
+          cp google-services.json android/app/google-services.json
 
       - name: Get dependencies
         run: flutter pub get
 
-      - name: Configure Firebase for Android
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          import shutil
-
-          source = Path("google-services.json")
-          target = Path("android/app/google-services.json")
-          if not source.exists():
-              raise SystemExit("google-services.json is missing from the repository root")
-          target.parent.mkdir(parents=True, exist_ok=True)
-          shutil.copyfile(source, target)
-
-          settings = Path("android/settings.gradle.kts")
-          settings_text = settings.read_text(encoding="utf-8")
-          google_services_plugin = '    id("com.google.gms.google-services") version "4.4.2" apply false\n'
-          if "com.google.gms.google-services" not in settings_text:
-              settings_text = settings_text.replace("plugins {\n", "plugins {\n" + google_services_plugin, 1)
-              settings.write_text(settings_text, encoding="utf-8")
-
-          app_gradle = Path("android/app/build.gradle.kts")
-          app_text = app_gradle.read_text(encoding="utf-8")
-          google_services_app_plugin = '    id("com.google.gms.google-services")\n'
-          if "com.google.gms.google-services" not in app_text:
-              app_text = app_text.replace(
-                  '    id("dev.flutter.flutter-gradle-plugin")\n',
-                  '    id("dev.flutter.flutter-gradle-plugin")\n' + google_services_app_plugin,
-                  1,
-              )
-              app_gradle.write_text(app_text, encoding="utf-8")
-
-          manifest = Path("android/app/src/main/AndroidManifest.xml")
-          manifest_text = manifest.read_text(encoding="utf-8")
-          pushy_permissions = [
-              "android.permission.INTERNET",
-              "android.permission.WAKE_LOCK",
-              "android.permission.POST_NOTIFICATIONS",
-              "android.permission.ACCESS_NETWORK_STATE",
-              "android.permission.RECEIVE_BOOT_COMPLETED",
-              "android.permission.SCHEDULE_EXACT_ALARM",
-          ]
-          declarations = "".join(
-              f'    <uses-permission android:name="{name}" />\n'
-              for name in pushy_permissions
-              if name not in manifest_text
-          )
-          if declarations:
-              manifest_text = manifest_text.replace(">\n    <application", ">\n" + declarations + "    <application", 1)
-
-          pushy_declarations = '''
-              <receiver android:name="me.pushy.sdk.flutter.internal.PushyInternalReceiver" android:exported="false">
-                  <intent-filter>
-                      <action android:name="pushy.me" />
-                  </intent-filter>
-              </receiver>
-              <receiver android:name="me.pushy.sdk.receivers.PushyUpdateReceiver" android:exported="false">
-                  <intent-filter>
-                      <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
-                  </intent-filter>
-              </receiver>
-              <receiver android:name="me.pushy.sdk.receivers.PushyBootReceiver" android:exported="false">
-                  <intent-filter>
-                      <action android:name="android.intent.action.BOOT_COMPLETED" />
-                  </intent-filter>
-              </receiver>
-              <service android:name="me.pushy.sdk.services.PushySocketService" android:stopWithTask="false" />
-              <service
-                  android:name="me.pushy.sdk.services.PushyJobService"
-                  android:permission="android.permission.BIND_JOB_SERVICE"
-                  android:stopWithTask="false" />
-          '''
-          if "me.pushy.sdk.flutter.internal.PushyInternalReceiver" not in manifest_text:
-              manifest_text = manifest_text.replace("    </application>", pushy_declarations + "    </application>", 1)
-          manifest.write_text(manifest_text, encoding="utf-8")
-
-          proguard = Path("android/app/proguard-rules.pro")
-          proguard.write_text(
-              "-dontwarn me.pushy.**\n"
-              "-keep class me.pushy.** { *; }\n"
-              "-keep class androidx.core.app.** { *; }\n"
-              "-keep class android.support.v4.app.** { *; }\n",
-              encoding="utf-8",
-          )
-          PY
-
-      - name: Set Android app name and icon
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          manifest = Path("android/app/src/main/AndroidManifest.xml")
-          text = manifest.read_text(encoding="utf-8")
-          text = text.replace('android:label="ansar_team_app"', 'android:label="فريق الأنصار"')
-          manifest.write_text(text, encoding="utf-8")
-          PY
-          dart run flutter_launcher_icons
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
 
       - name: Analyze
         run: flutter analyze --no-fatal-infos --no-fatal-warnings

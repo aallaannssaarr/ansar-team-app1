@@ -1,4 +1,5 @@
 import 'package:ansar_team_app/main.dart';
+import 'package:ansar_team_app/product_cache.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -41,6 +42,11 @@ void main() {
       productSearchScore(exact, query, words, barcodes),
       greaterThan(productSearchScore(partial, query, words, barcodes)),
     );
+  });
+
+  test('persistent product search normalizes Arabic letters and whitespace', () {
+    expect(normalizeProductSearch('  أَنسار   إدلب  '), 'انسار ادلب');
+    expect(normalizeProductSearch('مكتبة الأنصار'), normalizeProductSearch('مكتبة الانصار'));
   });
 
   testWidgets('product card hides zero prices and shows negative stock', (tester) async {
@@ -322,6 +328,8 @@ void main() {
     expect(notificationData({'type': 'chat_message'})['type'], 'chat_message');
     expect(notificationData('{"type":"chat_message","thread_id":"one"}')['thread_id'], 'one');
     expect(notificationData('not-json'), isEmpty);
+    expect(isChatNotificationType('chat_transfer'), isTrue);
+    expect(isChatNotificationType('attendance_checked_in'), isFalse);
   });
 
   test('direct notifications reach their target and never return to the sender', () {

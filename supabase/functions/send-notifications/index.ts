@@ -19,6 +19,8 @@ type Installation = {
   preferred_provider: string | null;
   firebase_failures: number | null;
   pushy_failures: number | null;
+  app_version: string | null;
+  notification_capabilities: Record<string, unknown> | string | null;
 };
 
 type Employee = {
@@ -160,7 +162,7 @@ async function getTargetInstallations(item: QueueItem): Promise<Installation[]> 
 async function loadInstallations(): Promise<Installation[]> {
   try {
     const installations = await supabaseGet<Installation[]>(
-      "/rest/v1/ansar_device_installations?is_active=eq.true&select=id,installation_id,employee_id,fcm_token,pushy_token,preferred_provider,firebase_failures,pushy_failures",
+      "/rest/v1/ansar_device_installations?is_active=eq.true&select=id,installation_id,employee_id,fcm_token,pushy_token,preferred_provider,firebase_failures,pushy_failures,app_version,notification_capabilities",
     );
     return installations.filter((device) => Boolean(device.fcm_token || device.pushy_token));
   } catch (_) {
@@ -176,6 +178,8 @@ async function loadInstallations(): Promise<Installation[]> {
       preferred_provider: "firebase",
       firebase_failures: 0,
       pushy_failures: 0,
+      app_version: null,
+      notification_capabilities: null,
     }));
   }
 }
@@ -220,7 +224,7 @@ async function sendToInstallation(item: QueueItem, installation: Installation): 
   let firebaseError = "";
   if (installation.fcm_token && firebaseJson) {
     try {
-      const providerMessageId = await sendFirebase(item, installation.fcm_token);
+      const providerMessageId = await sendFirebase(item, installation.fcm_token, supportsRichNotifications(installation));
       await updateInstallationSuccess(installation, "firebase");
       return { status: "sent", provider: "firebase", providerMessageId };
     } catch (error) {
@@ -236,7 +240,7 @@ async function sendToInstallation(item: QueueItem, installation: Installation): 
     (installation.firebase_failures ?? 0) + 1 >= 2;
   if (installation.pushy_token && pushyApiKey && shouldUsePushy) {
     try {
-      const providerMessageId = await sendPushy(item, installation.pushy_token);
+      const providerMessageId = await sendPushy(item, installation.pushy_token, supportsRichNotifications(installation));
       await updateInstallationSuccess(installation, "pushy");
       return { status: "sent", provider: "pushy", providerMessageId };
     } catch (error) {
@@ -252,7 +256,26 @@ async function sendToInstallation(item: QueueItem, installation: Installation): 
   return { status: "failed", provider: "firebase", error: firebaseError || "No fallback provider is configured" };
 }
 
-async function sendFirebase(item: QueueItem, token: string): Promise<string> {
+function notificationCapabilities(installation: Installation): Record<string, unknown> {
+  if (installation.notification_capabilities && typeof installation.notification_capabilities === "object") {
+    return installation.notification_capabilities;
+  }
+  if (typeof installation.notification_capabilities === "string") {
+    try {
+      const decoded = JSON.parse(installation.notification_capabilities);
+      if (decoded && typeof decoded === "object") return decoded;
+    } catch (_) {
+      // Older installations may contain an invalid optional capability payload.
+    }
+  }
+  return {};
+}
+
+function supportsRichNotifications(installation: Installation) {
+  return notificationCapabilities(installation).rich_notifications_v1 === true;
+}
+
+async function sendFirebase(item: QueueItem, token: string, rich: boolean): Promise<string> {
   firebaseAccessToken ??= await getFirebaseAccessToken();
   const serviceAccount = JSON.parse(firebaseJson);
   const data = queueData(item);
@@ -260,6 +283,15 @@ async function sendFirebase(item: QueueItem, token: string): Promise<string> {
     typeof data.sender_avatar_url === "string" && data.sender_avatar_url.startsWith("https://")
       ? data.sender_avatar_url
       : null;
+  const payloadData = stringifyData({
+    ...data,
+    notification_id: item.id,
+    title: item.title,
+    body: item.body,
+    message: item.body,
+    provider: "firebase",
+    rich_notification: rich,
+  });
   const response = await fetch(`https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`, {
     method: "POST",
     headers: {
@@ -269,19 +301,28 @@ async function sendFirebase(item: QueueItem, token: string): Promise<string> {
     body: JSON.stringify({
       message: {
         token,
-        notification: {
-          title: item.title,
-          body: item.body,
-          ...(senderImage ? { image: senderImage } : {}),
-        },
-        data: stringifyData({ ...data, notification_id: item.id }),
+        ...(rich
+          ? {}
+          : {
+              notification: {
+                title: item.title,
+                body: item.body,
+                ...(senderImage ? { image: senderImage } : {}),
+              },
+            }),
+        data: payloadData,
         android: {
           priority: "HIGH",
           collapse_key: `ansar-${item.id}`,
-          notification: {
-            sound: "default",
-            ...(senderImage ? { image: senderImage } : {}),
-          },
+          ttl: "604800s",
+          ...(rich
+            ? {}
+            : {
+                notification: {
+                  sound: "default",
+                  ...(senderImage ? { image: senderImage } : {}),
+                },
+              }),
         },
       },
     }),
@@ -291,12 +332,15 @@ async function sendFirebase(item: QueueItem, token: string): Promise<string> {
   return payload.name ?? "firebase";
 }
 
-async function sendPushy(item: QueueItem, token: string): Promise<string> {
+async function sendPushy(item: QueueItem, token: string, rich: boolean): Promise<string> {
   const data = {
     ...queueData(item),
     notification_id: item.id,
     title: item.title,
     message: item.body,
+    body: item.body,
+    provider: "pushy",
+    rich_notification: rich,
   };
   const response = await fetch(`https://api.pushy.me/push?api_key=${encodeURIComponent(pushyApiKey)}`, {
     method: "POST",
@@ -304,7 +348,7 @@ async function sendPushy(item: QueueItem, token: string): Promise<string> {
     body: JSON.stringify({
       to: token,
       data,
-      notification: { title: item.title, body: item.body, sound: "default" },
+      ...(rich ? {} : { notification: { title: item.title, body: item.body, sound: "default" } }),
       collapse_key: `ansar-${item.id}`.slice(0, 32),
       time_to_live: 604800,
     }),

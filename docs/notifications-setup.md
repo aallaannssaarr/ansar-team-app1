@@ -5,15 +5,16 @@
 ## الإعداد لمرة واحدة
 
 1. افتح **Supabase SQL Editor** ونفذ الملف `docs/ansar-platform-upgrade.sql` كاملاً. الملف إضافي وقابل لإعادة التنفيذ ولا يحذف الجداول القديمة.
-2. نفذ `docs/ansar-notification-scheduler.sql` لتشغيل التذكيرات ومرسل الإشعارات كل دقيقة.
-3. في [Pushy](https://dashboard.pushy.me/) أنشئ تطبيق Android باسم فريق الأنصار وباسم الحزمة `com.example.ansar_team_app`، ثم انسخ **Secret API Key**.
-4. في GitHub افتح **Settings > Secrets and variables > Actions** وأضف:
+2. نفذ الملف `docs/ansar-realtime-rich-upgrade.sql` لإصلاح Realtime، وإضافة الرد من الإشعار، والمرفقات، ومشاركة المناقلات، والملف العام الآمن للموظف.
+3. نفذ `docs/ansar-notification-scheduler.sql` لتشغيل التذكيرات ومرسل الإشعارات كل دقيقة.
+4. في [Pushy](https://dashboard.pushy.me/) أنشئ تطبيق Android باسم فريق الأنصار وباسم الحزمة `com.example.ansar_team_app`، ثم انسخ **Secret API Key**.
+5. في GitHub افتح **Settings > Secrets and variables > Actions** وأضف:
    - `SUPABASE_ACCESS_TOKEN`: رمز حساب Supabase.
    - `FIREBASE_SERVICE_ACCOUNT_JSON`: كامل محتوى ملف خدمة Firebase بصيغة JSON.
    - `PUSHY_SECRET_API_KEY`: مفتاح Pushy السري.
    - `FIREBASE_TESTER_GROUPS`: اسم مجموعة المختبرين، والقيمة المقترحة `ansar-testers`.
-5. شغّل **Deploy Notification Sender** من GitHub Actions مرة واحدة بعد إضافة الأسرار.
-6. في Firebase App Distribution أنشئ مجموعة مختبرين باسم `ansar-testers` وأضف عناوينهم. كل بناء ناجح سيبقى كملف APK في GitHub وسيُرسل أيضاً إلى المجموعة تلقائياً.
+6. شغّل **Deploy Notification Sender** من GitHub Actions مرة واحدة بعد إضافة الأسرار، وأعد تشغيله بعد كل تعديل على `supabase/functions/send-notifications/index.ts`.
+7. في Firebase App Distribution أنشئ مجموعة مختبرين باسم `ansar-testers` وأضف عناوينهم. كل بناء ناجح سيبقى كملف APK في GitHub وسيُرسل أيضاً إلى المجموعة تلقائياً.
 
 ## اختبار القبول
 
