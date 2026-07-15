@@ -23,11 +23,8 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'ansar_config.dart';
-import 'offline_database.dart';
 import 'product_cache.dart';
 import 'rich_notifications.dart';
-import 'session_store.dart';
-import 'sync_coordinator.dart';
 
 @pragma('vm:entry-point')
 Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
@@ -111,45 +108,18 @@ Future<void> main() async {
           ),
         ),
       );
+  await Firebase.initializeApp();
+  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
+  await Supabase.initialize(
+    url: AnsarConfig.supabaseUrl,
+    publishableKey: AnsarConfig.supabaseServiceKey,
+  );
+  await RichNotificationService.initialize();
+  initializePushyService();
   runApp(const AnsarApp());
 }
 
-Future<void>? _notificationServicesFuture;
-
-Future<void> ensureNotificationServices() {
-  return _notificationServicesFuture ??= _initializeNotificationServices();
-}
-
-Future<void> _initializeNotificationServices() async {
-  if (Firebase.apps.isEmpty) await Firebase.initializeApp();
-  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
-  await RichNotificationService.initialize();
-  initializePushyService();
-}
-
 SupabaseClient get supabase => Supabase.instance.client;
-Future<void>? _supabaseInitialization;
-
-Future<void> ensureSupabaseInitialized() {
-  final running = _supabaseInitialization;
-  if (running != null) return running;
-  final future = _initializeSupabase();
-  _supabaseInitialization = future;
-  return future;
-}
-
-Future<void> _initializeSupabase() async {
-  try {
-    await Supabase.initialize(
-      url: AnsarConfig.supabaseUrl,
-      publishableKey: AnsarConfig.supabaseServiceKey,
-    );
-  } catch (_) {
-    _supabaseInitialization = null;
-    rethrow;
-  }
-}
-
 List<Map<String, dynamic>>? cachedProducts;
 Map<int, String>? cachedBarcodes;
 Future<List<Map<String, dynamic>>>? cachedProductsFuture;
@@ -360,107 +330,9 @@ class AnsarApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'فريق الأنصار',
       theme: buildAnsarTheme(),
-      home: const Directionality(textDirection: TextDirection.rtl, child: AppBootstrap()),
-    );
-  }
-}
-
-class AppBootstrap extends StatefulWidget {
-  const AppBootstrap({super.key});
-
-  @override
-  State<AppBootstrap> createState() => _AppBootstrapState();
-}
-
-class _AppBootstrapState extends State<AppBootstrap> {
-  Object? error;
-  EmployeeSession? restoredSession;
-  bool ready = false;
-
-  @override
-  void initState() {
-    super.initState();
-    unawaited(initialize());
-  }
-
-  Future<void> initialize() async {
-    if (mounted) setState(() => error = null);
-    try {
-      await Future.wait<void>([
-        ensureSupabaseInitialized(),
-        OfflineDatabase.instance.initialize(),
-      ]);
-      Map<String, dynamic>? stored;
-      try {
-        stored = await SessionStore.load();
-      } catch (_) {
-        // A damaged preference entry falls back to the login page instead of
-        // blocking application startup.
-      }
-      if (!mounted) return;
-      setState(() {
-        restoredSession = stored == null ? null : EmployeeSession(stored);
-        ready = true;
-      });
-      unawaited(ensureNotificationServices().catchError((_) {}));
-    } catch (bootstrapError) {
-      if (mounted) setState(() => error = bootstrapError);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (ready) {
-      final session = restoredSession;
-      return session == null ? const LoginPage() : HomePage(initialSession: session);
-    }
-    return Scaffold(
-      backgroundColor: const Color(0xfff7faf8),
-      body: SafeArea(
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(28),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 126,
-                  height: 126,
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: borderColor),
-                  ),
-                  child: Image.asset('assets/logo.png', fit: BoxFit.contain),
-                ),
-                const SizedBox(height: 20),
-                const Text(
-                  'فريق الأنصار',
-                  style: TextStyle(color: inkColor, fontSize: 25, fontWeight: FontWeight.w900),
-                ),
-                const SizedBox(height: 7),
-                Text(
-                  error == null ? 'جاري تجهيز مساحة العمل' : 'تعذر تجهيز التطبيق',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: mutedInk),
-                ),
-                const SizedBox(height: 18),
-                if (error == null)
-                  const SizedBox(
-                    width: 34,
-                    child: LinearProgressIndicator(minHeight: 3, borderRadius: BorderRadius.all(Radius.circular(3))),
-                  )
-                else
-                  FilledButton.icon(
-                    onPressed: initialize,
-                    icon: const Icon(Icons.refresh_rounded),
-                    label: const Text('إعادة المحاولة'),
-                  ),
-              ],
-            ),
-          ),
-        ),
+      home: const Directionality(
+        textDirection: TextDirection.rtl,
+        child: LoginPage(),
       ),
     );
   }
@@ -724,8 +596,6 @@ class _LoginPageState extends State<LoginPage> {
         throw Exception('لم يتم العثور على موظف فعال بهذا الاسم');
       }
 
-      await SessionStore.save(Map<String, dynamic>.from(rows.first));
-
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
@@ -860,15 +730,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   StreamSubscription<RemoteMessage>? openedMessages;
   StreamSubscription<Map<String, dynamic>>? pushyClicks;
   StreamSubscription<Map<String, dynamic>>? richNotificationClickSubscription;
-  StreamSubscription<String>? sessionChangesSubscription;
   Timer? notificationRegistrationTimer;
   Timer? inAppNotificationsTimer;
   Timer? unreadMessagesTimer;
   RealtimeChannel? unreadMessagesChannel;
   bool openingNotification = false;
   bool notificationPermissionWarningShown = false;
-  bool messagingInitialized = false;
-  bool messagingInitializing = false;
   int unreadChatMessages = 0;
   final seenInAppNotificationIds = <String>{};
   DateTime inAppNotificationCursor = DateTime.now().toUtc();
@@ -878,45 +745,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     session = widget.initialSession;
-    unawaited(touchEmployeePresence(session.id, online: true));
-    startInAppNotificationMonitor();
-    startUnreadMessagesMonitor();
-    unawaited(SyncCoordinator.instance.start(
-      client: supabase,
-      employeeId: session.id,
-      branchNum: session.branchNum,
-      isAdmin: session.isAdmin,
-    ));
-    sessionChangesSubscription = OfflineDatabase.instance.changes
-        .where((scope) => scope == 'employees')
-        .listen((_) => unawaited(validateCachedSessionActive()));
-    unawaited(initializeMessagingListeners());
-    unawaited(refreshStoredSession());
-  }
-
-  Future<void> initializeMessagingListeners() async {
-    if (messagingInitialized || messagingInitializing) return;
-    messagingInitializing = true;
-    try {
-      await ensureNotificationServices();
-    } catch (_) {
-      messagingInitializing = false;
-      return;
-    }
-    if (!mounted) {
-      messagingInitializing = false;
-      return;
-    }
-    messagingInitialized = true;
-    messagingInitializing = false;
     initializePushyNotifications();
-    richNotificationClickSubscription ??= richNotificationClicks.stream.listen((data) {
+    richNotificationClickSubscription = richNotificationClicks.stream.listen((data) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) unawaited(openNotificationData(data));
       });
     });
     unawaited(RichNotificationService.emitPendingClick());
+    unawaited(touchEmployeePresence(session.id, online: true));
     startNotificationRegistrationMonitor();
+    startInAppNotificationMonitor();
+    startUnreadMessagesMonitor();
     foregroundMessages = FirebaseMessaging.onMessage.listen((message) {
       if (!mounted) return;
       if (message.data['sender_id'] == session.id) return;
@@ -977,30 +816,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }));
   }
 
-  Future<void> refreshStoredSession() async {
-    try {
-      final rows = await supabase.from('ansar_employees').select().eq('id', session.id).limit(1);
-      if (!mounted) return;
-      if (rows.isEmpty || rows.first['is_active'] == false) {
-        await performLogout(deactivateInstallation: false);
-        return;
-      }
-      final refreshed = EmployeeSession(Map<String, dynamic>.from(rows.first));
-      await SessionStore.save(refreshed.data);
-      if (mounted) updateSession(refreshed);
-    } catch (_) {
-      // The cached session remains valid while the device is offline.
-    }
-  }
-
-  Future<void> validateCachedSessionActive() async {
-    final employee = await OfflineDatabase.instance.readRow('employees', session.id);
-    if (!mounted || employee == null) return;
-    if (employee['is_active'] == false) {
-      await performLogout(deactivateInstallation: false);
-    }
-  }
-
   void initializePushyNotifications() {
     initializePushyService();
     pushyClicks?.cancel();
@@ -1053,13 +868,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void updateSession(EmployeeSession value) {
     setState(() => session = value);
-    unawaited(SessionStore.save(value.data));
-    unawaited(SyncCoordinator.instance.start(
-      client: supabase,
-      employeeId: value.id,
-      branchNum: value.branchNum,
-      isAdmin: value.isAdmin,
-    ));
     startNotificationRegistrationMonitor();
     startInAppNotificationMonitor();
     startUnreadMessagesMonitor();
@@ -1175,12 +983,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     openedMessages?.cancel();
     pushyClicks?.cancel();
     richNotificationClickSubscription?.cancel();
-    sessionChangesSubscription?.cancel();
     notificationRegistrationTimer?.cancel();
     inAppNotificationsTimer?.cancel();
     unreadMessagesTimer?.cancel();
     if (unreadMessagesChannel != null) supabase.removeChannel(unreadMessagesChannel!);
-    SyncCoordinator.instance.stop();
     unawaited(touchEmployeePresence(session.id, online: false));
     super.dispose();
   }
@@ -1188,12 +994,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      unawaited(initializeMessagingListeners());
+      startNotificationRegistrationMonitor();
       startInAppNotificationMonitor();
       unawaited(RichNotificationService.retryPendingReplies());
       unawaited(touchEmployeePresence(session.id, online: true));
       unawaited(refreshUnreadChatMessages());
-      unawaited(SyncCoordinator.instance.synchronize());
     } else if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
       unawaited(touchEmployeePresence(session.id, online: false));
     }
@@ -1241,42 +1046,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  Future<void> openSyncStatus() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => Directionality(
-          textDirection: TextDirection.rtl,
-          child: Scaffold(
-            appBar: AppBar(title: const Text('المزامنة والعمل دون إنترنت')),
-            body: SyncStatusPage(session: session),
-          ),
-        ),
-      ),
-    );
-  }
-
   Future<void> logout() async {
-    await performLogout();
-  }
-
-  Future<void> performLogout({bool deactivateInstallation = true}) async {
     await notificationTokenRefreshSubscription?.cancel();
     notificationTokenRefreshSubscription = null;
-    if (deactivateInstallation) {
-      try {
-        final installationId = await stableInstallationId();
-        await supabase
-            .from('ansar_device_installations')
-            .update({'is_active': false, 'updated_at': DateTime.now().toUtc().toIso8601String()})
-            .eq('installation_id', installationId)
-            .eq('employee_id', session.id);
-      } catch (_) {
-        // The local session is cleared even when the device is offline.
-      }
+    try {
+      final installationId = await stableInstallationId();
+      await supabase
+          .from('ansar_device_installations')
+          .update({'is_active': false, 'updated_at': DateTime.now().toUtc().toIso8601String()})
+          .eq('installation_id', installationId)
+          .eq('employee_id', session.id);
+    } catch (_) {
+      // Older installations continue to work until the additive device migration is applied.
     }
-    SyncCoordinator.instance.stop();
-    await OfflineDatabase.instance.clearPrivateRows(session.id);
-    await SessionStore.clear();
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.remove('ansar_employee_id');
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(
@@ -1295,10 +1079,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
     if (value == 'management') {
       await openManagement();
-      return;
-    }
-    if (value == 'sync') {
-      await openSyncStatus();
       return;
     }
     if (value == 'logout') await logout();
@@ -1453,14 +1233,6 @@ class AnsarTopBar extends StatelessWidget {
                               title: Text('إدارة النظام'),
                             ),
                           ),
-                        const PopupMenuItem(
-                          value: 'sync',
-                          child: ListTile(
-                            contentPadding: EdgeInsets.zero,
-                            leading: Icon(Icons.sync_rounded),
-                            title: Text('المزامنة دون إنترنت'),
-                          ),
-                        ),
                         const PopupMenuDivider(),
                         const PopupMenuItem(
                           value: 'logout',
@@ -1533,65 +1305,24 @@ class NotificationInboxPage extends StatefulWidget {
 
 class _NotificationInboxPageState extends State<NotificationInboxPage> {
   late Future<List<Map<String, dynamic>>> future;
-  StreamSubscription<String>? offlineSubscription;
-  bool refreshing = false;
 
   @override
   void initState() {
     super.initState();
     future = loadNotifications();
-    offlineSubscription = OfflineDatabase.instance.changes
-        .where((scope) => scope == 'notifications' || scope == 'employees')
-        .listen((_) {
-      if (mounted) setState(() => future = _readCachedNotifications());
-    });
   }
 
   Future<List<Map<String, dynamic>>> loadNotifications() async {
-    final cached = await _readCachedNotifications();
-    unawaited(_refreshNotificationCache().then<void>((_) {}, onError: (_) {}));
-    return cached;
-  }
-
-  Future<List<Map<String, dynamic>>> _readCachedNotifications() async {
-    final rows = await OfflineDatabase.instance.readRows(
-      'notifications',
-      ownerId: widget.session.id,
-      limit: 100,
-    );
-    return _enrichNotifications(rows.where((row) => isNotificationForSession(row, widget.session)).take(50).toList());
-  }
-
-  Future<List<Map<String, dynamic>>> _refreshNotificationCache() async {
-    if (refreshing) return _readCachedNotifications();
-    refreshing = true;
-    try {
-      final rows = await supabase
-          .from('ansar_notification_queue')
-          .select('id, employee_id, branch_num, title, body, data, status, created_at')
-          .order('created_at', ascending: false)
-          .limit(100)
-          .timeout(const Duration(seconds: 12));
-      final visible = rows
-          .cast<Map<String, dynamic>>()
-          .where((row) => isNotificationForSession(row, widget.session))
-          .take(50)
-          .toList();
-      await OfflineDatabase.instance.replaceServerRows(
-        scope: 'notifications',
-        ownerId: widget.session.id,
-        rows: visible,
-        idOf: (row) => '${row['id']}',
-      );
-      return _enrichNotifications(visible);
-    } catch (_) {
-      return _readCachedNotifications();
-    } finally {
-      refreshing = false;
-    }
-  }
-
-  Future<List<Map<String, dynamic>>> _enrichNotifications(List<Map<String, dynamic>> visible) async {
+    final rows = await supabase
+        .from('ansar_notification_queue')
+        .select('id, employee_id, branch_num, title, body, data, status, created_at')
+        .order('created_at', ascending: false)
+        .limit(100);
+    final visible = rows
+        .cast<Map<String, dynamic>>()
+        .where((row) => isNotificationForSession(row, widget.session))
+        .take(50)
+        .toList();
     final senderIds = visible
         .map((row) => notificationData(row['data'])['sender_id']?.toString())
         .whereType<String>()
@@ -1600,10 +1331,12 @@ class _NotificationInboxPageState extends State<NotificationInboxPage> {
         .toList();
     if (senderIds.isEmpty) return visible;
     try {
-      final cachedEmployees = await OfflineDatabase.instance.readRows('employees');
+      final employees = await supabase
+          .from('ansar_employees')
+          .select('id, display_name, full_name, avatar_url')
+          .inFilter('id', senderIds);
       final byId = {
-        for (final employee in cachedEmployees)
-          if (senderIds.contains('${employee['id']}')) '${employee['id']}': employee,
+        for (final employee in employees.cast<Map<String, dynamic>>()) '${employee['id']}': employee,
       };
       return visible.map((row) {
         final data = notificationData(row['data']);
@@ -1626,14 +1359,7 @@ class _NotificationInboxPageState extends State<NotificationInboxPage> {
   }
 
   void reload() {
-    setState(() => future = _refreshNotificationCache());
-    unawaited(SyncCoordinator.instance.synchronize());
-  }
-
-  @override
-  void dispose() {
-    offlineSubscription?.cancel();
-    super.dispose();
+    setState(() => future = loadNotifications());
   }
 
   Future<void> openNotification(Map<String, dynamic> row) async {
@@ -1760,171 +1486,6 @@ class NotificationInboxTile extends StatelessWidget {
   }
 }
 
-class SyncStatusPage extends StatefulWidget {
-  const SyncStatusPage({super.key, required this.session});
-
-  final EmployeeSession session;
-
-  @override
-  State<SyncStatusPage> createState() => _SyncStatusPageState();
-}
-
-class _SyncStatusPageState extends State<SyncStatusPage> {
-  late Future<List<OutboxAction>> future;
-  StreamSubscription<String>? subscription;
-
-  @override
-  void initState() {
-    super.initState();
-    future = load();
-    subscription = OfflineDatabase.instance.changes
-        .where((scope) => scope == 'outbox')
-        .listen((_) => reload());
-  }
-
-  Future<List<OutboxAction>> load() {
-    return OfflineDatabase.instance.actionsForEmployee(widget.session.id);
-  }
-
-  void reload() {
-    if (mounted) setState(() => future = load());
-  }
-
-  Future<void> retry([String? actionId]) async {
-    if (actionId != null) await OfflineDatabase.instance.retryAction(actionId);
-    await SyncCoordinator.instance.synchronize(forceCatalog: true);
-    reload();
-  }
-
-  @override
-  void dispose() {
-    subscription?.cancel();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return ValueListenableBuilder<SyncSnapshot>(
-      valueListenable: SyncCoordinator.instance.status,
-      builder: (context, status, _) {
-        final color = switch (status.health) {
-          SyncHealth.idle => successColor,
-          SyncHealth.syncing => infoColor,
-          SyncHealth.offline => accentColor,
-          SyncHealth.attention => dangerColor,
-        };
-        final label = switch (status.health) {
-          SyncHealth.idle => 'البيانات محدثة',
-          SyncHealth.syncing => 'تجري المزامنة الآن',
-          SyncHealth.offline => 'يعمل التطبيق دون إنترنت',
-          SyncHealth.attention => 'توجد عمليات تحتاج إلى متابعة',
-        };
-        return FutureBuilder<List<OutboxAction>>(
-          future: future,
-          builder: (context, snapshot) {
-            final actions = snapshot.data ?? const <OutboxAction>[];
-            return ListView(
-              padding: pagePadding,
-              children: [
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Row(
-                      children: [
-                        Container(
-                          width: 48,
-                          height: 48,
-                          decoration: BoxDecoration(color: color.withValues(alpha: 0.12), shape: BoxShape.circle),
-                          child: status.health == SyncHealth.syncing
-                              ? Padding(
-                                  padding: const EdgeInsets.all(13),
-                                  child: CircularProgressIndicator(strokeWidth: 2.5, color: color),
-                                )
-                              : Icon(Icons.cloud_sync_rounded, color: color),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(label, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16)),
-                              const SizedBox(height: 4),
-                              Text(
-                                status.message ??
-                                    (status.lastSuccessAt == null
-                                        ? 'سيتم حفظ أي عمل جديد على الهاتف ومزامنته تلقائياً.'
-                                        : 'آخر مزامنة ناجحة ${intl.DateFormat('yyyy/MM/dd - hh:mm a').format(status.lastSuccessAt!)}'),
-                                style: const TextStyle(color: mutedInk),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                FilledButton.icon(
-                  onPressed: status.health == SyncHealth.syncing ? null : () => retry(),
-                  icon: const Icon(Icons.sync_rounded),
-                  label: const Text('المزامنة الآن'),
-                ),
-                const SizedBox(height: 20),
-                Text('العمليات المحفوظة على الهاتف', style: Theme.of(context).textTheme.titleMedium),
-                const SizedBox(height: 8),
-                if (snapshot.connectionState != ConnectionState.done)
-                  const Center(child: Padding(padding: EdgeInsets.all(24), child: CircularProgressIndicator()))
-                else if (actions.isEmpty)
-                  const EmptyState(icon: Icons.cloud_done_outlined, text: 'لا توجد عمليات معلقة')
-                else
-                  ...actions.map((action) {
-                    final failed = action.state == 'conflict' || action.state == 'failed' || action.state == 'retry';
-                    return Card(
-                      child: ListTile(
-                        leading: Icon(
-                          failed ? Icons.error_outline_rounded : Icons.schedule_send_rounded,
-                          color: failed ? dangerColor : accentColor,
-                        ),
-                        title: Text(_syncActionLabel(action.actionType), style: const TextStyle(fontWeight: FontWeight.w800)),
-                        subtitle: Text(
-                          action.lastError?.isNotEmpty == true
-                              ? cleanError(action.lastError)
-                              : 'محفوظة منذ ${intl.DateFormat('yyyy/MM/dd - hh:mm a').format(action.createdAt)}',
-                          maxLines: 3,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        trailing: failed
-                            ? IconButton(
-                                tooltip: 'إعادة المحاولة',
-                                onPressed: () => retry(action.actionId),
-                                icon: const Icon(Icons.refresh_rounded),
-                              )
-                            : const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2)),
-                      ),
-                    );
-                  }),
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
-}
-
-String _syncActionLabel(String type) {
-  return switch (type) {
-    'chat_send' => 'رسالة دردشة',
-    'attendance_check_in' => 'تسجيل دخول دوام',
-    'attendance_check_out' => 'تسجيل خروج دوام',
-    'transfer_create' => 'إنشاء مناقلة',
-    'transfer_status' => 'تحديث حالة مناقلة',
-    'transfer_item' => 'تحديث بند مناقلة',
-    'transfer_receipt' => 'تأكيد استلام مناقلة',
-    _ => 'عملية محفوظة',
-  };
-}
-
 class DashboardPage extends StatefulWidget {
   const DashboardPage({super.key, required this.session});
 
@@ -1939,7 +1500,6 @@ class _DashboardPageState extends State<DashboardPage> {
   DashboardData? latestDashboard;
   Timer? timer;
   RealtimeChannel? attendanceChannel;
-  StreamSubscription<String>? offlineChanges;
   bool attendanceBusy = false;
   bool movementsExpanded = false;
 
@@ -1960,15 +1520,11 @@ class _DashboardPageState extends State<DashboardPage> {
           }
         },
       ).subscribe();
-    offlineChanges = OfflineDatabase.instance.changes
-        .where((scope) => scope == 'attendance' || scope == 'employees' || scope == 'branches')
-        .listen((_) {
-      if (mounted) setState(() => future = loadAndRememberDashboard());
-    });
-    timer = Timer.periodic(const Duration(seconds: 15), (_) {
+    timer = Timer.periodic(const Duration(seconds: 2), (_) {
       if (mounted) {
-        setState(() {});
-        unawaited(SyncCoordinator.instance.synchronize());
+        setState(() {
+          future = loadAndRememberDashboard();
+        });
       }
     });
   }
@@ -1976,7 +1532,6 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   void dispose() {
     timer?.cancel();
-    offlineChanges?.cancel();
     if (attendanceChannel != null) supabase.removeChannel(attendanceChannel!);
     super.dispose();
   }
@@ -1989,23 +1544,25 @@ class _DashboardPageState extends State<DashboardPage> {
 
   Future<DashboardData> loadDashboard() async {
     final branches = await loadAppBranchesMap();
-    final employeeValues = (await OfflineDatabase.instance.readRows('employees'))
-        .where((row) => row['is_active'] != false)
-        .toList();
-    if (employeeValues.every((row) => '${row['id']}' != widget.session.id)) {
-      employeeValues.add(widget.session.data);
-    }
-    final employees = employeeValues.map(EmployeeLite.fromRow).toList();
+    final employeeRows = await supabase
+        .from('ansar_employees')
+        .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url')
+        .eq('is_active', true);
+    final employees = employeeRows.cast<Map<String, dynamic>>().map(EmployeeLite.fromRow).toList();
     final employeeById = {for (final employee in employees) employee.id: employee};
     final employeeIds = employeeById.keys.toSet();
     Map<String, dynamic>? myOpenLog;
 
-    final attendanceValues = await OfflineDatabase.instance.readRows('attendance', limit: 200);
-    unawaited(SyncCoordinator.instance.synchronize());
-    final rows = attendanceValues.take(80).toList();
-    final openRows = attendanceValues.where((row) {
-      return row['status'] == 'open' || row['check_out_at'] == null;
-    }).toList();
+    final rows = await supabase
+        .from('ansar_attendance_logs')
+        .select()
+        .order('check_in_at', ascending: false)
+        .limit(80);
+    final openRows = await supabase
+        .from('ansar_attendance_logs')
+        .select()
+        .eq('status', 'open')
+        .order('check_in_at', ascending: false);
 
     final now = DateTime.now();
     final todayKey = formatDateKey(now);
@@ -2096,10 +1653,7 @@ class _DashboardPageState extends State<DashboardPage> {
     final recordedAt = DateTime.now();
     final backdated = isAttendanceBackdated(action.effectiveAt, recordedAt);
     try {
-      final actionId = newClientActionId();
       final values = {
-        'id': actionId,
-        'client_action_id': actionId,
         'employee_id': widget.session.id,
         'branch_num': widget.session.branchNum,
         'check_in_at': action.effectiveAt.toUtc().toIso8601String(),
@@ -2108,24 +1662,22 @@ class _DashboardPageState extends State<DashboardPage> {
         'check_in_note': emptyToNull(action.note),
         'status': 'open',
       };
-      await OfflineDatabase.instance.putRows(
-        scope: 'attendance',
-        rows: [values],
-        idOf: (_) => actionId,
-        localState: 'pending',
-      );
-      await OfflineDatabase.instance.queueAction(
-        actionId: actionId,
-        employeeId: widget.session.id,
-        actionType: 'attendance_check_in',
-        entityId: actionId,
-        payload: {
-          'values': {...values}..remove('id'),
+      await insertAttendanceWithCompatibility(values);
+      unawaited(enqueueNotification(
+        title: 'تسجيل دخول دوام',
+        body: '${widget.session.name} سجل الدخول الساعة ${formatTime(action.effectiveAt)}${backdated ? ' · سُجل لاحقاً' : ''}',
+        data: {
+          'type': 'attendance_check_in',
+          'route': 'attendance',
+          'sender_id': widget.session.id,
           'sender_name': widget.session.name,
-          'sender_avatar_url': widget.session.avatarUrl,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
+          'employee_id': widget.session.id,
+          'branch_num': widget.session.branchNum,
+          'effective_at': action.effectiveAt.toUtc().toIso8601String(),
+          'is_backdated': backdated,
         },
-      );
-      unawaited(SyncCoordinator.instance.synchronize());
+      ));
       if (mounted) {
         setState(() {
           future = loadAndRememberDashboard();
@@ -2160,7 +1712,6 @@ class _DashboardPageState extends State<DashboardPage> {
     final recordedAt = DateTime.now();
     final backdated = isAttendanceBackdated(action.effectiveAt, recordedAt);
     try {
-      final actionId = newClientActionId();
       final values = {
         'check_out_at': action.effectiveAt.toUtc().toIso8601String(),
         'check_out_recorded_at': recordedAt.toUtc().toIso8601String(),
@@ -2168,28 +1719,22 @@ class _DashboardPageState extends State<DashboardPage> {
         'check_out_note': emptyToNull(action.note),
         'status': 'closed',
       };
-      final localRowId = '${openLog['client_action_id'] ?? openLog['id']}';
-      final updated = <String, dynamic>{...openLog, ...values};
-      await OfflineDatabase.instance.putRows(
-        scope: 'attendance',
-        rows: [updated],
-        idOf: (_) => localRowId,
-        localState: 'pending',
-      );
-      await OfflineDatabase.instance.queueAction(
-        actionId: actionId,
-        employeeId: widget.session.id,
-        actionType: 'attendance_check_out',
-        entityId: localRowId,
-        payload: {
-          'log_id': '${openLog['id']}',
-          'local_row_id': localRowId,
-          'values': values,
+      await updateAttendanceWithCompatibility(openLog['id'], values);
+      unawaited(enqueueNotification(
+        title: 'تسجيل خروج دوام',
+        body: '${widget.session.name} سجل الخروج الساعة ${formatTime(action.effectiveAt)}${backdated ? ' · سُجل لاحقاً' : ''}',
+        data: {
+          'type': 'attendance_check_out',
+          'route': 'attendance',
+          'sender_id': widget.session.id,
           'sender_name': widget.session.name,
-          'sender_avatar_url': widget.session.avatarUrl,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
+          'employee_id': widget.session.id,
+          'branch_num': widget.session.branchNum,
+          'effective_at': action.effectiveAt.toUtc().toIso8601String(),
+          'is_backdated': backdated,
         },
-      );
-      unawaited(SyncCoordinator.instance.synchronize());
+      ));
       if (mounted) {
         setState(() {
           future = loadAndRememberDashboard();
@@ -2661,12 +2206,13 @@ Future<String?> validateAttendanceAction({
 
   final dayStart = DateTime(now.year, now.month, now.day);
   final dayEnd = dayStart.add(const Duration(days: 1));
-  final rows = (await OfflineDatabase.instance.readRows('attendance', newestFirst: false)).where((row) {
-    if ('${row['employee_id']}' != employeeId) return false;
-    final value = DateTime.tryParse(row['check_in_at']?.toString() ?? '')?.toLocal();
-    return value != null && !value.isBefore(dayStart) && value.isBefore(dayEnd);
-  }).toList();
-  unawaited(SyncCoordinator.instance.synchronize());
+  final rows = await supabase
+      .from('ansar_attendance_logs')
+      .select('id, check_in_at, check_out_at, status')
+      .eq('employee_id', employeeId)
+      .gte('check_in_at', dayStart.toUtc().toIso8601String())
+      .lt('check_in_at', dayEnd.toUtc().toIso8601String())
+      .order('check_in_at', ascending: true);
 
   final proposedStart = isCheckIn ? effectiveAt : openStart ?? effectiveAt;
   final proposedEnd = isCheckIn ? now : effectiveAt;
@@ -3414,7 +2960,6 @@ class _ReportsPageState extends State<ReportsPage> {
   String? selectedEmployeeId;
   late Future<ReportData> future;
   ReportData? latestReport;
-  StreamSubscription<String>? offlineReportSubscription;
 
   @override
   void initState() {
@@ -3422,15 +2967,6 @@ class _ReportsPageState extends State<ReportsPage> {
     selectedBranch = widget.session.isAdmin ? null : widget.session.branchNum;
     selectedEmployeeId = widget.session.isAdmin || widget.session.isBranchManager ? null : widget.session.id;
     future = loadAndRememberReports();
-    offlineReportSubscription = OfflineDatabase.instance.changes.where((scope) {
-      return scope == 'attendance' || scope == 'employees' || scope == 'branches';
-    }).listen((_) => reload());
-  }
-
-  @override
-  void dispose() {
-    offlineReportSubscription?.cancel();
-    super.dispose();
   }
 
   Future<ReportData> loadAndRememberReports() async {
@@ -3453,12 +2989,11 @@ class _ReportsPageState extends State<ReportsPage> {
 
     final employeeById = {for (final employee in employees) employee.id: employee};
     final sinceUtc = DateTime.now().subtract(Duration(days: days)).toUtc();
-    final cachedAttendance = await OfflineDatabase.instance.readRows('attendance', limit: 2000);
-    final rows = cachedAttendance.where((row) {
-      final value = DateTime.tryParse(row['check_in_at']?.toString() ?? '');
-      return value != null && !value.toUtc().isBefore(sinceUtc);
-    }).toList();
-    unawaited(SyncCoordinator.instance.synchronize());
+    final rows = await supabase
+        .from('ansar_attendance_logs')
+        .select()
+        .gte('check_in_at', sinceUtc.toIso8601String())
+        .order('check_in_at', ascending: false);
 
     final hoursByEmployee = <String, double>{};
     final daysByEmployee = <String, Set<String>>{};
@@ -3971,9 +3506,6 @@ class _QueriesPageState extends State<QueriesPage> {
   int queryMode = 0;
   String selectedSalesBooks = 'all';
   String? productCacheNotice;
-  int productSearchSequence = 0;
-  List<ProductResult>? lastProductResults;
-  StreamSubscription<String>? offlineQuerySubscription;
 
   @override
   void initState() {
@@ -3983,36 +3515,22 @@ class _QueriesPageState extends State<QueriesPage> {
     startDate = TextEditingController(text: todayKey);
     endDate = TextEditingController(text: todayKey);
     unawaited(warmQueriesCache().catchError((_) {}));
-    offlineQuerySubscription = OfflineDatabase.instance.changes.where((scope) {
-      return scope == 'products' || scope == 'accounts' || scope == 'sales' || scope == 'account_entries';
-    }).listen((scope) {
-      if (!mounted || future == null) return;
-      if (scope == 'products' && queryMode == 0 && search.text.trim().length >= 2) {
-        submitProductSearch();
-        return;
-      }
-      if (queryMode == 1 || queryMode == 2 || queryMode == 3) submitSearch();
-    });
   }
 
   @override
   void dispose() {
     queryDebounce?.cancel();
-    offlineQuerySubscription?.cancel();
     search.dispose();
     startDate.dispose();
     endDate.dispose();
     super.dispose();
   }
 
-  Future<List<ProductResult>> runSearch([String? requestedValue]) async {
-    final value = (requestedValue ?? search.text).trim();
+  Future<List<ProductResult>> runSearch() async {
+    final value = search.text.trim();
     if (value.isEmpty) return [];
 
     final productRows = await searchProductsLikeLegacy(value, limit: 60);
-    if (productRows.isEmpty && !await ProductSearchCache.instance.hasData && mounted) {
-      productCacheNotice = 'يجري تنزيل دليل الكتب لأول مرة. ستظهر النتائج تلقائياً بعد اكتماله.';
-    }
     observeProductCacheStatus();
 
     Map<int, BranchOption> branches = <int, BranchOption>{};
@@ -4029,13 +3547,14 @@ class _QueriesPageState extends State<QueriesPage> {
     List<Map<String, dynamic>> stockRows = <Map<String, dynamic>>[];
     if (matNums.isNotEmpty) {
       try {
-        stockRows = await ProductSearchCache.instance.stockForMatNums(matNums);
+        final rows = await supabase
+            .from('product_stock')
+            .select('mat_num, sto_num, quantity')
+            .inFilter('mat_num', matNums);
+        stockRows = rows.cast<Map<String, dynamic>>();
       } catch (_) {
-        // Book names remain searchable even while the local stock table is being repaired.
+        // A stock failure must never hide matching books from search results.
       }
-      // Stock refresh is intentionally left to the background catalog sync.
-      // Waiting for the network here made otherwise-local book results appear
-      // intermittent on slow connections.
     }
     final stockByMat = <int, List<StockResult>>{};
     for (final row in stockRows) {
@@ -4074,39 +3593,12 @@ class _QueriesPageState extends State<QueriesPage> {
   }
 
   void submitSearch() {
-    if (queryMode == 0) {
-      submitProductSearch();
-      return;
-    }
     setState(() {
+      if (queryMode == 0) future = runSearch();
       if (queryMode == 1) future = runAccountsSearch();
       if (queryMode == 2) future = runCashSummary();
       if (queryMode == 3) future = runDailySales();
     });
-  }
-
-  void submitProductSearch() {
-    final value = search.text.trim();
-    final sequence = ++productSearchSequence;
-    if (value.length < 2) {
-      setState(() => future = null);
-      return;
-    }
-    final request = runSearch(value).then((results) {
-      if (sequence != productSearchSequence) return lastProductResults ?? results;
-      lastProductResults = results;
-      return results;
-    }).catchError((Object error) {
-      if (sequence == productSearchSequence && mounted) {
-        setState(() {
-          productCacheNotice = lastProductResults?.isNotEmpty == true
-              ? 'تعذر تحديث البيانات الآن. تُعرض آخر نتائج محفوظة.'
-              : 'لا توجد نسخة كتب مكتملة بعد. سيُعاد التحديث تلقائياً عند عودة الإنترنت.';
-        });
-      }
-      return lastProductResults ?? <ProductResult>[];
-    });
-    setState(() => future = request);
   }
 
   void queueSearch() {
@@ -4115,7 +3607,6 @@ class _QueriesPageState extends State<QueriesPage> {
     if (queryMode != 0 && queryMode != 1) return;
     final minLength = queryMode == 0 ? 2 : 1;
     if (value.length < minLength) {
-      productSearchSequence++;
       setState(() => future = null);
       return;
     }
@@ -4139,20 +3630,26 @@ class _QueriesPageState extends State<QueriesPage> {
 
   Future<List<Map<String, dynamic>>> runCashSummary() async {
     const cashBoxes = [181, 1872, 1873, 1876];
-    final accounts = await loadAccountsCached();
-    return accounts.where((row) => cashBoxes.contains(nullableIntValue(row['num']))).toList()
-      ..sort((a, b) => intValue(a['num']).compareTo(intValue(b['num'])));
+    final rows = await supabase
+        .from('accounts')
+        .select('num, name, ras')
+        .inFilter('num', cashBoxes)
+        .order('num', ascending: true);
+    return rows.cast<Map<String, dynamic>>();
   }
 
   Future<List<Map<String, dynamic>>> runDailySales() async {
-    final rows = (await OfflineDatabase.instance.readRows('sales')).where((row) {
-      final date = row['date']?.toString() ?? '';
-      if (date.compareTo(startDate.text) < 0 || date.compareTo(endDate.text) > 0) return false;
-      if (intValue(row['kind']) != 0) return false;
-      if (selectedSalesBooks == 'all') return true;
-      return selectedSalesBooks.split(',').map(int.parse).contains(nullableIntValue(row['book']));
-    }).take(100).toList();
-    unawaited(SyncCoordinator.instance.synchronize());
+    var query = supabase
+        .from('bills_full')
+        .select('book, bnum, date, accnum, totalvalue, remark, kind')
+        .eq('kind', 0)
+        .gte('date', startDate.text)
+        .lte('date', endDate.text);
+    if (selectedSalesBooks != 'all') {
+      final books = selectedSalesBooks.split(',').map(int.parse).toList();
+      query = books.length == 1 ? query.eq('book', books.first) : query.inFilter('book', books);
+    }
+    final rows = await query.order('date', ascending: false).order('bnum', ascending: false).limit(100);
     final accounts = {
       for (final account in await loadAccountsCached())
         nullableIntValue(account['num']): account['name']?.toString() ?? ''
@@ -4219,8 +3716,6 @@ class _QueriesPageState extends State<QueriesPage> {
             setState(() {
               queryMode = value;
               future = null;
-              productSearchSequence++;
-              lastProductResults = null;
               search.clear();
             });
             if (queryMode == 2 || queryMode == 3) submitSearch();
@@ -4244,11 +3739,7 @@ class _QueriesPageState extends State<QueriesPage> {
                           tooltip: 'مسح البحث',
                           onPressed: () {
                             search.clear();
-                            productSearchSequence++;
-                            setState(() {
-                              future = null;
-                              lastProductResults = null;
-                            });
+                            setState(() => future = null);
                           },
                           icon: const Icon(Icons.close_rounded),
                         ),
@@ -4351,15 +3842,17 @@ class _QueriesPageState extends State<QueriesPage> {
         else if (queryMode == 0)
           FutureBuilder<List<ProductResult>>(
             future: future as Future<List<ProductResult>>,
-            initialData: lastProductResults,
             builder: (context, snapshot) {
-              if (snapshot.connectionState != ConnectionState.done && !snapshot.hasData) {
+              if (snapshot.connectionState != ConnectionState.done) {
                 return const Center(child: Padding(
                   padding: EdgeInsets.all(24),
                   child: CircularProgressIndicator(),
                 ));
               }
-              final results = snapshot.data ?? lastProductResults ?? <ProductResult>[];
+              if (snapshot.hasError) {
+                return ErrorState(message: cleanError(snapshot.error), onRetry: submitSearch);
+              }
+              final results = snapshot.data!;
               if (results.isEmpty) {
                 return const EmptyState(icon: Icons.search_off_rounded, text: 'لا توجد نتائج مطابقة');
               }
@@ -4756,7 +4249,6 @@ class _AccountStatementPageState extends State<AccountStatementPage> {
   late final TextEditingController startDate;
   late final TextEditingController endDate;
   late Future<List<Map<String, dynamic>>> future;
-  StreamSubscription<String>? offlineEntriesSubscription;
 
   @override
   void initState() {
@@ -4765,37 +4257,23 @@ class _AccountStatementPageState extends State<AccountStatementPage> {
     endDate = TextEditingController(text: formatDateKey(today));
     startDate = TextEditingController(text: formatDateKey(DateTime(today.year, today.month, 1)));
     future = loadEntries();
-    offlineEntriesSubscription = OfflineDatabase.instance.changes
-        .where((scope) => scope == 'account_entries' || scope == 'accounts')
-        .listen((_) {
-      if (mounted) setState(() => future = loadEntries());
-    });
-  }
-
-  @override
-  void dispose() {
-    offlineEntriesSubscription?.cancel();
-    startDate.dispose();
-    endDate.dispose();
-    super.dispose();
   }
 
   Future<List<Map<String, dynamic>>> loadEntries() async {
-    final values = (await OfflineDatabase.instance.readRows(
-      'account_entries',
-      newestFirst: false,
-    )).where((row) {
-      final date = row['date']?.toString() ?? '';
-      return '${row['acc_num']}' == '${widget.account['num']}' &&
-          date.compareTo(startDate.text) >= 0 &&
-          date.compareTo(endDate.text) <= 0;
-    }).toList();
-    unawaited(SyncCoordinator.instance.synchronize());
+    final rows = await supabase
+        .from('account_entries')
+        .select('num, item, kind, date, remark, acc_num2, cash, billnum')
+        .eq('acc_num', widget.account['num'])
+        .gte('date', startDate.text)
+        .lte('date', endDate.text)
+        .order('date', ascending: true)
+        .order('num', ascending: true)
+        .order('item', ascending: true);
     final accounts = {
       for (final account in await loadAccountsCached())
         nullableIntValue(account['num']): account['name']?.toString() ?? ''
     };
-    return values.map((entry) {
+    return rows.cast<Map<String, dynamic>>().map((entry) {
       final otherNum = (entry['acc_num2'] as num?)?.toInt();
       return {
         ...entry,
@@ -4883,39 +4361,26 @@ class SalesBillDetailsPage extends StatefulWidget {
 
 class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
   late Future<SalesBillDetailsData> future;
-  StreamSubscription<String>? offlineSalesSubscription;
 
   @override
   void initState() {
     super.initState();
     future = loadItems();
-    offlineSalesSubscription = OfflineDatabase.instance.changes
-        .where((scope) => scope == 'sales_items' || scope == 'products' || scope == 'legacy_branches')
-        .listen((_) {
-      if (mounted) setState(() => future = loadItems());
-    });
-  }
-
-  @override
-  void dispose() {
-    offlineSalesSubscription?.cancel();
-    super.dispose();
   }
 
   Future<SalesBillDetailsData> loadItems() async {
-    final items = (await OfflineDatabase.instance.readRows('sales_items', newestFirst: false)).where((row) {
-      return '${row['book']}' == '${widget.bill['book']}' &&
-          '${row['bnum']}' == '${widget.bill['bnum']}' &&
-          intValue(row['kind']) == 0;
-    }).toList()
-      ..sort((a, b) => intValue(a['item']).compareTo(intValue(b['item'])));
-    if (items.isEmpty) unawaited(_refreshSalesBillItems());
+    final rows = await supabase
+        .from('bill_items_full')
+        .select('item, matnum, quantity, price, value, remarki')
+        .eq('book', widget.bill['book'])
+        .eq('bnum', widget.bill['bnum'])
+        .eq('kind', 0)
+        .order('item', ascending: true);
+    final items = rows.cast<Map<String, dynamic>>();
     final matNums = items.map((row) => nullableIntValue(row['matnum'])).whereType<int>().toSet().toList();
     final products = matNums.isEmpty
         ? <Map<String, dynamic>>[]
-        : (await ProductSearchCache.instance.allProducts())
-            .where((row) => matNums.contains(nullableIntValue(row['mat_num'])))
-            .toList();
+        : await supabase.from('products').select('mat_num, name').inFilter('mat_num', matNums);
     final names = <int, String>{};
     for (final product in products.cast<Map<String, dynamic>>()) {
       final matNum = nullableIntValue(product['mat_num']);
@@ -4926,25 +4391,6 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
       branches: branches,
       items: items.map((item) => {...item, 'product_name': names[nullableIntValue(item['matnum'])]}).toList(),
     );
-  }
-
-  Future<void> _refreshSalesBillItems() async {
-    try {
-      final rows = await supabase
-          .from('bill_items_full')
-          .select('book, bnum, kind, item, matnum, quantity, price, value, remarki')
-          .eq('book', widget.bill['book'])
-          .eq('bnum', widget.bill['bnum'])
-          .eq('kind', 0)
-          .order('item', ascending: true);
-      await OfflineDatabase.instance.putRows(
-        scope: 'sales_items',
-        rows: rows.cast<Map<String, dynamic>>(),
-        idOf: (row) => '${row['book']}:${row['bnum']}:${row['kind']}:${row['item']}',
-      );
-    } catch (_) {
-      // A cached invoice remains readable while offline.
-    }
   }
 
   @override
@@ -6595,7 +6041,6 @@ class _TransfersPageState extends State<TransfersPage> {
   late Future<TransferData> future;
   TransferData? latestTransfers;
   RealtimeChannel? transferChannel;
-  StreamSubscription<String>? offlineChanges;
   Timer? transferTimer;
   String statusFilter = 'active';
   int? fromBranchFilter;
@@ -6611,32 +6056,21 @@ class _TransfersPageState extends State<TransfersPage> {
         event: PostgresChangeEvent.all,
         schema: 'public',
         table: 'ansar_transfer_orders',
-        callback: (_) => handleServerTransferChange(),
+        callback: (_) => refreshTransfers(),
       )
       ..onPostgresChanges(
         event: PostgresChangeEvent.all,
         schema: 'public',
         table: 'ansar_transfer_order_items',
-        callback: (_) => handleServerTransferChange(),
+        callback: (_) => refreshTransfers(),
       ).subscribe();
-    transferTimer = Timer.periodic(
-      const Duration(seconds: 20),
-      (_) => unawaited(SyncCoordinator.instance.synchronize()),
-    );
-    offlineChanges = OfflineDatabase.instance.changes
-        .where((scope) =>
-            scope == 'transfer_orders' ||
-            scope == 'transfer_items' ||
-            scope == 'branches' ||
-            scope == 'employees')
-        .listen((_) => refreshTransfers());
+    transferTimer = Timer.periodic(const Duration(seconds: 30), (_) => refreshTransfers());
     unawaited(warmProductSearchCache());
   }
 
   @override
   void dispose() {
     transferTimer?.cancel();
-    offlineChanges?.cancel();
     if (transferChannel != null) supabase.removeChannel(transferChannel!);
     super.dispose();
   }
@@ -6646,11 +6080,6 @@ class _TransfersPageState extends State<TransfersPage> {
     setState(() {
       future = loadAndRememberTransfers();
     });
-  }
-
-  void handleServerTransferChange() {
-    unawaited(SyncCoordinator.instance.synchronize());
-    refreshTransfers();
   }
 
   Future<TransferData> loadAndRememberTransfers() async {
@@ -6663,13 +6092,12 @@ class _TransfersPageState extends State<TransfersPage> {
     final branches = await loadAppBranchesMap();
     final employees = await loadEmployeesForScope(widget.session, includeInactive: false);
     final employeeById = {for (final employee in employees) employee.id: employee};
-    final values = await OfflineDatabase.instance.readRows(
-      'transfer_orders',
-      ownerId: widget.session.id,
-      limit: 100,
-    );
-    unawaited(SyncCoordinator.instance.synchronize());
-    final visible = values.where((row) {
+    final rows = await supabase
+        .from('ansar_transfer_orders')
+        .select()
+        .order('created_at', ascending: false)
+        .limit(60);
+    final visible = rows.cast<Map<String, dynamic>>().where((row) {
       if (widget.session.isAdmin) return true;
       final fromBranch = nullableIntValue(row['from_branch_num']);
       final toBranch = nullableIntValue(row['to_branch_num']);
@@ -6715,62 +6143,51 @@ class _TransfersPageState extends State<TransfersPage> {
     if (result == null) return;
     setState(() => transferBusy = true);
     try {
-      final actionId = newClientActionId();
-      final now = DateTime.now().toUtc().toIso8601String();
-      final order = <String, dynamic>{
-        'id': actionId,
-        'client_action_id': actionId,
-        'order_no': 'محلي',
-        'from_branch_num': widget.session.branchNum,
-        'to_branch_num': result.toBranch,
-        'requested_by': widget.session.id,
-        'status': 'submitted',
-        'requester_note': emptyToNull(result.note),
-        'submitted_at': now,
-        'created_at': now,
-        'updated_at': now,
-        'sync_version': 1,
-      };
-      final items = <Map<String, dynamic>>[];
-      for (final item in result.items) {
-        final itemId = newClientActionId();
-        items.add({
-          'id': itemId,
-          'client_action_id': itemId,
-          'order_id': actionId,
-          'mat_num': item.matNum,
-          'requested_quantity': item.quantity,
-          'note': emptyToNull(item.note),
-          'item_status': 'requested',
-        });
-      }
-      await OfflineDatabase.instance.putRows(
-        scope: 'transfer_orders',
-        ownerId: widget.session.id,
-        rows: [order],
-        idOf: (_) => actionId,
-        localState: 'pending',
-      );
-      await OfflineDatabase.instance.putRows(
-        scope: 'transfer_items',
-        ownerId: widget.session.id,
-        rows: items,
-        idOf: (row) => '${row['id']}',
-        localState: 'pending',
-      );
-      await OfflineDatabase.instance.queueAction(
-        actionId: actionId,
-        employeeId: widget.session.id,
-        actionType: 'transfer_create',
-        entityId: actionId,
-        payload: {
-          'order': {...order}..remove('id'),
-          'items': items.map((item) => {...item}..remove('order_id')).toList(),
+      final inserted = await supabase
+          .from('ansar_transfer_orders')
+          .insert({
+            'from_branch_num': widget.session.branchNum,
+            'to_branch_num': result.toBranch,
+            'requested_by': widget.session.id,
+            'status': 'submitted',
+            'requester_note': emptyToNull(result.note),
+            'submitted_at': DateTime.now().toUtc().toIso8601String(),
+          })
+          .select('id')
+          .single();
+      await supabase.from('ansar_transfer_order_items').insert(
+            result.items
+                .map((item) => {
+                      'order_id': inserted['id'],
+                      'mat_num': item.matNum,
+                      'requested_quantity': item.quantity,
+                      'note': emptyToNull(item.note),
+                    })
+                .toList(),
+          );
+      await supabase.from('ansar_order_events').insert({
+        'order_id': inserted['id'],
+        'employee_id': widget.session.id,
+        'event_type': 'created',
+        'new_status': 'submitted',
+        'note': 'تم إنشاء الطلب من التطبيق',
+      });
+      unawaited(enqueueNotification(
+        title: 'مناقلة جديدة',
+        body:
+            'طلب مناقلة من ${branchLabel(data.branches, widget.session.branchNum)} إلى ${branchLabel(data.branches, result.toBranch)}',
+        data: {
+          'type': 'transfer_created',
+          'route': 'transfer',
+          'order_id': inserted['id'],
+          'sender_id': widget.session.id,
           'sender_name': widget.session.name,
-          'sender_avatar_url': widget.session.avatarUrl,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
+          'order_no': inserted['order_no'] ?? '',
+          'from_branch_name': branchLabel(data.branches, widget.session.branchNum),
+          'to_branch_name': branchLabel(data.branches, result.toBranch),
         },
-      );
-      unawaited(SyncCoordinator.instance.synchronize());
+      ));
       if (mounted) {
         setState(() {
           future = loadAndRememberTransfers();
@@ -6794,47 +6211,41 @@ class _TransfersPageState extends State<TransfersPage> {
       builder: (_) => StatusDialog(current: order['status'] as String? ?? 'submitted'),
     );
     if (status == null) return;
-    if (status == 'in_delivery' &&
-        !await transferItemsReadyForDelivery('${order['id']}', employeeId: widget.session.id)) {
+    if (status == 'in_delivery' && !await transferItemsReadyForDelivery('${order['id']}')) {
       if (mounted) showSnack(context, 'يجب معالجة جميع البنود وتحديد الكمية المتوفرة قبل بدء التوصيل');
       return;
     }
     setState(() => transferBusy = true);
     try {
-      final actionId = newClientActionId();
-      final localId = '${order['client_action_id'] ?? order['id']}';
-      final oldStatus = order['status'];
-      final updated = <String, dynamic>{
-        ...order,
+      await supabase.from('ansar_transfer_orders').update({
         'status': status,
         'handled_by': widget.session.id,
-        'updated_at': DateTime.now().toUtc().toIso8601String(),
-      };
-      await OfflineDatabase.instance.putRows(
-        scope: 'transfer_orders',
-        ownerId: widget.session.id,
-        rows: [updated],
-        idOf: (_) => localId,
-        localState: 'pending',
-      );
-      await OfflineDatabase.instance.queueAction(
-        actionId: actionId,
-        employeeId: widget.session.id,
-        actionType: 'transfer_status',
-        entityId: localId,
-        payload: {
-          'order_id': '${order['id']}',
-          'order_ref': localId,
-          'local_row_id': localId,
+        if (status == 'approved') 'approved_at': DateTime.now().toUtc().toIso8601String(),
+      }).eq('id', order['id']);
+      await supabase.from('ansar_order_events').insert({
+        'order_id': order['id'],
+        'employee_id': widget.session.id,
+        'event_type': 'status_changed',
+        'old_status': order['status'],
+        'new_status': status,
+      });
+      unawaited(enqueueNotification(
+        title: 'تحديث مناقلة',
+        body: '${widget.session.name} حدّث المناقلة رقم ${order['order_no'] ?? '-'} من ${branchLabel(latestTransfers?.branches ?? const <int, BranchOption>{}, intValue(order['from_branch_num']))} إلى ${branchLabel(latestTransfers?.branches ?? const <int, BranchOption>{}, intValue(order['to_branch_num']))}: ${statusLabel(status)}',
+        data: {
+          'type': 'transfer_updated',
+          'route': 'transfer',
+          'order_id': order['id'],
           'status': status,
-          'old_status': oldStatus,
-          'expected_version': nullableIntValue(order['sync_version']),
+          'sender_id': widget.session.id,
           'sender_name': widget.session.name,
-          'sender_avatar_url': widget.session.avatarUrl,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
+          'order_no': order['order_no'] ?? '',
+          'from_branch_name': branchLabel(latestTransfers?.branches ?? const <int, BranchOption>{}, intValue(order['from_branch_num'])),
+          'to_branch_name': branchLabel(latestTransfers?.branches ?? const <int, BranchOption>{}, intValue(order['to_branch_num'])),
+          'status_label': statusLabel(status),
         },
-      );
-      order['status'] = status;
-      unawaited(SyncCoordinator.instance.synchronize());
+      ));
       if (mounted) {
         setState(() {
           future = loadAndRememberTransfers();
@@ -7144,7 +6555,6 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
   late Future<TransferDetailsData> future;
   TransferDetailsData? latestDetails;
   RealtimeChannel? detailsChannel;
-  StreamSubscription<String>? offlineChanges;
   Timer? detailsTimer;
   bool sharingPdf = false;
   bool statusBusy = false;
@@ -7188,7 +6598,6 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
         callback: (payload) {
           final updated = payload.newRecord;
           if (updated.isNotEmpty) widget.order.addAll(updated);
-          unawaited(SyncCoordinator.instance.synchronize());
           refreshDetails();
         },
       )
@@ -7201,7 +6610,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
           column: 'order_id',
           value: widget.order['id'],
         ),
-        callback: (_) => handleServerDetailChange(),
+        callback: (_) => refreshDetails(),
       )
       ..onPostgresChanges(
         event: PostgresChangeEvent.all,
@@ -7212,26 +6621,14 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
           column: 'order_id',
           value: widget.order['id'],
         ),
-        callback: (_) => handleServerDetailChange(),
+        callback: (_) => refreshDetails(),
       ).subscribe();
-    detailsTimer = Timer.periodic(
-      const Duration(seconds: 20),
-      (_) => unawaited(SyncCoordinator.instance.synchronize()),
-    );
-    offlineChanges = OfflineDatabase.instance.changes
-        .where((scope) =>
-            scope == 'transfer_orders' ||
-            scope == 'transfer_items' ||
-            scope == 'transfer_events' ||
-            scope == 'products' ||
-            scope == 'employees')
-        .listen((_) => refreshDetails());
+    detailsTimer = Timer.periodic(const Duration(seconds: 30), (_) => refreshDetails());
   }
 
   @override
   void dispose() {
     detailsTimer?.cancel();
-    offlineChanges?.cancel();
     if (detailsChannel != null) supabase.removeChannel(detailsChannel!);
     super.dispose();
   }
@@ -7243,11 +6640,6 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     });
   }
 
-  void handleServerDetailChange() {
-    unawaited(SyncCoordinator.instance.synchronize());
-    refreshDetails();
-  }
-
   Future<TransferDetailsData> loadAndRememberItems() async {
     final loaded = await loadItems();
     latestDetails = loaded;
@@ -7255,24 +6647,21 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
   }
 
   Future<TransferDetailsData> loadItems() async {
-    final orderRefs = {'${widget.order['id']}', '${widget.order['client_action_id'] ?? ''}'};
-    final result = (await OfflineDatabase.instance.readRows(
-      'transfer_items',
-      ownerId: widget.session.id,
-      newestFirst: false,
-    )).where((row) => orderRefs.contains('${row['order_id']}')).toList();
-    unawaited(SyncCoordinator.instance.synchronize());
+    final items = await supabase
+        .from('ansar_transfer_order_items')
+        .select()
+        .eq('order_id', widget.order['id'])
+        .order('created_at', ascending: true);
+    final result = items.cast<Map<String, dynamic>>();
     final matNums = result.map((row) => nullableIntValue(row['mat_num'])).whereType<int>().toList();
-    var products = <Map<String, dynamic>>[];
-    if (matNums.isNotEmpty) {
-      try {
-        products = (await ProductSearchCache.instance.allProducts())
-            .where((row) => matNums.contains(nullableIntValue(row['mat_num'])))
-            .toList();
-      } catch (_) {}
-    }
+    final products = matNums.isEmpty
+        ? <Map<String, dynamic>>[]
+        : await supabase
+            .from('products')
+            .select('mat_num, name, quantity')
+            .inFilter('mat_num', matNums);
     final productByMat = <int, Map<String, dynamic>>{};
-    for (final row in products) {
+    for (final row in products.cast<Map<String, dynamic>>()) {
       final matNum = nullableIntValue(row['mat_num']);
       if (matNum != null) productByMat[matNum] = row;
     }
@@ -7282,14 +6671,18 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
               'product': productByMat[nullableIntValue(row['mat_num'])],
             })
         .toList();
-    final events = (await OfflineDatabase.instance.readRows(
-      'transfer_events',
-      ownerId: widget.session.id,
-    )).where((row) => orderRefs.contains('${row['order_id']}')).toList();
-    final employeesRows = await OfflineDatabase.instance.readRows('employees');
+    final eventsRows = await supabase
+        .from('ansar_order_events')
+        .select()
+        .eq('order_id', widget.order['id'])
+        .order('created_at', ascending: false);
+    final events = eventsRows.cast<Map<String, dynamic>>();
+    final employeesRows = await supabase
+        .from('ansar_employees')
+        .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url');
     final employees = {
-      for (final row in employeesRows)
-        if (row['id'] != null) '${row['id']}': EmployeeLite.fromRow(row),
+      for (final row in employeesRows.cast<Map<String, dynamic>>())
+        row['id'] as String: EmployeeLite.fromRow(row),
     };
     return TransferDetailsData(items: enrichedItems, events: events, employees: employees);
   }
@@ -7323,43 +6716,36 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     }
     setState(() => itemBusyId = '${item['id']}');
     try {
-      final actionId = newClientActionId();
-      final localId = '${item['client_action_id'] ?? item['id']}';
-      final oldStatus = item['item_status'];
-      final updated = <String, dynamic>{
-        ...item,
+      await supabase.from('ansar_transfer_order_items').update({
         'item_status': status,
         'approved_quantity': approved,
-        'updated_at': DateTime.now().toUtc().toIso8601String(),
-      };
-      await OfflineDatabase.instance.putRows(
-        scope: 'transfer_items',
-        ownerId: widget.session.id,
-        rows: [updated],
-        idOf: (_) => localId,
-        localState: 'pending',
-      );
-      await OfflineDatabase.instance.queueAction(
-        actionId: actionId,
-        employeeId: widget.session.id,
-        actionType: 'transfer_item',
-        entityId: localId,
-        payload: {
-          'order_id': '${widget.order['id']}',
-          'order_ref': '${widget.order['client_action_id'] ?? widget.order['id']}',
-          'item_id': '${item['id']}',
-          'item_ref': localId,
-          'local_row_id': localId,
-          'item_status': status,
-          'old_status': oldStatus,
-          'approved_quantity': approved,
-          'expected_version': nullableIntValue(item['sync_version']),
-          'item_name': (item['product'] as Map<String, dynamic>?)?['name'] ?? 'مادة ${item['mat_num']}',
+      }).eq('id', item['id']);
+      await supabase.from('ansar_order_events').insert({
+        'order_id': widget.order['id'],
+        'employee_id': widget.session.id,
+        'event_type': 'item_changed',
+        'old_status': item['item_status'],
+        'new_status': status,
+        'note': 'بند ${(item['product'] as Map<String, dynamic>?)?['name'] ?? item['mat_num']} - الكمية المتوفرة $approved',
+      });
+      unawaited(enqueueNotification(
+        title: 'تحديث بند مناقلة',
+        body: 'حدّث ${widget.session.name} كتاب ${(item['product'] as Map<String, dynamic>?)?['name'] ?? 'مادة ${item['mat_num']}'} في المناقلة رقم ${widget.order['order_no'] ?? '-'} من ${branchLabel(widget.branches, intValue(widget.order['from_branch_num']))} إلى ${branchLabel(widget.branches, intValue(widget.order['to_branch_num']))}: ${itemStatusLabel(status)}، الكمية ${formatMoneyValue(approved)}',
+        data: {
+          'type': 'transfer_item_updated',
+          'route': 'transfer',
+          'order_id': widget.order['id'],
+          'sender_id': widget.session.id,
           'sender_name': widget.session.name,
-          'sender_avatar_url': widget.session.avatarUrl,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
+          'item_name': (item['product'] as Map<String, dynamic>?)?['name'] ?? 'مادة ${item['mat_num']}',
+          'order_no': widget.order['order_no'] ?? '',
+          'from_branch_name': branchLabel(widget.branches, intValue(widget.order['from_branch_num'])),
+          'to_branch_name': branchLabel(widget.branches, intValue(widget.order['to_branch_num'])),
+          'status_label': itemStatusLabel(status),
+          'approved_quantity': approved,
         },
-      );
-      unawaited(SyncCoordinator.instance.synchronize());
+      ));
       item['item_status'] = status;
       item['approved_quantity'] = approved;
       if (mounted) {
@@ -7381,44 +6767,43 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       builder: (_) => StatusDialog(current: widget.order['status'] as String? ?? 'submitted'),
     );
     if (status == null) return;
-    if (status == 'in_delivery' &&
-        !await transferItemsReadyForDelivery('${widget.order['id']}', employeeId: widget.session.id)) {
+    if (status == 'in_delivery' && !await transferItemsReadyForDelivery('${widget.order['id']}')) {
       if (mounted) showSnack(context, 'يجب معالجة جميع البنود وتحديد الكمية المتوفرة قبل بدء التوصيل');
       return;
     }
     final oldStatus = widget.order['status'];
     setState(() => statusBusy = true);
     try {
-      final actionId = newClientActionId();
-      final localId = '${widget.order['client_action_id'] ?? widget.order['id']}';
-      widget.order
-        ..['status'] = status
-        ..['handled_by'] = widget.session.id
-        ..['updated_at'] = DateTime.now().toUtc().toIso8601String();
-      await OfflineDatabase.instance.putRows(
-        scope: 'transfer_orders',
-        ownerId: widget.session.id,
-        rows: [widget.order],
-        idOf: (_) => localId,
-        localState: 'pending',
-      );
-      await OfflineDatabase.instance.queueAction(
-        actionId: actionId,
-        employeeId: widget.session.id,
-        actionType: 'transfer_status',
-        entityId: localId,
-        payload: {
-          'order_id': '${widget.order['id']}',
-          'order_ref': localId,
-          'local_row_id': localId,
+      await supabase.from('ansar_transfer_orders').update({
+        'status': status,
+        'handled_by': widget.session.id,
+        if (status == 'approved') 'approved_at': DateTime.now().toUtc().toIso8601String(),
+      }).eq('id', widget.order['id']);
+      await supabase.from('ansar_order_events').insert({
+        'order_id': widget.order['id'],
+        'employee_id': widget.session.id,
+        'event_type': 'status_changed',
+        'old_status': oldStatus,
+        'new_status': status,
+      });
+      unawaited(enqueueNotification(
+        title: 'تحديث مناقلة',
+        body: '${widget.session.name} حدّث المناقلة رقم ${widget.order['order_no'] ?? '-'} من ${branchLabel(widget.branches, intValue(widget.order['from_branch_num']))} إلى ${branchLabel(widget.branches, intValue(widget.order['to_branch_num']))}: ${statusLabel(status)}',
+        data: {
+          'type': 'transfer_updated',
+          'route': 'transfer',
+          'order_id': widget.order['id'],
           'status': status,
-          'old_status': oldStatus,
-          'expected_version': nullableIntValue(widget.order['sync_version']),
+          'sender_id': widget.session.id,
           'sender_name': widget.session.name,
-          'sender_avatar_url': widget.session.avatarUrl,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
+          'order_no': widget.order['order_no'] ?? '',
+          'from_branch_name': branchLabel(widget.branches, intValue(widget.order['from_branch_num'])),
+          'to_branch_name': branchLabel(widget.branches, intValue(widget.order['to_branch_num'])),
+          'status_label': statusLabel(status),
         },
-      );
-      unawaited(SyncCoordinator.instance.synchronize());
+      ));
+      widget.order['status'] = status;
       refreshDetails();
     } catch (error) {
       if (mounted) showSnack(context, cleanError(error));
@@ -7445,47 +6830,29 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     if (result == null || !mounted) return;
     setState(() => receiptBusy = true);
     try {
-      final sentById = {
-        for (final item in data.items) '${item['id']}': doubleValue(item['approved_quantity']),
-      };
-      final hasDifference = result.items.any((item) {
-        final sent = sentById['${item['item_id']}'] ?? 0;
-        return doubleValue(item['damaged_quantity']) > 0 ||
-            doubleValue(item['received_quantity']) < sent ||
-            (item['note']?.toString().trim().isNotEmpty ?? false);
-      });
-      final actionId = newClientActionId();
-      final localId = '${widget.order['client_action_id'] ?? widget.order['id']}';
+      final response = await confirmReceiptWithFallback(result);
+      final responseMap = response is Map ? Map<String, dynamic>.from(response) : const <String, dynamic>{};
+      final hasDifference = responseMap['has_difference'] == true;
       widget.order
         ..['status'] = 'received'
         ..['received_by'] = widget.session.id
         ..['received_at'] = DateTime.now().toUtc().toIso8601String()
         ..['has_receipt_discrepancy'] = hasDifference;
-      await OfflineDatabase.instance.putRows(
-        scope: 'transfer_orders',
-        ownerId: widget.session.id,
-        rows: [widget.order],
-        idOf: (_) => localId,
-        localState: 'pending',
-      );
-      await OfflineDatabase.instance.queueAction(
-        actionId: actionId,
-        employeeId: widget.session.id,
-        actionType: 'transfer_receipt',
-        entityId: localId,
-        payload: {
-          'order_id': '${widget.order['id']}',
-          'order_ref': localId,
-          'local_row_id': localId,
-          'items': result.items,
-          'note': emptyToNull(result.note),
-          'has_difference': hasDifference,
-          'expected_version': nullableIntValue(widget.order['sync_version']),
+      unawaited(enqueueNotification(
+        title: 'استلام مناقلة',
+        body: hasDifference
+            ? 'تم استلام المناقلة رقم ${widget.order['order_no'] ?? '-'} مع وجود فروقات'
+            : 'تم استلام المناقلة رقم ${widget.order['order_no'] ?? '-'} بالكامل',
+        data: {
+          'type': 'transfer_received',
+          'route': 'transfer',
+          'order_id': widget.order['id'],
+          'sender_id': widget.session.id,
           'sender_name': widget.session.name,
-          'sender_avatar_url': widget.session.avatarUrl,
+          'sender_avatar_url': widget.session.avatarUrl ?? '',
+          'has_difference': hasDifference,
         },
-      );
-      unawaited(SyncCoordinator.instance.synchronize());
+      ));
       refreshDetails();
     } catch (error) {
       if (mounted) showSnack(context, transferActionError(error, action: 'تأكيد استلام المناقلة'));
@@ -7508,7 +6875,7 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
       } catch (fallbackError) {
         throw Exception(
           '${transferActionError(fallbackError, action: 'تأكيد استلام المناقلة')} '
-          'نفّذ ملف ansar-offline-sync-upgrade.sql في Supabase. '
+          'أعد تنفيذ ملف ansar-runtime-repair.sql في Supabase. '
           'السبب الأصلي: ${compactDatabaseError(rpcError)}',
         );
       }
@@ -8821,9 +8188,40 @@ class _ShareTransferToChatPageState extends State<ShareTransferToChatPage> {
       final from = branchLabel(widget.branches, intValue(widget.order['from_branch_num']));
       final to = branchLabel(widget.branches, intValue(widget.order['to_branch_num']));
       final body = 'مناقلة رقم ${widget.order['order_no'] ?? '-'} · من $from إلى $to';
+      var sharedAtomically = false;
+      try {
+        await supabase.rpc('ansar_share_transfer_to_chat', params: {
+          'p_order_id': '${widget.order['id']}',
+          'p_thread_ids': selected.toList(),
+          'p_sender_id': widget.session.id,
+        });
+        sharedAtomically = true;
+        unawaited(kickNotificationSender());
+      } catch (rpcError) {
+        try {
+          await supabase.from('ansar_chat_messages').insert(
+                selected
+                    .map((threadId) => {
+                          'thread_id': threadId,
+                          'sender_id': widget.session.id,
+                          'body': body,
+                          'message_type': 'transfer',
+                          'transfer_order_id': '${widget.order['id']}',
+                        })
+                    .toList(),
+              );
+        } catch (fallbackError) {
+          throw Exception(
+            '${transferActionError(fallbackError, action: 'مشاركة المناقلة')} '
+            'أعد تنفيذ ملف ansar-runtime-repair.sql في Supabase. '
+            'السبب الأصلي: ${compactDatabaseError(rpcError)}',
+          );
+        }
+      }
       final threads = await loadVisibleChatThreads(widget.session);
       final now = DateTime.now().toUtc().toIso8601String();
       for (final threadId in selected) {
+        unawaited(supabase.from('ansar_chat_threads').update({'updated_at': now}).eq('id', threadId));
         Map<String, dynamic>? thread;
         for (final item in threads) {
           if ('${item['id']}' == threadId) {
@@ -8831,44 +8229,10 @@ class _ShareTransferToChatPageState extends State<ShareTransferToChatPage> {
             break;
           }
         }
-        final actionId = newClientActionId();
-        final message = <String, dynamic>{
-          'id': actionId,
-          'client_action_id': actionId,
-          'thread_id': threadId,
-          'sender_id': widget.session.id,
-          'body': body,
-          'message_type': 'transfer',
-          'transfer_order_id': '${widget.order['id']}',
-          'created_at': now,
-          'updated_at': now,
-          'sender': widget.session.data,
-        };
-        await OfflineDatabase.instance.putRows(
-          scope: 'chat_messages',
-          ownerId: widget.session.id,
-          rows: [message],
-          idOf: (_) => actionId,
-          localState: 'pending',
-        );
-        await OfflineDatabase.instance.queueAction(
-          actionId: actionId,
-          employeeId: widget.session.id,
-          actionType: 'chat_send',
-          entityId: actionId,
-          payload: {
-            'thread_id': threadId,
-            'thread_type': thread?['thread_type'],
-            'thread_title': thread?['title'],
-            'body': body,
-            'message_type': 'transfer',
-            'transfer_order_id': '${widget.order['id']}',
-            'sender_name': widget.session.name,
-            'sender_avatar_url': widget.session.avatarUrl,
-          },
-        );
+        if (!sharedAtomically && thread != null) {
+          unawaited(enqueueChatNotification(thread: thread, sender: widget.session, body: body));
+        }
       }
-      unawaited(SyncCoordinator.instance.synchronize());
       if (mounted) Navigator.pop(context, selected.length);
     } catch (error) {
       if (mounted) showSnack(context, transferActionError(error, action: 'مشاركة المناقلة'));
@@ -8957,7 +8321,6 @@ class _ChatPageState extends State<ChatPage> {
   List<Map<String, dynamic>>? latestThreads;
   RealtimeChannel? threadsChannel;
   Timer? threadsTimer;
-  StreamSubscription<String>? offlineThreadsSubscription;
   bool threadBusy = false;
   bool showArchived = false;
 
@@ -8965,54 +8328,43 @@ class _ChatPageState extends State<ChatPage> {
   void initState() {
     super.initState();
     future = loadAndRememberThreads();
-    offlineThreadsSubscription = OfflineDatabase.instance.changes.where((scope) {
-      return scope == 'chat_threads' ||
-          scope == 'chat_messages' ||
-          scope == 'chat_receipts' ||
-          scope == 'chat_participants' ||
-          scope == 'chat_participants_all' ||
-          scope == 'employees';
-    }).listen((_) => refreshThreads());
     threadsChannel = supabase.channel('chat-list-${widget.session.id}')
       ..onPostgresChanges(
         event: PostgresChangeEvent.all,
         schema: 'public',
         table: 'ansar_chat_threads',
-        callback: (_) => handleServerThreadChange(),
+        callback: (_) => refreshThreads(),
       )
       ..onPostgresChanges(
         event: PostgresChangeEvent.all,
         schema: 'public',
         table: 'ansar_chat_messages',
-        callback: (_) => handleServerThreadChange(),
+        callback: (_) => refreshThreads(),
       )
       ..onPostgresChanges(
         event: PostgresChangeEvent.all,
         schema: 'public',
         table: 'ansar_employees',
-        callback: (_) => handleServerThreadChange(),
+        callback: (_) => refreshThreads(),
       )
       ..onPostgresChanges(
         event: PostgresChangeEvent.all,
         schema: 'public',
         table: 'ansar_chat_participants',
-        callback: (_) => handleServerThreadChange(),
+        callback: (_) => refreshThreads(),
       )
       ..onPostgresChanges(
         event: PostgresChangeEvent.all,
         schema: 'public',
         table: 'ansar_chat_message_receipts',
-        callback: (_) => handleServerThreadChange(),
+        callback: (_) => refreshThreads(),
       ).subscribe();
-    threadsTimer = Timer.periodic(const Duration(seconds: 15), (_) {
-      unawaited(SyncCoordinator.instance.synchronize());
-    });
+    threadsTimer = Timer.periodic(const Duration(seconds: 5), (_) => refreshThreads());
   }
 
   @override
   void dispose() {
     threadsTimer?.cancel();
-    offlineThreadsSubscription?.cancel();
     if (threadsChannel != null) supabase.removeChannel(threadsChannel!);
     threadSearch.dispose();
     super.dispose();
@@ -9023,11 +8375,6 @@ class _ChatPageState extends State<ChatPage> {
     setState(() => future = loadAndRememberThreads());
   }
 
-  void handleServerThreadChange() {
-    unawaited(SyncCoordinator.instance.synchronize());
-    refreshThreads();
-  }
-
   Future<List<Map<String, dynamic>>> loadAndRememberThreads() async {
     final loaded = await loadThreads();
     latestThreads = loaded;
@@ -9035,12 +8382,19 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<List<Map<String, dynamic>>> loadThreads() async {
-    final rows = await loadVisibleChatThreads(widget.session);
-    final joinedParticipants = await OfflineDatabase.instance.readRows(
-      'chat_participants',
-      ownerId: widget.session.id,
-    );
-    final activeEmployees = await loadAllActiveEmployees();
+    final threadRowsFuture = supabase
+        .from('ansar_chat_threads')
+        .select()
+        .eq('is_active', true)
+        .order('updated_at', ascending: false);
+    final joinedParticipantsFuture = supabase
+        .from('ansar_chat_participants')
+        .select('thread_id, role, is_pinned, is_muted, muted_until, is_archived, last_read_at')
+        .eq('employee_id', widget.session.id);
+    final employeesFuture = loadAllActiveEmployees();
+    final rows = (await threadRowsFuture).cast<Map<String, dynamic>>();
+    final joinedParticipants = (await joinedParticipantsFuture).cast<Map<String, dynamic>>();
+    final activeEmployees = await employeesFuture;
     final joinedThreadIds = joinedParticipants.map((row) => row['thread_id']).toSet();
     final settingsByThread = {
       for (final row in joinedParticipants) '${row['thread_id']}': row,
@@ -9055,25 +8409,35 @@ class _ChatPageState extends State<ChatPage> {
     final unreadByThread = threadIds.isEmpty ? <String, int>{} : await loadChatUnreadCounts(widget.session.id);
     final participantRows = threadIds.isEmpty
         ? <Map<String, dynamic>>[]
-        : await OfflineDatabase.instance.readRows(
-            'chat_participants_all',
-            ownerId: widget.session.id,
-          );
+        : (await supabase
+                .from('ansar_chat_participants')
+                .select('thread_id, employee_id')
+                .inFilter('thread_id', threadIds))
+            .cast<Map<String, dynamic>>();
     final rawMessageRows = threadIds.isEmpty
         ? <Map<String, dynamic>>[]
-        : await OfflineDatabase.instance.readRows(
-            'chat_messages',
-            ownerId: widget.session.id,
-            limit: 5000,
-          );
-    final messageRows = rawMessageRows
-        .where((row) => threadIds.contains(row['thread_id']) && row['deleted_at'] == null)
-        .toList()
-      ..sort((a, b) {
-        final aTime = DateTime.tryParse(a['created_at']?.toString() ?? '') ?? DateTime.fromMillisecondsSinceEpoch(0);
-        final bTime = DateTime.tryParse(b['created_at']?.toString() ?? '') ?? DateTime.fromMillisecondsSinceEpoch(0);
-        return bTime.compareTo(aTime);
-      });
+        : (await supabase
+                .from('ansar_chat_messages')
+                .select('id, thread_id, sender_id, body, created_at')
+                .inFilter('thread_id', threadIds)
+                .isFilter('deleted_at', null)
+                .order('created_at', ascending: false)
+                .limit(250))
+            .cast<Map<String, dynamic>>();
+    var hiddenMessageIds = <String>{};
+    if (rawMessageRows.isNotEmpty) {
+      try {
+        final hiddenRows = await supabase
+            .from('ansar_chat_message_hidden')
+            .select('message_id')
+            .eq('employee_id', widget.session.id)
+            .inFilter('message_id', rawMessageRows.map((row) => '${row['id']}').toList());
+        hiddenMessageIds = hiddenRows.map((row) => '${row['message_id']}').toSet();
+      } catch (_) {
+        // The list remains usable before the optional per-user deletion migration is installed.
+      }
+    }
+    final messageRows = rawMessageRows.where((row) => !hiddenMessageIds.contains('${row['id']}')).toList();
     final employees = {for (final employee in activeEmployees) employee.id: employee};
     final latestByThread = <String, Map<String, dynamic>>{};
     for (final row in messageRows) {
@@ -9596,7 +8960,6 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   Timer? realtimeReconnectTimer;
   RealtimeChannel? liveChannel;
   RealtimeChannel? messagesChannel;
-  StreamSubscription<String>? offlineChanges;
   bool sendingMessage = false;
   double? attachmentUploadProgress;
   bool refreshingMessages = false;
@@ -9622,9 +8985,6 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     message.addListener(handleTypingChanged);
     setupLiveConversation();
     setupMessageChanges();
-    offlineChanges = OfflineDatabase.instance.changes
-        .where((scope) => scope == 'chat_messages' || scope == 'chat_receipts')
-        .listen((_) => unawaited(refreshMessages()));
     unawaited(loadOtherParticipantLastSeen());
     scrollController.addListener(handleMessageScroll);
     // Realtime can report a connected channel even when a table is not yet
@@ -9640,7 +9000,6 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     timer?.cancel();
     typingTimer?.cancel();
     realtimeReconnectTimer?.cancel();
-    offlineChanges?.cancel();
     if (messagesChannel != null) supabase.removeChannel(messagesChannel!);
     if (liveChannel != null) {
       liveChannel!.untrack();
@@ -9721,17 +9080,10 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     final row = Map<String, dynamic>.from(payload.newRecord);
     if ('${row['thread_id']}' != '${widget.thread['id']}') return;
     final current = latestMessages ?? <Map<String, dynamic>>[];
-    final rowKey = '${row['client_action_id'] ?? row['id']}';
-    if (current.any((message) => '${message['client_action_id'] ?? message['id']}' == rowKey)) {
+    if (current.any((message) => '${message['id']}' == '${row['id']}')) {
       unawaited(refreshMessages());
       return;
     }
-    unawaited(OfflineDatabase.instance.putRows(
-      scope: 'chat_messages',
-      ownerId: widget.session.id,
-      rows: [row],
-      idOf: (_) => rowKey,
-    ));
     final mine = row['sender_id'] == widget.session.id;
     final shouldFollow = mine || isNearMessageBottom;
     final optimistic = {
@@ -9966,82 +9318,41 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   }
 
   Future<List<Map<String, dynamic>>> loadMessages() async {
-    final cached = (await OfflineDatabase.instance.readRows(
-      'chat_messages',
-      ownerId: widget.session.id,
-      newestFirst: false,
-    )).where((row) => '${row['thread_id']}' == '${widget.thread['id']}').toList();
-    var allMessages = cached.length <= messageLimit ? cached : cached.sublist(cached.length - messageLimit);
-    final localFirst = cached.isNotEmpty;
-    if (localFirst) unawaited(SyncCoordinator.instance.synchronize());
-    if (!localFirst) {
-      try {
-        final rows = await supabase
-            .from('ansar_chat_messages')
-            .select()
-            .eq('thread_id', widget.thread['id'])
-            .order('created_at', ascending: false)
-            .limit(messageLimit);
-        final server = rows.cast<Map<String, dynamic>>().reversed.toList();
-        await OfflineDatabase.instance.putRows(
-          scope: 'chat_messages',
-          ownerId: widget.session.id,
-          rows: server,
-          idOf: (row) => '${row['client_action_id'] ?? row['id']}',
-        );
-        final byKey = <String, Map<String, dynamic>>{
-          for (final row in server) '${row['client_action_id'] ?? row['id']}': row,
-        };
-        for (final row in cached.where((item) => item['_local_state'] != null)) {
-          byKey.putIfAbsent('${row['client_action_id'] ?? row['id']}', () => row);
-        }
-        allMessages = byKey.values.toList()
-          ..sort((a, b) => (a['created_at']?.toString() ?? '').compareTo(b['created_at']?.toString() ?? ''));
-      } catch (_) {
-        if (allMessages.isEmpty) rethrow;
-      }
-    }
+    final rows = await supabase
+        .from('ansar_chat_messages')
+        .select()
+        .eq('thread_id', widget.thread['id'])
+        .order('created_at', ascending: false)
+        .limit(messageLimit);
+    final allMessages = rows.cast<Map<String, dynamic>>().reversed.toList();
     var hiddenMessageIds = <String>{};
-    if (!localFirst) {
-      try {
-        final messageIds = allMessages.map((row) => '${row['id']}').toList();
-        if (messageIds.isEmpty) return <Map<String, dynamic>>[];
-        final hiddenRows = await supabase
-            .from('ansar_chat_message_hidden')
-            .select('message_id')
-            .eq('employee_id', widget.session.id)
-            .inFilter('message_id', messageIds);
-        hiddenMessageIds = hiddenRows.map((row) => '${row['message_id']}').toSet();
-      } catch (_) {
-        // The chat remains usable before the optional per-user deletion migration is installed.
-      }
+    try {
+      final messageIds = allMessages.map((row) => '${row['id']}').toList();
+      if (messageIds.isEmpty) return <Map<String, dynamic>>[];
+      final hiddenRows = await supabase
+          .from('ansar_chat_message_hidden')
+          .select('message_id')
+          .eq('employee_id', widget.session.id)
+          .inFilter('message_id', messageIds);
+      hiddenMessageIds = hiddenRows.map((row) => '${row['message_id']}').toSet();
+    } catch (_) {
+      // The chat remains usable before the optional per-user deletion migration is installed.
     }
     final messages = allMessages.where((row) => !hiddenMessageIds.contains('${row['id']}')).toList();
-    List<Map<String, dynamic>> receiptRows = (await OfflineDatabase.instance.readRows(
-      'chat_receipts',
-      ownerId: widget.session.id,
-    ));
-    if (!localFirst) {
-      try {
-        final messageIds = messages.map((row) => '${row['id']}').toList();
-        if (messageIds.isNotEmpty) {
-          final rows = await supabase
-              .from('ansar_chat_message_receipts')
-              .select('message_id, employee_id, status, sent_at, delivered_at, read_at')
-              .inFilter('message_id', messageIds);
-          receiptRows = rows.cast<Map<String, dynamic>>();
-          await OfflineDatabase.instance.putRows(
-            scope: 'chat_receipts',
-            ownerId: widget.session.id,
-            rows: receiptRows,
-            idOf: (row) => '${row['message_id']}:${row['employee_id']}',
-          );
-        }
-        await markThreadDelivered();
-        if (isNearMessageBottom) await markThreadRead();
-      } catch (_) {
-        // Receipts are optional until the platform migration is installed.
+    List<Map<String, dynamic>> receiptRows = [];
+    try {
+      final messageIds = messages.map((row) => '${row['id']}').toList();
+      if (messageIds.isNotEmpty) {
+        final rows = await supabase
+            .from('ansar_chat_message_receipts')
+            .select('message_id, employee_id, status, sent_at, delivered_at, read_at')
+            .inFilter('message_id', messageIds);
+        receiptRows = rows.cast<Map<String, dynamic>>();
       }
+      await markThreadDelivered();
+      if (isNearMessageBottom) await markThreadRead();
+    } catch (_) {
+      // Receipts are optional until the platform migration is installed.
     }
     final transferById = <String, Map<String, dynamic>>{};
     final transferIds = messages
@@ -10051,25 +9362,16 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
         .toSet()
         .toList();
     if (transferIds.isNotEmpty) {
-      final localTransfers = await OfflineDatabase.instance.readRows(
-        'transfer_orders',
-        ownerId: widget.session.id,
-      );
-      for (final transfer in localTransfers.where((row) => transferIds.contains('${row['id']}'))) {
-        transferById['${transfer['id']}'] = transfer;
-      }
-      if (!localFirst) {
-        try {
-          final transferRows = await supabase
-              .from('ansar_transfer_orders')
-              .select('id, order_no, status, from_branch_num, to_branch_num')
-              .inFilter('id', transferIds);
-          for (final transfer in transferRows.cast<Map<String, dynamic>>()) {
-            transferById['${transfer['id']}'] = transfer;
-          }
-        } catch (_) {
-          // The message still opens the transfer even if its live status cannot be fetched briefly.
+      try {
+        final transferRows = await supabase
+            .from('ansar_transfer_orders')
+            .select('id, order_no, status, from_branch_num, to_branch_num')
+            .inFilter('id', transferIds);
+        for (final transfer in transferRows.cast<Map<String, dynamic>>()) {
+          transferById['${transfer['id']}'] = transfer;
         }
+      } catch (_) {
+        // The message still opens the transfer even if its live status cannot be fetched briefly.
       }
     }
     final messageById = <String, Map<String, dynamic>>{
@@ -10082,7 +9384,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
         .where((id) => !hiddenMessageIds.contains(id))
         .toSet()
         .toList();
-    if (missingReplyIds.isNotEmpty && !localFirst) {
+    if (missingReplyIds.isNotEmpty) {
       try {
         final replyRows = await supabase.from('ansar_chat_messages').select().inFilter('id', missingReplyIds);
         for (final row in replyRows.cast<Map<String, dynamic>>()) {
@@ -10098,23 +9400,15 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
       ...receiptRows.map((row) => row['employee_id']?.toString()).whereType<String>(),
     }.toList();
     final missingSenderIds = senderIds.where((id) => !senderProfiles.containsKey(id)).toList();
-    var employeeRows = (await OfflineDatabase.instance.readRows('employees'))
-        .where((row) => missingSenderIds.contains('${row['id']}'))
-        .toList();
-    if (missingSenderIds.isNotEmpty && !localFirst) {
-      try {
-        final onlineEmployees = await supabase
+    final employeeRows = missingSenderIds.isEmpty
+        ? <Map<String, dynamic>>[]
+        : await supabase
             .from('ansar_employees')
             .select('id, display_name, full_name, avatar_url')
             .inFilter('id', missingSenderIds);
-        employeeRows = onlineEmployees.cast<Map<String, dynamic>>();
-      } catch (_) {}
-    }
-    for (final row in employeeRows) {
+    for (final row in employeeRows.cast<Map<String, dynamic>>()) {
       senderProfiles['${row['id']}'] = row;
     }
-    unawaited(markThreadDelivered());
-    if (isNearMessageBottom) unawaited(markThreadRead());
     final employees = senderProfiles;
     final receiptsByMessage = <String, List<Map<String, dynamic>>>{};
     for (final receipt in receiptRows) {
@@ -10290,56 +9584,19 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     setState(() => sendingMessage = true);
     try {
       final reply = replyingTo;
-      final actionId = newClientActionId();
-      final attachments = <Map<String, dynamic>>[];
-      for (final attachment in pendingAttachments) {
-        final localPath = await OfflineDatabase.instance.stageAttachment(attachment.bytes, attachment.name);
-        attachments.add({
-          'local_path': localPath,
-          'name': attachment.name,
-          'size': attachment.bytes.length,
-          'mime_type': attachment.mimeType,
-        });
-      }
-      final inserted = <String, dynamic>{
-        'id': actionId,
-        'client_action_id': actionId,
-        'thread_id': widget.thread['id'],
-        'sender_id': widget.session.id,
-        'body': body,
-        'message_type': attachments.isEmpty ? 'text' : 'attachment',
-        'attachments': attachments,
-        if (reply?['id'] != null) 'reply_to_id': '${reply!['id']}',
-        'created_at': DateTime.now().toUtc().toIso8601String(),
-        'sender_name': widget.session.name,
-        'sender_avatar_url': widget.session.avatarUrl,
-        'receipt_status': 'pending',
-        'receipt_details': const <Map<String, dynamic>>[],
-      };
-      await OfflineDatabase.instance.putRows(
-        scope: 'chat_messages',
-        ownerId: widget.session.id,
-        rows: [inserted],
-        idOf: (_) => actionId,
-        localState: 'pending',
-      );
-      await OfflineDatabase.instance.queueAction(
-        actionId: actionId,
-        employeeId: widget.session.id,
-        actionType: 'chat_send',
-        entityId: actionId,
-        payload: {
-          'thread_id': '${widget.thread['id']}',
-          'thread_type': widget.thread['thread_type'],
-          'thread_title': widget.thread['title'],
-          'body': body,
-          'message_type': attachments.isEmpty ? 'text' : 'attachment',
-          'attachments': attachments,
-          if (reply?['id'] != null) 'reply_to_id': '${reply!['id']}',
-          'sender_name': widget.session.name,
-          'sender_avatar_url': widget.session.avatarUrl,
-        },
-      );
+      final attachments = await uploadPendingAttachments();
+      final inserted = await supabase
+          .from('ansar_chat_messages')
+          .insert({
+            'thread_id': widget.thread['id'],
+            'sender_id': widget.session.id,
+            'body': body,
+            'message_type': attachments.isEmpty ? 'text' : 'attachment',
+            if (attachments.isNotEmpty) 'attachments': attachments,
+            if (reply?['id'] != null) 'reply_to_id': '${reply!['id']}',
+          })
+          .select()
+          .single();
       if (mounted) {
         message.clear();
         pendingAttachments.clear();
@@ -10365,7 +9622,14 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
           if (mounted) scrollToMessageBottom();
         });
       }
-      unawaited(SyncCoordinator.instance.synchronize());
+      unawaited(touchThread());
+      unawaited(enqueueChatNotification(
+        thread: widget.thread,
+        sender: widget.session,
+        body: body.isEmpty
+            ? 'أرسل ${attachments.length == 1 ? 'مرفقاً' : '${attachments.length} مرفقات'}'
+            : (body.length > 80 ? '${body.substring(0, 80)}...' : body),
+      ));
     } catch (error) {
       if (mounted) showSnack(context, chatUpgradeError(error));
     } finally {
@@ -11845,48 +11109,20 @@ bool chatMessageSnapshotsEqual(
 }
 
 Future<List<Map<String, dynamic>>> loadVisibleChatThreads(EmployeeSession session) async {
-  final cached = await OfflineDatabase.instance.readRows(
-    'chat_threads',
-    ownerId: session.id,
-  );
-  unawaited(_refreshVisibleChatThreads(session).then<void>((_) {}, onError: (_) {}));
-  return cached.where((thread) => thread['is_active'] != false).toList();
-}
-
-Future<List<Map<String, dynamic>>> _refreshVisibleChatThreads(EmployeeSession session) async {
-  try {
-    final threadRows = await supabase
-        .from('ansar_chat_threads')
-        .select()
-        .eq('is_active', true)
-        .order('updated_at', ascending: false)
-        .timeout(const Duration(seconds: 12));
-    final joinedRows = await supabase
-        .from('ansar_chat_participants')
-        .select()
-        .eq('employee_id', session.id)
-        .timeout(const Duration(seconds: 12));
-    final joinedIds = joinedRows.map((row) => row['thread_id']?.toString()).whereType<String>().toSet();
-    final visible = threadRows.cast<Map<String, dynamic>>().where((thread) {
-      if (thread['thread_type'] == 'general') return true;
-      return joinedIds.contains(thread['id']?.toString());
-    }).toList();
-    await OfflineDatabase.instance.replaceServerRows(
-      scope: 'chat_threads',
-      ownerId: session.id,
-      rows: visible,
-      idOf: (row) => '${row['id']}',
-    );
-    await OfflineDatabase.instance.replaceServerRows(
-      scope: 'chat_participants',
-      ownerId: session.id,
-      rows: joinedRows.cast<Map<String, dynamic>>(),
-      idOf: (row) => '${row['thread_id']}:${row['employee_id']}',
-    );
-    return visible;
-  } catch (_) {
-    return OfflineDatabase.instance.readRows('chat_threads', ownerId: session.id);
-  }
+  final threadRows = await supabase
+      .from('ansar_chat_threads')
+      .select()
+      .eq('is_active', true)
+      .order('updated_at', ascending: false);
+  final joinedRows = await supabase
+      .from('ansar_chat_participants')
+      .select('thread_id')
+      .eq('employee_id', session.id);
+  final joinedIds = joinedRows.map((row) => row['thread_id']?.toString()).whereType<String>().toSet();
+  return threadRows.cast<Map<String, dynamic>>().where((thread) {
+    if (thread['thread_type'] == 'general') return true;
+    return joinedIds.contains(thread['id']?.toString());
+  }).toList();
 }
 
 Map<String, dynamic> notificationData(Object? value) {
@@ -11906,21 +11142,18 @@ Future<Map<String, dynamic>?> loadChatThreadForSession(
   EmployeeSession session,
   String threadId,
 ) async {
-  var cachedThreads = await OfflineDatabase.instance.readRows('chat_threads', ownerId: session.id);
-  var rows = cachedThreads.where((row) => '${row['id']}' == threadId && row['is_active'] != false).toList();
-  if (rows.isEmpty) {
-    try {
-      await _refreshVisibleChatThreads(session).timeout(const Duration(seconds: 3));
-    } catch (_) {}
-    cachedThreads = await OfflineDatabase.instance.readRows('chat_threads', ownerId: session.id);
-    rows = cachedThreads.where((row) => '${row['id']}' == threadId && row['is_active'] != false).toList();
-  }
+  final rows = await supabase
+      .from('ansar_chat_threads')
+      .select()
+      .eq('id', threadId)
+      .eq('is_active', true)
+      .limit(1);
   if (rows.isEmpty) return null;
   final thread = Map<String, dynamic>.from(rows.first);
-  final participantRows = (await OfflineDatabase.instance.readRows(
-    'chat_participants_all',
-    ownerId: session.id,
-  )).where((row) => '${row['thread_id']}' == threadId).toList();
+  final participantRows = await supabase
+      .from('ansar_chat_participants')
+      .select('employee_id')
+      .eq('thread_id', threadId);
   final participantIds = participantRows
       .map((row) => row['employee_id']?.toString())
       .whereType<String>()
@@ -11932,9 +11165,11 @@ Future<Map<String, dynamic>?> loadChatThreadForSession(
   if (type == 'direct') {
     final otherIds = participantIds.where((id) => id != session.id).toList();
     if (otherIds.isNotEmpty) {
-      final employeeRows = (await OfflineDatabase.instance.readRows('employees'))
-          .where((row) => '${row['id']}' == otherIds.first)
-          .toList();
+      final employeeRows = await supabase
+          .from('ansar_employees')
+          .select('display_name, full_name, avatar_url')
+          .eq('id', otherIds.first)
+          .limit(1);
       if (employeeRows.isNotEmpty) {
         final employee = employeeRows.first;
         final name = employeeDisplayName(employee);
@@ -11983,19 +11218,11 @@ Future<void> openTransferNotification(
   final orderId = data['order_id']?.toString();
   if (orderId == null || orderId.isEmpty) return;
   try {
-    var rows = (await OfflineDatabase.instance.readRows(
-      'transfer_orders',
-      ownerId: session.id,
-    )).where((row) => '${row['id']}' == orderId || '${row['client_action_id']}' == orderId).toList();
-    if (rows.isEmpty) {
-      try {
-        await SyncCoordinator.instance.synchronize().timeout(const Duration(seconds: 3));
-      } catch (_) {}
-      rows = (await OfflineDatabase.instance.readRows(
-        'transfer_orders',
-        ownerId: session.id,
-      )).where((row) => '${row['id']}' == orderId || '${row['client_action_id']}' == orderId).toList();
-    }
+    final rows = await supabase
+        .from('ansar_transfer_orders')
+        .select()
+        .eq('id', orderId)
+        .limit(1);
     if (!context.mounted) return;
     if (rows.isEmpty) {
       showSnack(context, 'تعذر العثور على المناقلة المطلوبة');
@@ -12055,53 +11282,31 @@ Future<void> markChatNotificationDelivered(String employeeId, String threadId) a
 }
 
 Future<Map<String, int>> loadChatUnreadCounts(String employeeId) async {
-  final cached = await OfflineDatabase.instance.readRows(
-    'chat_receipts',
-    ownerId: employeeId,
-  );
-  final cachedCounts = <String, int>{};
-  for (final row in cached) {
-    if ('${row['employee_id']}' != employeeId || '${row['status']}' == 'read') continue;
-    final threadId = row['thread_id']?.toString();
-    if (threadId == null || threadId.isEmpty) continue;
-    cachedCounts[threadId] = (cachedCounts[threadId] ?? 0) + 1;
-  }
   try {
     final response = await supabase.rpc('ansar_chat_unread_counts', params: {
       'p_employee_id': employeeId,
     });
     if (response is List) {
-      final counts = {
+      return {
         for (final item in response)
           if (item is Map && item['thread_id'] != null)
             '${item['thread_id']}': nullableIntValue(item['unread_count']) ?? 0,
       };
-      return counts;
     }
   } catch (_) {
     // Fall back to the receipt table while the RPC migration is being deployed.
   }
-  try {
-    final rows = await supabase
-        .from('ansar_chat_message_receipts')
-        .select()
-        .eq('employee_id', employeeId)
-        .neq('status', 'read');
-    final counts = <String, int>{};
-    for (final row in rows) {
-      final threadId = '${row['thread_id']}';
-      counts[threadId] = (counts[threadId] ?? 0) + 1;
-    }
-    await OfflineDatabase.instance.putRows(
-      scope: 'chat_receipts',
-      ownerId: employeeId,
-      rows: rows.cast<Map<String, dynamic>>(),
-      idOf: (row) => '${row['message_id']}:${row['employee_id']}',
-    );
-    return counts;
-  } catch (_) {
-    return cachedCounts;
+  final rows = await supabase
+      .from('ansar_chat_message_receipts')
+      .select('thread_id')
+      .eq('employee_id', employeeId)
+      .neq('status', 'read');
+  final counts = <String, int>{};
+  for (final row in rows) {
+    final threadId = '${row['thread_id']}';
+    counts[threadId] = (counts[threadId] ?? 0) + 1;
   }
+  return counts;
 }
 
 Future<void> touchEmployeePresence(String employeeId, {required bool online}) async {
@@ -13608,8 +12813,8 @@ class ErrorState extends StatelessWidget {
 
 Future<Map<int, BranchOption>> loadLegacyBranchesMap() async {
   final branches = <int, BranchOption>{};
-  final cachedRows = await OfflineDatabase.instance.readRows('legacy_branches');
-  for (final row in cachedRows) {
+  final legacyRows = await supabase.from('branches').select('sto_num, name').order('sto_num');
+  for (final row in legacyRows) {
     final number = nullableIntValue(row['sto_num']);
     if (number == null) continue;
     branches[number] = BranchOption(
@@ -13617,70 +12822,17 @@ Future<Map<int, BranchOption>> loadLegacyBranchesMap() async {
       name: (row['name'] ?? 'فرع $number').toString(),
     );
   }
-  if (branches.isNotEmpty) {
-    unawaited(_refreshLegacyBranchesCache().then<void>((_) {}));
-    return branches;
-  }
-  unawaited(_refreshLegacyBranchesCache().then<void>((_) {}));
-  return branches;
-}
-
-Future<Map<int, BranchOption>> _refreshLegacyBranchesCache() async {
-  final branches = <int, BranchOption>{};
-  try {
-    final legacyRows = await supabase.from('branches').select('sto_num, name').order('sto_num');
-    final values = legacyRows.cast<Map<String, dynamic>>();
-    await OfflineDatabase.instance.replaceServerRows(
-      scope: 'legacy_branches',
-      rows: values,
-      idOf: (row) => '${row['sto_num']}',
-    );
-    branches.clear();
-    for (final row in values) {
-      final number = nullableIntValue(row['sto_num']);
-      if (number == null) continue;
-      branches[number] = BranchOption(number: number, name: (row['name'] ?? 'فرع $number').toString());
-    }
-  } catch (_) {
-    // The app branch cache remains available when the legacy source is offline.
-  }
   return branches;
 }
 
 Future<Map<int, BranchOption>> loadAppBranchesMap() async {
-  final branches = <int, BranchOption>{};
-  final cachedRows = await OfflineDatabase.instance.readRows('branches');
-  for (final row in cachedRows) {
-    final number = nullableIntValue(row['sto_num']);
-    if (number == null || row['is_active'] == false) continue;
-    branches[number] = BranchOption(number: number, name: (row['name'] ?? 'فرع $number').toString());
-  }
-  if (branches.isNotEmpty) {
-    unawaited(_refreshAppBranchesCache().then<void>((_) {}));
-    return branches;
-  }
-  try {
-    return await _refreshAppBranchesCache().timeout(const Duration(seconds: 10));
-  } catch (_) {
-    return branches;
-  }
-}
-
-Future<Map<int, BranchOption>> _refreshAppBranchesCache() async {
   final branches = <int, BranchOption>{};
   try {
     final appRows = await supabase
         .from('ansar_branches')
         .select('sto_num, name, is_active')
         .order('sto_num');
-    final values = appRows.cast<Map<String, dynamic>>();
-    await OfflineDatabase.instance.replaceServerRows(
-      scope: 'branches',
-      rows: values,
-      idOf: (row) => '${row['sto_num']}',
-    );
-    branches.clear();
-    for (final row in values) {
+    for (final row in appRows) {
       final number = nullableIntValue(row['sto_num']);
       if (number == null) continue;
       if (row['is_active'] == false) {
@@ -13756,7 +12908,11 @@ Future<List<Map<String, dynamic>>> loadAccountsCached() async {
   if (cachedAccounts != null) return cachedAccounts!;
   final running = cachedAccountsFuture;
   if (running != null) return running;
-  cachedAccountsFuture = _loadAccountsLocalFirst();
+  cachedAccountsFuture = supabase
+      .from('accounts')
+      .select('num, name, ras, owner')
+      .order('num', ascending: true)
+      .then((rows) => rows.cast<Map<String, dynamic>>());
   try {
     cachedAccounts = await cachedAccountsFuture;
     return cachedAccounts!;
@@ -13765,39 +12921,11 @@ Future<List<Map<String, dynamic>>> loadAccountsCached() async {
   }
 }
 
-Future<List<Map<String, dynamic>>> _loadAccountsLocalFirst() async {
-  final local = await OfflineDatabase.instance.readRows('accounts', newestFirst: false);
-  if (local.isNotEmpty) {
-    unawaited(_refreshAccountsCache().then<void>((_) {}, onError: (_) {}));
-    return local;
-  }
-  try {
-    return await _refreshAccountsCache().timeout(const Duration(seconds: 10));
-  } catch (_) {
-    return local;
-  }
-}
-
-Future<List<Map<String, dynamic>>> _refreshAccountsCache() async {
-  final rows = await supabase
-      .from('accounts')
-      .select('num, name, ras, owner')
-      .order('num', ascending: true);
-  final values = rows.cast<Map<String, dynamic>>();
-  await OfflineDatabase.instance.replaceServerRows(
-    scope: 'accounts',
-    rows: values,
-    idOf: (row) => '${row['num']}',
-  );
-  cachedAccounts = values;
-  return values;
-}
-
 Future<void> warmQueriesCache() async {
-  await Future.wait<void>([
-    warmProductSearchCache().catchError((_) {}),
-    loadAccountsCached().then<void>((_) {}).catchError((_) {}),
-    loadLegacyBranchesMap().then<void>((_) {}).catchError((_) {}),
+  await Future.wait([
+    warmProductSearchCache(),
+    loadAccountsCached(),
+    loadLegacyBranchesMap(),
   ]);
 }
 
@@ -13806,15 +12934,16 @@ Future<List<Map<String, dynamic>>> searchProductsLikeLegacy(
   required int limit,
 }) async {
   final cache = ProductSearchCache.instance;
-  final searchLimit = max(250, limit * 8);
   var hadLocalData = false;
+  var localRows = <Map<String, dynamic>>[];
+  Object? localCacheError;
   try {
     hadLocalData = await cache.hasData;
-    if (!hadLocalData) {
-      unawaited(cache.synchronize(supabase, force: true).catchError((_) {}));
-      return <Map<String, dynamic>>[];
-    }
-    final localRows = await cache.search(query, limit: searchLimit);
+    localRows = await cache.search(query, limit: max(250, limit * 8));
+  } catch (error) {
+    localCacheError = error;
+  }
+  if (localRows.isNotEmpty) {
     unawaited(cache.synchronize(supabase).catchError((_) {}));
     final localBarcodes = <int, String>{};
     for (final product in localRows) {
@@ -13823,13 +12952,34 @@ Future<List<Map<String, dynamic>>> searchProductsLikeLegacy(
       if (matNum != null && barcode != null && barcode.isNotEmpty) localBarcodes[matNum] = barcode;
     }
     return rankProductRows(localRows, query, localBarcodes, limit: limit);
-  } catch (localError) {
-    if (hadLocalData) rethrow;
-    try {
-      return await searchProductsDirect(query, limit: limit);
-    } catch (_) {
-      throw localError;
+  }
+
+  Object? directError;
+  try {
+    final direct = await searchProductsDirect(query, limit: limit);
+    if (direct.isNotEmpty) {
+      unawaited(cache.synchronize(supabase, force: true).catchError((_) {}));
+      return direct;
     }
+  } catch (error) {
+    directError = error;
+  }
+
+  try {
+    await cache.synchronize(supabase, force: true);
+    final refreshed = await cache.search(query, limit: max(250, limit * 8));
+    final refreshedBarcodes = <int, String>{};
+    for (final product in refreshed) {
+      final matNum = nullableIntValue(product['mat_num']);
+      final barcode = product['_cached_barcode']?.toString();
+      if (matNum != null && barcode != null && barcode.isNotEmpty) refreshedBarcodes[matNum] = barcode;
+    }
+    return rankProductRows(refreshed, query, refreshedBarcodes, limit: limit);
+  } catch (_) {
+    if (hadLocalData) return <Map<String, dynamic>>[];
+    if (directError != null) throw directError;
+    if (localCacheError != null) throw localCacheError;
+    rethrow;
   }
 }
 
@@ -13955,58 +13105,26 @@ Future<List<EmployeeLite>> loadEmployeesForScope(
   EmployeeSession session, {
   required bool includeInactive,
 }) async {
-  final cached = await OfflineDatabase.instance.readRows('employees');
-  if (cached.isNotEmpty) {
-    unawaited(_refreshActiveEmployees().then<void>((_) {}));
-    var rows = cached.where((row) => includeInactive || row['is_active'] != false);
-    if (!session.isAdmin && session.isBranchManager) {
-      rows = rows.where((row) => nullableIntValue(row['branch_num']) == session.branchNum);
-    } else if (!session.isAdmin) {
-      rows = rows.where((row) => '${row['id']}' == session.id);
-    }
-    final employees = rows.map(EmployeeLite.fromRow).toList()..sort((a, b) => a.name.compareTo(b.name));
-    return employees;
-  }
-  unawaited(_refreshActiveEmployees().then<void>((_) {}));
-  final all = <EmployeeLite>[EmployeeLite.fromRow(session.data)];
+  var query = supabase
+      .from('ansar_employees')
+      .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url');
+  if (!includeInactive) query = query.eq('is_active', true);
   if (!session.isAdmin && session.isBranchManager) {
-    return all.where((employee) => employee.branchNum == session.branchNum).toList();
+    query = query.eq('branch_num', session.branchNum);
+  } else if (!session.isAdmin) {
+    query = query.eq('id', session.id);
   }
-  if (!session.isAdmin) return all.where((employee) => employee.id == session.id).toList();
-  return all;
+  final rows = await query.order('display_name', ascending: true);
+  return rows.map(EmployeeLite.fromRow).toList();
 }
 
 Future<List<EmployeeLite>> loadAllActiveEmployees() async {
-  final cached = await OfflineDatabase.instance.readRows('employees');
-  if (cached.isNotEmpty) {
-    unawaited(_refreshActiveEmployees().then<void>((_) {}));
-    return cached.where((row) => row['is_active'] != false).map(EmployeeLite.fromRow).toList();
-  }
-  try {
-    return await _refreshActiveEmployees().timeout(const Duration(seconds: 10));
-  } catch (_) {
-    return <EmployeeLite>[];
-  }
-}
-
-Future<List<EmployeeLite>> _refreshActiveEmployees() async {
-  try {
-    final rows = await supabase
-        .from('ansar_employees')
-        .select('id, display_name, full_name, branch_num, role, is_active, avatar_url, phone, email, job_title, updated_at')
-        .eq('is_active', true)
-        .order('display_name', ascending: true);
-    final values = rows.cast<Map<String, dynamic>>();
-    await OfflineDatabase.instance.replaceServerRows(
-      scope: 'employees',
-      rows: values,
-      idOf: (row) => '${row['id']}',
-    );
-    return values.map(EmployeeLite.fromRow).toList();
-  } catch (_) {
-    final cached = await OfflineDatabase.instance.readRows('employees');
-    return cached.where((row) => row['is_active'] != false).map(EmployeeLite.fromRow).toList();
-  }
+  final rows = await supabase
+      .from('ansar_employees')
+      .select('id, display_name, full_name, branch_num, role, is_active, avatar_url')
+      .eq('is_active', true)
+      .order('display_name', ascending: true);
+  return rows.cast<Map<String, dynamic>>().map(EmployeeLite.fromRow).toList();
 }
 
 List<Movement> buildMovementsFromRows(
@@ -14101,20 +13219,11 @@ List<String> transferAllowedNextStatuses(String current) {
   }
 }
 
-Future<bool> transferItemsReadyForDelivery(String orderId, {required String employeeId}) async {
-  var rows = (await OfflineDatabase.instance.readRows(
-    'transfer_items',
-    ownerId: employeeId,
-  )).where((row) => '${row['order_id']}' == orderId).toList();
-  try {
-    final onlineRows = await supabase
-        .from('ansar_transfer_order_items')
-        .select('id, order_id, item_status, approved_quantity')
-        .eq('order_id', orderId);
-    rows = onlineRows.cast<Map<String, dynamic>>();
-  } catch (_) {
-    // Local item states are authoritative for the pending offline action.
-  }
+Future<bool> transferItemsReadyForDelivery(String orderId) async {
+  final rows = await supabase
+      .from('ansar_transfer_order_items')
+      .select('item_status, approved_quantity')
+      .eq('order_id', orderId);
   if (rows.isEmpty) return false;
   return rows.every((row) {
     final status = row['item_status']?.toString() ?? 'requested';
@@ -14545,7 +13654,7 @@ Future<void> saveDeviceInstallation(
   String? fcmToken,
   String? pushyToken,
 }) async {
-  String appVersion = '0.5.2+7';
+  String appVersion = '0.4.1+8';
   try {
     final info = await PackageInfo.fromPlatform();
     appVersion = '${info.version}+${info.buildNumber}';

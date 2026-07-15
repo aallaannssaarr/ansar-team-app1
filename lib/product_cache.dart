@@ -1,28 +1,66 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:sqflite/sqflite.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-
-import 'offline_database.dart';
 
 class ProductSearchCache {
   ProductSearchCache._();
 
   static final ProductSearchCache instance = ProductSearchCache._();
 
+  Database? _database;
   Future<void>? _syncFuture;
   Object? lastSyncError;
   DateTime? lastSyncAt;
 
   Future<Database> get database async {
-    final db = await OfflineDatabase.instance.database;
+    final current = _database;
+    if (current != null) return current;
+    final root = await getDatabasesPath();
+    final db = await openDatabase(
+      '$root${Platform.pathSeparator}ansar-products-v1.db',
+      version: 1,
+      onCreate: (database, _) async {
+        await database.execute('''
+          create table products (
+            mat_num integer primary key,
+            normalized_name text not null,
+            row_json text not null
+          )
+        ''');
+        await database.execute('create index products_normalized_name_idx on products(normalized_name)');
+        await database.execute('''
+          create table product_barcodes (
+            mat_num integer not null,
+            barcode text not null,
+            primary key (mat_num, barcode)
+          )
+        ''');
+        await database.execute('create index product_barcodes_barcode_idx on product_barcodes(barcode)');
+        await database.execute('''
+          create table products_stage (
+            mat_num integer primary key,
+            normalized_name text not null,
+            row_json text not null
+          )
+        ''');
+        await database.execute('''
+          create table product_barcodes_stage (
+            mat_num integer not null,
+            barcode text not null,
+            primary key (mat_num, barcode)
+          )
+        ''');
+        await database.execute('create table cache_meta (key text primary key, value text)');
+      },
+    );
+    _database = db;
     final syncValue = Sqflite.firstIntValue(
       await db.rawQuery("select cast(value as integer) from cache_meta where key = 'last_sync_ms' limit 1"),
     );
-    if (syncValue != null && lastSyncAt == null) {
-      lastSyncAt = DateTime.fromMillisecondsSinceEpoch(syncValue, isUtc: true);
-    }
+    if (syncValue != null) lastSyncAt = DateTime.fromMillisecondsSinceEpoch(syncValue, isUtc: true);
     return db;
   }
 
@@ -63,31 +101,6 @@ class ProductSearchCache {
       }
     }
 
-    final orderSql = numericQuery != null
-        ? '''
-          case
-            when cast(product.mat_num as text) = ? then 0
-            when exists (
-              select 1 from product_barcodes exact_barcode
-              where exact_barcode.mat_num = product.mat_num and exact_barcode.barcode = ?
-            ) then 0
-            when cast(product.mat_num as text) like ? then 1
-            else 2
-          end,
-          product.mat_num
-        '''
-        : '''
-          case
-            when product.normalized_name = ? then 0
-            when product.normalized_name like ? then 1
-            else 2
-          end,
-          length(product.normalized_name),
-          product.mat_num
-        ''';
-    final orderArgs = numericQuery != null
-        ? <Object?>[normalized, normalized, '$normalized%']
-        : <Object?>[normalized, '$normalized%'];
     final rows = await db.rawQuery(
       '''
         select product.row_json,
@@ -95,10 +108,9 @@ class ProductSearchCache {
            where barcode.mat_num = product.mat_num limit 1) as cached_barcode
         from products product
         where ${where.isEmpty ? '1 = 0' : where.join(' and ')}
-        order by $orderSql
         limit ?
       ''',
-      [...args, ...orderArgs, limit],
+      [...args, limit],
     );
     return rows.map(_decodeProduct).whereType<Map<String, dynamic>>().toList();
   }
@@ -123,17 +135,6 @@ class ProductSearchCache {
     };
   }
 
-  Future<List<Map<String, dynamic>>> stockForMatNums(Iterable<int> matNums) async {
-    final ids = matNums.toSet().toList(growable: false);
-    if (ids.isEmpty) return <Map<String, dynamic>>[];
-    final placeholders = List.filled(ids.length, '?').join(',');
-    final rows = await (await database).rawQuery(
-      'select mat_num, sto_num, quantity, updated_at from product_stock where mat_num in ($placeholders)',
-      ids,
-    );
-    return rows.map((row) => Map<String, dynamic>.from(row)).toList();
-  }
-
   Future<void> synchronize(SupabaseClient client, {bool force = false}) {
     final running = _syncFuture;
     if (running != null) return running;
@@ -155,11 +156,7 @@ class ProductSearchCache {
       var from = 0;
       const pageSize = 750;
       while (true) {
-        final rows = await client
-            .from('products')
-            .select()
-            .order('mat_num', ascending: true)
-            .range(from, from + pageSize - 1);
+        final rows = await client.from('products').select().range(from, from + pageSize - 1);
         final page = rows.cast<Map<String, dynamic>>();
         final batch = db.batch();
         for (final product in page) {
@@ -187,8 +184,6 @@ class ProductSearchCache {
           final rows = await client
               .from('product_barcodes')
               .select('mat_num, barcode')
-              .order('mat_num', ascending: true)
-              .order('barcode', ascending: true)
               .range(from, from + pageSize - 1);
           final page = rows.cast<Map<String, dynamic>>();
           final batch = db.batch();
@@ -210,42 +205,6 @@ class ProductSearchCache {
         barcodeSyncSucceeded = false;
       }
 
-      var stockSyncSucceeded = true;
-      try {
-        await db.delete('product_stock_stage');
-        from = 0;
-        while (true) {
-          final rows = await client
-              .from('product_stock')
-              .select('mat_num, sto_num, quantity')
-              .order('mat_num', ascending: true)
-              .order('sto_num', ascending: true)
-              .range(from, from + pageSize - 1);
-          final page = rows.cast<Map<String, dynamic>>();
-          final batch = db.batch();
-          for (final row in page) {
-            final matNum = _intValue(row['mat_num']);
-            final branchNum = _intValue(row['sto_num']);
-            if (matNum == null || branchNum == null) continue;
-            batch.insert(
-              'product_stock_stage',
-              {
-                'mat_num': matNum,
-                'sto_num': branchNum,
-                'quantity': _doubleValue(row['quantity']),
-                'updated_at': DateTime.now().toUtc().toIso8601String(),
-              },
-              conflictAlgorithm: ConflictAlgorithm.replace,
-            );
-          }
-          await batch.commit(noResult: true);
-          if (page.length < pageSize) break;
-          from += pageSize;
-        }
-      } catch (_) {
-        stockSyncSucceeded = false;
-      }
-
       final stagedCount = Sqflite.firstIntValue(await db.rawQuery('select count(*) from products_stage')) ?? 0;
       if (stagedCount == 0) throw StateError('لم تُرجع قاعدة البيانات أي كتب لتحديث النسخة المحلية');
 
@@ -258,10 +217,6 @@ class ProductSearchCache {
         await transaction.rawInsert('insert into products select * from products_stage');
         await transaction.delete('product_barcodes');
         await transaction.rawInsert('insert into product_barcodes select * from product_barcodes_stage');
-        if (stockSyncSucceeded) {
-          await transaction.delete('product_stock');
-          await transaction.rawInsert('insert into product_stock select * from product_stock_stage');
-        }
         await transaction.insert(
           'cache_meta',
           {'key': 'last_sync_ms', 'value': now.millisecondsSinceEpoch.toString()},
@@ -269,14 +224,12 @@ class ProductSearchCache {
         );
       });
       lastSyncAt = now;
-      OfflineDatabase.instance.notifyChanged('products');
     } catch (error) {
       lastSyncError = error;
       rethrow;
     } finally {
       await db.delete('products_stage');
       await db.delete('product_barcodes_stage');
-      await db.delete('product_stock_stage');
     }
   }
 
@@ -312,9 +265,4 @@ int? _intValue(Object? value) {
   if (value is int) return value;
   if (value is num) return value.toInt();
   return int.tryParse(value?.toString() ?? '');
-}
-
-double _doubleValue(Object? value) {
-  if (value is num) return value.toDouble();
-  return double.tryParse(value?.toString() ?? '') ?? 0;
 }
