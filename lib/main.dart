@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:fl_chart/fl_chart.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -134,15 +133,21 @@ Future<void>? _supabaseInitialization;
 Future<void> ensureSupabaseInitialized() {
   final running = _supabaseInitialization;
   if (running != null) return running;
-  final future = Supabase.initialize(
-    url: AnsarConfig.supabaseUrl,
-    publishableKey: AnsarConfig.supabaseServiceKey,
-  ).then<void>((_) {});
+  final future = _initializeSupabase();
   _supabaseInitialization = future;
-  return future.onError((error, stackTrace) {
-    if (identical(_supabaseInitialization, future)) _supabaseInitialization = null;
-    Error.throwWithStackTrace(error, stackTrace);
-  });
+  return future;
+}
+
+Future<void> _initializeSupabase() async {
+  try {
+    await Supabase.initialize(
+      url: AnsarConfig.supabaseUrl,
+      publishableKey: AnsarConfig.supabaseServiceKey,
+    );
+  } catch (_) {
+    _supabaseInitialization = null;
+    rethrow;
+  }
 }
 
 List<Map<String, dynamic>>? cachedProducts;
