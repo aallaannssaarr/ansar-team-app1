@@ -4,7 +4,6 @@
         <item name="android:windowSplashScreenBackground">#F7FAF8</item>
         <item name="android:windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
         <item name="android:windowSplashScreenIconBackgroundColor">#FFFFFF</item>
-        <item name="android:postSplashScreenTheme">@style/NormalTheme</item>
     </style>
     <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
         <item name="android:windowBackground">#F7FAF8</item>
