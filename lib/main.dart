@@ -386,7 +386,10 @@ class _AppBootstrapState extends State<AppBootstrap> {
   Future<void> initialize() async {
     if (mounted) setState(() => error = null);
     try {
-      await ensureSupabaseInitialized();
+      await Future.wait<void>([
+        ensureSupabaseInitialized(),
+        OfflineDatabase.instance.initialize(),
+      ]);
       Map<String, dynamic>? stored;
       try {
         stored = await SessionStore.load();
@@ -399,9 +402,6 @@ class _AppBootstrapState extends State<AppBootstrap> {
         restoredSession = stored == null ? null : EmployeeSession(stored);
         ready = true;
       });
-      // Local storage is prepared in parallel. A device-specific SQLite
-      // problem must never lock the employee out of the whole application.
-      unawaited(OfflineDatabase.instance.initialize().catchError((_) {}));
       unawaited(ensureNotificationServices().catchError((_) {}));
     } catch (bootstrapError) {
       if (mounted) setState(() => error = bootstrapError);
@@ -1549,11 +1549,8 @@ class _NotificationInboxPageState extends State<NotificationInboxPage> {
 
   Future<List<Map<String, dynamic>>> loadNotifications() async {
     final cached = await _readCachedNotifications();
-    if (cached.isNotEmpty) {
-      unawaited(_refreshNotificationCache().then<void>((_) {}));
-      return cached;
-    }
-    return _refreshNotificationCache();
+    unawaited(_refreshNotificationCache().then<void>((_) {}, onError: (_) {}));
+    return cached;
   }
 
   Future<List<Map<String, dynamic>>> _readCachedNotifications() async {
@@ -1573,7 +1570,8 @@ class _NotificationInboxPageState extends State<NotificationInboxPage> {
           .from('ansar_notification_queue')
           .select('id, employee_id, branch_num, title, body, data, status, created_at')
           .order('created_at', ascending: false)
-          .limit(100);
+          .limit(100)
+          .timeout(const Duration(seconds: 12));
       final visible = rows
           .cast<Map<String, dynamic>>()
           .where((row) => isNotificationForSession(row, widget.session))
@@ -11851,11 +11849,8 @@ Future<List<Map<String, dynamic>>> loadVisibleChatThreads(EmployeeSession sessio
     'chat_threads',
     ownerId: session.id,
   );
-  if (cached.isNotEmpty) {
-    unawaited(_refreshVisibleChatThreads(session).then<void>((_) {}));
-    return cached.where((thread) => thread['is_active'] != false).toList();
-  }
-  return _refreshVisibleChatThreads(session);
+  unawaited(_refreshVisibleChatThreads(session).then<void>((_) {}, onError: (_) {}));
+  return cached.where((thread) => thread['is_active'] != false).toList();
 }
 
 Future<List<Map<String, dynamic>>> _refreshVisibleChatThreads(EmployeeSession session) async {
@@ -11864,11 +11859,13 @@ Future<List<Map<String, dynamic>>> _refreshVisibleChatThreads(EmployeeSession se
         .from('ansar_chat_threads')
         .select()
         .eq('is_active', true)
-        .order('updated_at', ascending: false);
+        .order('updated_at', ascending: false)
+        .timeout(const Duration(seconds: 12));
     final joinedRows = await supabase
         .from('ansar_chat_participants')
         .select()
-        .eq('employee_id', session.id);
+        .eq('employee_id', session.id)
+        .timeout(const Duration(seconds: 12));
     final joinedIds = joinedRows.map((row) => row['thread_id']?.toString()).whereType<String>().toSet();
     final visible = threadRows.cast<Map<String, dynamic>>().where((thread) {
       if (thread['thread_type'] == 'general') return true;
@@ -13662,8 +13659,11 @@ Future<Map<int, BranchOption>> loadAppBranchesMap() async {
     unawaited(_refreshAppBranchesCache().then<void>((_) {}));
     return branches;
   }
-  unawaited(_refreshAppBranchesCache().then<void>((_) {}));
-  return branches;
+  try {
+    return await _refreshAppBranchesCache().timeout(const Duration(seconds: 10));
+  } catch (_) {
+    return branches;
+  }
 }
 
 Future<Map<int, BranchOption>> _refreshAppBranchesCache() async {
@@ -13771,8 +13771,11 @@ Future<List<Map<String, dynamic>>> _loadAccountsLocalFirst() async {
     unawaited(_refreshAccountsCache().then<void>((_) {}, onError: (_) {}));
     return local;
   }
-  unawaited(_refreshAccountsCache().then<void>((_) {}, onError: (_) {}));
-  return local;
+  try {
+    return await _refreshAccountsCache().timeout(const Duration(seconds: 10));
+  } catch (_) {
+    return local;
+  }
 }
 
 Future<List<Map<String, dynamic>>> _refreshAccountsCache() async {
@@ -13979,8 +13982,11 @@ Future<List<EmployeeLite>> loadAllActiveEmployees() async {
     unawaited(_refreshActiveEmployees().then<void>((_) {}));
     return cached.where((row) => row['is_active'] != false).map(EmployeeLite.fromRow).toList();
   }
-  unawaited(_refreshActiveEmployees().then<void>((_) {}));
-  return <EmployeeLite>[];
+  try {
+    return await _refreshActiveEmployees().timeout(const Duration(seconds: 10));
+  } catch (_) {
+    return <EmployeeLite>[];
+  }
 }
 
 Future<List<EmployeeLite>> _refreshActiveEmployees() async {
@@ -14539,7 +14545,7 @@ Future<void> saveDeviceInstallation(
   String? fcmToken,
   String? pushyToken,
 }) async {
-  String appVersion = '0.5.1+6';
+  String appVersion = '0.5.2+7';
   try {
     final info = await PackageInfo.fromPlatform();
     appVersion = '${info.version}+${info.buildNumber}';

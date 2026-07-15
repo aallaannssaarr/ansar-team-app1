@@ -25,10 +25,6 @@ class OfflineDatabase {
   Future<void> initialize() async {
     try {
       await database;
-      final integrity = await integrityStatus();
-      if (integrity.toLowerCase() != 'ok') {
-        await _replaceCorruptDatabase();
-      }
     } catch (error) {
       if (_isCorruptionError(error)) {
         await _replaceCorruptDatabase();
@@ -36,7 +32,6 @@ class OfflineDatabase {
         rethrow;
       }
     }
-    await pruneOldData();
   }
 
   Future<void> _replaceCorruptDatabase() async {
