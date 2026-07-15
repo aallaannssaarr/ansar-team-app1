@@ -6,27 +6,17 @@ workflows:
     environment:
       flutter: stable
     scripts:
-      - name: Generate Android platform
-        script: |
-          flutter create --platforms=android .
       - name: Get dependencies
         script: |
           flutter pub get
-      - name: Set Android app name and icon
+      - name: Generate launcher icon
         script: |
-          python3 - <<'PY'
-          from pathlib import Path
-          manifest = Path("android/app/src/main/AndroidManifest.xml")
-          text = manifest.read_text(encoding="utf-8")
-          text = text.replace('android:label="ansar_team_app"', 'android:label="فريق الأنصار"')
-          manifest.write_text(text, encoding="utf-8")
-          PY
           dart run flutter_launcher_icons
       - name: Analyze
         script: |
           flutter analyze --no-fatal-infos --no-fatal-warnings
       - name: Build debug APK
         script: |
-          flutter build apk --debug
+          flutter build apk --debug --flavor stable
     artifacts:
-      - build/app/outputs/flutter-apk/app-debug.apk
+      - build/app/outputs/flutter-apk/app-stable-debug.apk

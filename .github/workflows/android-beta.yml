@@ -1,0 +1,79 @@
+name: Android Beta APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/design-beta
+
+permissions:
+  contents: read
+
+jobs:
+  build-beta:
+    runs-on: ubuntu-latest
+    env:
+      FIREBASE_BETA_GOOGLE_SERVICES_JSON: ${{ secrets.FIREBASE_BETA_GOOGLE_SERVICES_JSON }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.6"
+          channel: stable
+
+      - name: Configure Android environment
+        shell: bash
+        run: |
+          printf 'flutter.sdk=%s\n' "$FLUTTER_ROOT" > android/local.properties
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" >> android/local.properties
+          chmod +x android/gradlew
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Generate launcher icons
+        run: dart run flutter_launcher_icons
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Run automated tests
+        run: flutter test --reporter expanded
+
+      - name: Configure Firebase beta app
+        shell: bash
+        run: |
+          if [ -z "$FIREBASE_BETA_GOOGLE_SERVICES_JSON" ]; then
+            echo "::error::Register com.example.ansar_team_app.beta in Firebase, then add its JSON as the FIREBASE_BETA_GOOGLE_SERVICES_JSON repository secret."
+            exit 1
+          fi
+          mkdir -p android/app/src/beta
+          printf '%s' "$FIREBASE_BETA_GOOGLE_SERVICES_JSON" > android/app/src/beta/google-services.json
+
+      - name: Build beta APK
+        run: flutter build apk --debug --flavor beta --dart-define=ANSAR_BETA=true
+
+      - name: Prepare beta APK
+        run: |
+          mkdir -p release
+          cp build/app/outputs/flutter-apk/app-beta-debug.apk release/ansar-team-beta-debug.apk
+
+      - name: Upload beta APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ansar-team-beta-debug-apk
+          path: release/ansar-team-beta-debug.apk

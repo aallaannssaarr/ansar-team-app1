@@ -558,4 +558,59 @@ void main() {
     expect(find.text('فريق الأنصار'), findsOneWidget);
     expect(find.byIcon(Icons.notifications_none_rounded), findsOneWidget);
   });
+
+  testWidgets('design components fit a 360px screen with enlarged Arabic text', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _testShell(
+        MediaQuery(
+          data: MediaQueryData(textScaler: TextScaler.linear(1.3)),
+          child: const SingleChildScrollView(
+            padding: EdgeInsets.all(16),
+            child: Column(
+              children: [
+                AnsarPageHeader(
+                  title: 'التقارير والإحصائيات',
+                  subtitle: 'ملخص واضح للفترة والفرع والموظف المحدد',
+                  icon: Icons.insert_chart_outlined_rounded,
+                  badge: 'تجريبي',
+                ),
+                Row(
+                  children: [
+                    Expanded(
+                      child: AnsarMetricCard(
+                        label: 'إجمالي الساعات',
+                        value: '128.5',
+                        caption: 'ضمن النطاق المحدد',
+                        icon: Icons.timer_rounded,
+                        color: brandColor,
+                      ),
+                    ),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: AnsarMetricCard(
+                        label: 'متوسط الوردية',
+                        value: '7.5',
+                        caption: 'ساعة لكل وردية',
+                        icon: Icons.speed_rounded,
+                        color: accentColor,
+                      ),
+                    ),
+                  ],
+                ),
+                SizedBox(height: 16),
+                TransferStepHeader(step: 1),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('التقارير والإحصائيات'), findsOneWidget);
+    expect(find.text('المراجعة'), findsOneWidget);
+  });
 }
