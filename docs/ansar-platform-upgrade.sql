@@ -309,6 +309,15 @@ alter table public.ansar_transfer_orders
   add column if not exists receipt_note text,
   add column if not exists has_receipt_discrepancy boolean not null default false;
 
+alter table public.ansar_transfer_orders
+  drop constraint if exists ansar_transfer_orders_status_check;
+alter table public.ansar_transfer_orders
+  add constraint ansar_transfer_orders_status_check
+  check (status in (
+    'draft', 'submitted', 'approved', 'partially_available', 'preparing',
+    'in_delivery', 'received', 'completed', 'rejected', 'cancelled'
+  )) not valid;
+
 alter table public.ansar_transfer_order_items
   add column if not exists received_quantity numeric,
   add column if not exists damaged_quantity numeric,
@@ -493,6 +502,12 @@ alter table public.ansar_chat_messages
   add column if not exists forwarded_from_id text,
   add column if not exists attachments jsonb not null default '[]'::jsonb,
   add column if not exists transfer_order_id text;
+
+alter table public.ansar_chat_messages
+  drop constraint if exists ansar_chat_messages_message_type_check;
+alter table public.ansar_chat_messages
+  add constraint ansar_chat_messages_message_type_check
+  check (message_type in ('text', 'attachment', 'transfer', 'forwarded', 'system')) not valid;
 
 alter table public.ansar_employees
   add column if not exists last_seen_at timestamptz;

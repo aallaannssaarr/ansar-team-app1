@@ -1,7 +1,10 @@
 import 'package:ansar_team_app/main.dart';
+import 'package:ansar_team_app/offline_database.dart';
 import 'package:ansar_team_app/product_cache.dart';
+import 'package:ansar_team_app/session_store.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 Widget _testShell(Widget child) {
   return MaterialApp(
@@ -14,6 +17,34 @@ Widget _testShell(Widget child) {
 }
 
 void main() {
+  test('offline actions receive stable unique UUIDs', () {
+    final first = newClientActionId();
+    final second = newClientActionId();
+    final uuid = RegExp(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$');
+
+    expect(first, isNot(second));
+    expect(uuid.hasMatch(first), isTrue);
+    expect(uuid.hasMatch(second), isTrue);
+  });
+
+  test('saved employee session survives restart without credentials', () async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    await SessionStore.save({
+      'id': 'employee-1',
+      'display_name': 'موظف تجريبي',
+      'branch_num': 1,
+      'username': 'employee1',
+      'password': 'must-not-be-stored',
+      'password_hash': 'must-not-be-stored-either',
+    });
+
+    final restored = await SessionStore.load();
+    expect(restored?['id'], 'employee-1');
+    expect(restored?['display_name'], 'موظف تجريبي');
+    expect(restored?.containsKey('password'), isFalse);
+    expect(restored?.containsKey('password_hash'), isFalse);
+  });
+
   test('cleanError hides Flutter setState Future noise', () {
     expect(
       cleanError('setState() callback argument returned a Future'),
