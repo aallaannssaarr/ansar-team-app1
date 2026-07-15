@@ -129,6 +129,22 @@ Future<void> _initializeNotificationServices() async {
 }
 
 SupabaseClient get supabase => Supabase.instance.client;
+Future<void>? _supabaseInitialization;
+
+Future<void> ensureSupabaseInitialized() {
+  final running = _supabaseInitialization;
+  if (running != null) return running;
+  final future = Supabase.initialize(
+    url: AnsarConfig.supabaseUrl,
+    publishableKey: AnsarConfig.supabaseServiceKey,
+  ).then<void>((_) {});
+  _supabaseInitialization = future;
+  return future.onError((error, stackTrace) {
+    if (identical(_supabaseInitialization, future)) _supabaseInitialization = null;
+    Error.throwWithStackTrace(error, stackTrace);
+  });
+}
+
 List<Map<String, dynamic>>? cachedProducts;
 Map<int, String>? cachedBarcodes;
 Future<List<Map<String, dynamic>>>? cachedProductsFuture;
@@ -365,19 +381,22 @@ class _AppBootstrapState extends State<AppBootstrap> {
   Future<void> initialize() async {
     if (mounted) setState(() => error = null);
     try {
-      await Future.wait([
-        Supabase.initialize(
-          url: AnsarConfig.supabaseUrl,
-          publishableKey: AnsarConfig.supabaseServiceKey,
-        ),
-        OfflineDatabase.instance.initialize(),
-      ]);
-      final stored = await SessionStore.load();
+      await ensureSupabaseInitialized();
+      Map<String, dynamic>? stored;
+      try {
+        stored = await SessionStore.load();
+      } catch (_) {
+        // A damaged preference entry falls back to the login page instead of
+        // blocking application startup.
+      }
       if (!mounted) return;
       setState(() {
         restoredSession = stored == null ? null : EmployeeSession(stored);
         ready = true;
       });
+      // Local storage is prepared in parallel. A device-specific SQLite
+      // problem must never lock the employee out of the whole application.
+      unawaited(OfflineDatabase.instance.initialize().catchError((_) {}));
       unawaited(ensureNotificationServices().catchError((_) {}));
     } catch (bootstrapError) {
       if (mounted) setState(() => error = bootstrapError);
@@ -14515,7 +14534,7 @@ Future<void> saveDeviceInstallation(
   String? fcmToken,
   String? pushyToken,
 }) async {
-  String appVersion = '0.5.0+5';
+  String appVersion = '0.5.1+6';
   try {
     final info = await PackageInfo.fromPlatform();
     appVersion = '${info.version}+${info.buildNumber}';

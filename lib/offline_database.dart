@@ -15,6 +15,7 @@ class OfflineDatabase {
   static const databaseVersion = 4;
 
   Database? _database;
+  Future<Database>? _openingDatabase;
   final StreamController<String> _changes = StreamController<String>.broadcast();
 
   Stream<String> get changes => _changes.stream;
@@ -28,8 +29,12 @@ class OfflineDatabase {
       if (integrity.toLowerCase() != 'ok') {
         await _replaceCorruptDatabase();
       }
-    } catch (_) {
-      await _replaceCorruptDatabase();
+    } catch (error) {
+      if (_isCorruptionError(error)) {
+        await _replaceCorruptDatabase();
+      } else {
+        rethrow;
+      }
     }
     await pruneOldData();
   }
@@ -63,22 +68,38 @@ class OfflineDatabase {
   Future<Database> get database async {
     final current = _database;
     if (current != null && current.isOpen) return current;
+    final opening = _openingDatabase;
+    if (opening != null) return opening;
+    final future = _openDatabase();
+    _openingDatabase = future;
+    try {
+      return await future;
+    } finally {
+      if (identical(_openingDatabase, future)) _openingDatabase = null;
+    }
+  }
+
+  Future<Database> _openDatabase() async {
     final root = await getDatabasesPath();
     final path = '$root${Platform.pathSeparator}$databaseName';
     final opened = await openDatabase(
       path,
       version: databaseVersion,
-      onConfigure: (db) async {
-        await db.execute('pragma journal_mode = WAL');
-        await db.execute('pragma foreign_keys = ON');
-        await db.execute('pragma busy_timeout = 5000');
-      },
       onCreate: (db, _) => _createTables(db),
       onUpgrade: (db, _, __) => _createTables(db),
       onOpen: _createTables,
     );
     _database = opened;
     return opened;
+  }
+
+  bool _isCorruptionError(Object error) {
+    final text = error.toString().toLowerCase();
+    return text.contains('database disk image is malformed') ||
+        text.contains('file is not a database') ||
+        text.contains('database corrupt') ||
+        text.contains('sqlite_corrupt') ||
+        text.contains('sqlite_notadb');
   }
 
   Future<void> _createTables(DatabaseExecutor db) async {
