@@ -7976,6 +7976,8 @@ class TransferStepHeader extends StatelessWidget {
                 const SizedBox(height: 5),
                 Text(
                   labels[index],
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                     color: index <= step ? brandColor : mutedInk,
                     fontSize: 11,
@@ -7986,7 +7988,10 @@ class TransferStepHeader extends StatelessWidget {
             ),
           ),
           if (index != labels.length - 1)
-            Expanded(child: Divider(color: index < step ? brandColor : borderColor, thickness: 2)),
+            SizedBox(
+              width: 14,
+              child: Divider(color: index < step ? brandColor : borderColor, thickness: 2),
+            ),
         ],
       ],
     );

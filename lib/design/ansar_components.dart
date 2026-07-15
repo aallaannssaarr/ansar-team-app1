@@ -39,11 +39,13 @@ class AnsarPageHeader extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
+                Wrap(
+                  spacing: ansarSpace8,
+                  runSpacing: ansarSpace4,
+                  crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
-                    Flexible(child: Text(title, style: Theme.of(context).textTheme.titleLarge)),
-                    if (badge != null) ...[
-                      const SizedBox(width: ansarSpace8),
+                    Text(title, style: Theme.of(context).textTheme.titleLarge),
+                    if (badge != null)
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
                         decoration: BoxDecoration(
@@ -56,7 +58,6 @@ class AnsarPageHeader extends StatelessWidget {
                           style: const TextStyle(color: warningColor, fontSize: 10, fontWeight: FontWeight.w800),
                         ),
                       ),
-                    ],
                   ],
                 ),
                 const SizedBox(height: ansarSpace4),
@@ -114,8 +115,14 @@ class AnsarMetricCard extends StatelessWidget {
                 ),
                 child: Icon(icon, color: color, size: 20),
               ),
-              const Spacer(),
-              Text(value, style: TextStyle(color: color, fontSize: 22, fontWeight: FontWeight.w800)),
+              const SizedBox(width: ansarSpace8),
+              Expanded(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: AlignmentDirectional.centerEnd,
+                  child: Text(value, style: TextStyle(color: color, fontSize: 22, fontWeight: FontWeight.w800)),
+                ),
+              ),
             ],
           ),
           const SizedBox(height: ansarSpace8),
