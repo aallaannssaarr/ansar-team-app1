@@ -44,7 +44,7 @@
     <script>
       const parts = location.pathname.split('/').filter(Boolean);
       const orderId = parts[0] === 'transfer' && parts[1] ? parts[1] : '';
-      const appUrl = `ansarteambeta://transfer/${encodeURIComponent(orderId)}`;
+      const appUrl = `ansarteam://transfer/${encodeURIComponent(orderId)}`;
       const button = document.getElementById('open-app');
       button.href = appUrl;
       if (orderId) setTimeout(() => { location.href = appUrl; }, 180);
