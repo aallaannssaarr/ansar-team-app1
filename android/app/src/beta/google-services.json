@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "362221832982",
+    "project_id": "ansar-team",
+    "storage_bucket": "ansar-team.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:362221832982:android:8e5eec4edf1360d0135e37",
+        "android_client_info": {
+          "package_name": "com.example.ansar_team_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBshlfBnEbPz5yvM8LnY681Vj84RhlpGfY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:362221832982:android:58ff51d536110e98135e37",
+        "android_client_info": {
+          "package_name": "com.example.ansar_team_app.beta"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBshlfBnEbPz5yvM8LnY681Vj84RhlpGfY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

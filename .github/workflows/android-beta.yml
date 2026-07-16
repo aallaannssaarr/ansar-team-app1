@@ -57,12 +57,15 @@ jobs:
       - name: Configure Firebase beta app
         shell: bash
         run: |
-          if [ -z "$FIREBASE_BETA_GOOGLE_SERVICES_JSON" ]; then
-            echo "::error::Register com.example.ansar_team_app.beta in Firebase, then add its JSON as the FIREBASE_BETA_GOOGLE_SERVICES_JSON repository secret."
+          mkdir -p android/app/src/beta
+          if [ -n "$FIREBASE_BETA_GOOGLE_SERVICES_JSON" ]; then
+            printf '%s' "$FIREBASE_BETA_GOOGLE_SERVICES_JSON" > android/app/src/beta/google-services.json
+          elif [ -f android/app/src/beta/google-services.json ]; then
+            echo "Using the beta Firebase configuration committed with the project."
+          else
+            echo "::error::Register com.example.ansar_team_app.beta in Firebase and provide android/app/src/beta/google-services.json."
             exit 1
           fi
-          mkdir -p android/app/src/beta
-          printf '%s' "$FIREBASE_BETA_GOOGLE_SERVICES_JSON" > android/app/src/beta/google-services.json
 
       - name: Build beta APK
         run: flutter build apk --debug --flavor beta --dart-define=ANSAR_BETA=true
