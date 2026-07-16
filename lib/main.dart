@@ -116,10 +116,9 @@ Future<void> main() async {
           ),
         ),
       );
-  appLinks ??= AppLinks();
   unawaited(initializeAppLinks());
-  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
   runApp(const AnsarApp());
+  unawaited(initializeDeferredServices());
 }
 
 Future<void>? coreServicesFuture;
@@ -131,10 +130,19 @@ StreamSubscription<Uri>? globalAppLinkSubscription;
 String? pendingTransferOrderId;
 
 Future<void> initializeCoreServices() {
-  return coreServicesFuture ??= Supabase.initialize(
-    url: AnsarConfig.supabaseUrl,
-    publishableKey: AnsarConfig.supabaseServiceKey,
-  );
+  return coreServicesFuture ??= _initializeCoreServices();
+}
+
+Future<void> _initializeCoreServices() async {
+  try {
+    await Supabase.initialize(
+      url: AnsarConfig.supabaseUrl,
+      publishableKey: AnsarConfig.supabaseServiceKey,
+    );
+  } catch (_) {
+    coreServicesFuture = null;
+    rethrow;
+  }
 }
 
 Future<void> initializeDeferredServices() {
@@ -144,6 +152,7 @@ Future<void> initializeDeferredServices() {
 Future<void> _initializeDeferredServices() async {
   try {
     await Firebase.initializeApp();
+    FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
     await RichNotificationService.initialize();
     initializePushyService();
     deferredServicesReady = true;
@@ -177,9 +186,12 @@ void rememberTransferDeepLink(Uri uri) {
 }
 
 Future<void> initializeAppLinks() async {
-  appLinks ??= AppLinks();
-  globalAppLinkSubscription ??= appLinks!.uriLinkStream.listen(rememberTransferDeepLink);
   try {
+    appLinks ??= AppLinks();
+    globalAppLinkSubscription ??= appLinks!.uriLinkStream.listen(
+      rememberTransferDeepLink,
+      onError: (_) {},
+    );
     final initialLink = await appLinks!.getInitialLink();
     if (initialLink != null) rememberTransferDeepLink(initialLink);
   } catch (_) {

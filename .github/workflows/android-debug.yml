@@ -1,4 +1,4 @@
-name: Android Debug APK
+name: Android Stable APK
 
 on:
   workflow_dispatch:
@@ -56,13 +56,13 @@ jobs:
       - name: Run automated tests
         run: flutter test --reporter expanded
 
-      - name: Build stable debug APK
-        run: flutter build apk --debug --flavor stable
+      - name: Build stable release APK
+        run: flutter build apk --release --flavor stable
 
       - name: Prepare APK file
         run: |
           mkdir -p release
-          cp build/app/outputs/flutter-apk/app-stable-debug.apk release/ansar-team-stable-debug.apk
+          cp build/app/outputs/flutter-apk/app-stable-release.apk release/ansar-team-stable-release.apk
 
       - name: Distribute APK to Firebase testers
         if: ${{ env.FIREBASE_SERVICE_ACCOUNT_JSON != '' }}
@@ -73,7 +73,7 @@ jobs:
           APP_ID=$(python -c "import json; print(json.load(open('google-services.json'))['client'][0]['client_info']['mobilesdk_app_id'])")
           GROUPS=${FIREBASE_TESTER_GROUPS:-ansar-testers}
           RELEASE_NOTES=$(git log -1 --pretty=%s)
-          if ! firebase appdistribution:distribute release/ansar-team-stable-debug.apk \
+          if ! firebase appdistribution:distribute release/ansar-team-stable-release.apk \
               --app "$APP_ID" \
               --groups "$GROUPS" \
               --release-notes "$RELEASE_NOTES"; then
@@ -83,16 +83,16 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ansar-team-stable-debug-apk
-          path: release/ansar-team-stable-debug.apk
+          name: ansar-team-stable-release-apk
+          path: release/ansar-team-stable-release.apk
 
-      - name: Publish latest debug APK
+      - name: Publish latest stable APK
         uses: ncipollo/release-action@v1
         with:
-          tag: debug-latest
-          name: Latest debug APK
-          body: "Always contains the latest debug APK built from main."
-          artifacts: release/ansar-team-stable-debug.apk
+          tag: stable-latest
+          name: Latest stable APK
+          body: "Always contains the latest stable release-mode APK built from main."
+          artifacts: release/ansar-team-stable-release.apk
           allowUpdates: true
           replacesArtifacts: true
           removeArtifacts: true
