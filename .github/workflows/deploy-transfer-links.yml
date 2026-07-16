@@ -1,0 +1,41 @@
+name: Deploy Transfer Links
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "hosting/**"
+      - "firebase.json"
+      - ".firebaserc"
+      - "assets/logo.png"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Check Firebase credentials
+        run: |
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT_JSON" ]; then
+            echo "FIREBASE_SERVICE_ACCOUNT_JSON is required" >&2
+            exit 1
+          fi
+
+      - name: Prepare hosting files
+        run: cp assets/logo.png hosting/logo.png
+
+      - name: Deploy Firebase Hosting
+        run: |
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/firebase-service-account.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/firebase-service-account.json"
+          npm install --global firebase-tools
+          firebase deploy --only hosting --project ansar-team --non-interactive

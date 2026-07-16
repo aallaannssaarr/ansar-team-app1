@@ -34,11 +34,13 @@ android {
         create("stable") {
             dimension = "edition"
             applicationId = "com.example.ansar_team_app"
+            manifestPlaceholders["deepLinkScheme"] = "ansarteam"
         }
         create("beta") {
             dimension = "edition"
             applicationId = "com.example.ansar_team_app.beta"
             versionNameSuffix = "-beta"
+            manifestPlaceholders["deepLinkScheme"] = "ansarteambeta"
         }
     }
 

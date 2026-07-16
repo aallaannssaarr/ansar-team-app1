@@ -1,12 +1,13 @@
 name: ansar_team_app
 description: Native mobile app for Al Ansar team operations.
 publish_to: "none"
-version: 0.4.1+8
+version: 0.5.0+9
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
 
 dependencies:
+  app_links: ^6.4.1
   flutter:
     sdk: flutter
   fl_chart: ^0.69.0

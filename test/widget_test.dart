@@ -211,6 +211,71 @@ void main() {
     );
   });
 
+  test('general administrators have no assigned branch or attendance scope', () {
+    final administrator = EmployeeSession({
+      'id': 'admin',
+      'display_name': 'مدير النظام',
+      'username': 'admin',
+      'branch_num': null,
+      'role': 'admin',
+      'can_manage_all_branches': true,
+    });
+    final branchManager = EmployeeSession({
+      'id': 'manager',
+      'display_name': 'مدير فرع',
+      'username': 'manager',
+      'branch_num': 3,
+      'role': 'branch_manager',
+    });
+
+    expect(administrator.isGeneralAdmin, isTrue);
+    expect(administrator.assignedBranchNum, isNull);
+    expect(branchManager.isGeneralAdmin, isFalse);
+    expect(branchManager.assignedBranchNum, 3);
+  });
+
+  test('invoice wording and transfer links preserve their business identifiers', () {
+    final wording = arabicUsdAmountInWords(100.50);
+    expect(wording, contains('مائة'));
+    expect(wording, contains('دولار'));
+    expect(wording, contains('خمسون'));
+    expect(wording, contains('سنت'));
+    expect(
+      transferOrderIdFromUri(Uri.parse('ansarteambeta://transfer/order-19')),
+      'order-19',
+    );
+    expect(
+      transferOrderIdFromUri(Uri.parse('https://ansar-team.web.app/transfer/order-20')),
+      'order-20',
+    );
+  });
+
+  testWidgets('chat list labels the current employee last message as mine', (tester) async {
+    await tester.pumpWidget(
+      _testShell(
+        ChatThreadTile(
+          currentEmployeeId: 'employee-1',
+          thread: const {
+            'id': 'thread-1',
+            'thread_type': 'direct',
+            'title': 'موظف آخر',
+            'last_sender_name': 'إبراهيم',
+            'last_message': {
+              'sender_id': 'employee-1',
+              'body': 'تم تجهيز الطلب',
+              'created_at': '2026-07-16T10:00:00Z',
+            },
+          },
+          onTap: () {},
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('أنت: تم تجهيز الطلب'), findsOneWidget);
+    expect(find.textContaining('إبراهيم:'), findsNothing);
+  });
+
   testWidgets('product detail tables render compact rows without overflow', (tester) async {
     await tester.binding.setSurfaceSize(const Size(390, 844));
     addTearDown(() => tester.binding.setSurfaceSize(null));

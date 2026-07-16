@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:app_links/app_links.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -115,6 +116,14 @@ Future<void> main() async {
           ),
         ),
       );
+  if (kIsBetaBuild) {
+    appLinks ??= AppLinks();
+    unawaited(initializeAppLinks());
+    FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
+    runApp(const AnsarApp());
+    return;
+  }
+
   await Firebase.initializeApp();
   FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
   await Supabase.initialize(
@@ -123,7 +132,106 @@ Future<void> main() async {
   );
   await RichNotificationService.initialize();
   initializePushyService();
+  deferredServicesReady = true;
+  deferredServicesFuture = Future<void>.value();
   runApp(const AnsarApp());
+}
+
+Future<void>? coreServicesFuture;
+Future<void>? deferredServicesFuture;
+bool deferredServicesReady = false;
+final transferDeepLinks = StreamController<String>.broadcast();
+AppLinks? appLinks;
+StreamSubscription<Uri>? globalAppLinkSubscription;
+String? pendingTransferOrderId;
+
+Future<void> initializeCoreServices() {
+  return coreServicesFuture ??= Supabase.initialize(
+    url: AnsarConfig.supabaseUrl,
+    publishableKey: AnsarConfig.supabaseServiceKey,
+  );
+}
+
+Future<void> initializeDeferredServices() {
+  return deferredServicesFuture ??= _initializeDeferredServices();
+}
+
+Future<void> _initializeDeferredServices() async {
+  try {
+    await Firebase.initializeApp();
+    await RichNotificationService.initialize();
+    initializePushyService();
+    deferredServicesReady = true;
+  } catch (_) {
+    deferredServicesReady = false;
+    deferredServicesFuture = null;
+  }
+}
+
+String? transferOrderIdFromUri(Uri uri) {
+  if ({'ansarteam', 'ansarteambeta'}.contains(uri.scheme) &&
+      uri.host == 'transfer' &&
+      uri.pathSegments.isNotEmpty) {
+    return uri.pathSegments.last;
+  }
+  final segments = uri.pathSegments;
+  final transferIndex = segments.indexOf('transfer');
+  if ((uri.scheme == 'https' || uri.scheme == 'http') &&
+      transferIndex >= 0 &&
+      transferIndex + 1 < segments.length) {
+    return segments[transferIndex + 1];
+  }
+  return null;
+}
+
+void rememberTransferDeepLink(Uri uri) {
+  final orderId = transferOrderIdFromUri(uri);
+  if (orderId == null || orderId.isEmpty) return;
+  pendingTransferOrderId = orderId;
+  if (transferDeepLinks.hasListener) transferDeepLinks.add(orderId);
+}
+
+Future<void> initializeAppLinks() async {
+  appLinks ??= AppLinks();
+  globalAppLinkSubscription ??= appLinks!.uriLinkStream.listen(rememberTransferDeepLink);
+  try {
+    final initialLink = await appLinks!.getInitialLink();
+    if (initialLink != null) rememberTransferDeepLink(initialLink);
+  } catch (_) {
+    // Deep links are optional and must never delay opening the application.
+  }
+}
+
+class EmployeeSessionStore {
+  static const sessionKey = 'ansar_employee_session_v1';
+
+  static Future<void> save(EmployeeSession session) async {
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setString(sessionKey, jsonEncode(session.data));
+    await preferences.setString('ansar_employee_id', session.id);
+  }
+
+  static Future<EmployeeSession?> load() async {
+    final preferences = await SharedPreferences.getInstance();
+    final raw = preferences.getString(sessionKey);
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      final data = Map<String, dynamic>.from(decoded);
+      if (data['id'] == null || data['username'] == null) return null;
+      return EmployeeSession(data);
+    } catch (_) {
+      await preferences.remove(sessionKey);
+      return null;
+    }
+  }
+
+  static Future<void> clear() async {
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.remove(sessionKey);
+    await preferences.remove('ansar_employee_id');
+  }
 }
 
 SupabaseClient get supabase => Supabase.instance.client;
@@ -148,9 +256,101 @@ class AnsarApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: kIsBetaBuild ? 'فريق الأنصار التجريبي' : 'فريق الأنصار',
       theme: buildAnsarTheme(),
-      home: const Directionality(
+      home: Directionality(
         textDirection: TextDirection.rtl,
-        child: LoginPage(),
+        child: kIsBetaBuild ? const BootstrapPage() : const LoginPage(),
+      ),
+    );
+  }
+}
+
+class BootstrapPage extends StatefulWidget {
+  const BootstrapPage({super.key});
+
+  @override
+  State<BootstrapPage> createState() => _BootstrapPageState();
+}
+
+class _BootstrapPageState extends State<BootstrapPage> {
+  late Future<EmployeeSession?> future;
+
+  @override
+  void initState() {
+    super.initState();
+    future = prepareApplication();
+  }
+
+  Future<EmployeeSession?> prepareApplication() async {
+    await initializeCoreServices();
+    final session = await EmployeeSessionStore.load();
+    unawaited(initializeDeferredServices());
+    return session;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<EmployeeSession?>(
+      future: future,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) return const BrandedStartupView();
+        if (snapshot.hasError) {
+          return Scaffold(
+            body: Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.cloud_off_rounded, color: dangerColor, size: 42),
+                    const SizedBox(height: 12),
+                    const Text('تعذر تجهيز التطبيق', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 12),
+                    FilledButton.icon(
+                      onPressed: () => setState(() => future = prepareApplication()),
+                      icon: const Icon(Icons.refresh_rounded),
+                      label: const Text('إعادة المحاولة'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }
+        final session = snapshot.data;
+        return session == null ? const LoginPage() : HomePage(initialSession: session, restoredSession: true);
+      },
+    );
+  }
+}
+
+class BrandedStartupView extends StatelessWidget {
+  const BrandedStartupView({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: softSurface,
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 112,
+              height: 112,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: borderColor),
+              ),
+              child: Image.asset('assets/logo.png', fit: BoxFit.contain),
+            ),
+            const SizedBox(height: 18),
+            const Text('فريق الأنصار', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 14),
+            const SizedBox(width: 28, height: 28, child: CircularProgressIndicator(strokeWidth: 2.5)),
+          ],
+        ),
       ),
     );
   }
@@ -165,7 +365,8 @@ class EmployeeSession {
   String get name => (data['display_name'] ?? data['full_name'] ?? username) as String;
   String get fullName => (data['full_name'] ?? name) as String;
   String get username => data['username'] as String? ?? '';
-  int get branchNum => (data['branch_num'] as num?)?.toInt() ?? 0;
+  int? get assignedBranchNum => nullableIntValue(data['branch_num']);
+  int get branchNum => assignedBranchNum ?? 0;
   String get role => data['role'] as String? ?? 'employee';
   String? get avatarUrl => data['avatar_url'] as String?;
   String? get phone => data['phone'] as String?;
@@ -174,6 +375,7 @@ class EmployeeSession {
   bool get canManageEmployees => data['can_manage_employees'] == true;
   bool get canManageAllBranches => data['can_manage_all_branches'] == true;
   bool get isAdmin => role == 'admin' || canManageAllBranches;
+  bool get isGeneralAdmin => role == 'admin' || canManageAllBranches;
   bool get isBranchManager => role == 'branch_manager';
 }
 
@@ -195,6 +397,7 @@ class EmployeeLite {
     required this.role,
     required this.isActive,
     this.avatarUrl,
+    this.canManageAllBranches = false,
   });
 
   final String id;
@@ -204,6 +407,9 @@ class EmployeeLite {
   final String role;
   final bool isActive;
   final String? avatarUrl;
+  final bool canManageAllBranches;
+
+  bool get isGeneralAdmin => role == 'admin' || canManageAllBranches;
 
   factory EmployeeLite.fromRow(Map<String, dynamic> row) {
     return EmployeeLite(
@@ -214,6 +420,7 @@ class EmployeeLite {
       role: row['role']?.toString() ?? 'employee',
       isActive: row['is_active'] != false,
       avatarUrl: row['avatar_url']?.toString(),
+      canManageAllBranches: row['can_manage_all_branches'] == true,
     );
   }
 
@@ -226,6 +433,7 @@ class EmployeeLite {
       role: session.role,
       isActive: true,
       avatarUrl: session.avatarUrl,
+      canManageAllBranches: session.canManageAllBranches,
     );
   }
 }
@@ -391,7 +599,7 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  final usernameController = TextEditingController(text: 'admin');
+  final usernameController = TextEditingController();
   bool loading = false;
   String? error;
 
@@ -414,12 +622,14 @@ class _LoginPageState extends State<LoginPage> {
         throw Exception('لم يتم العثور على موظف فعال بهذا الاسم');
       }
 
+      final session = EmployeeSession(Map<String, dynamic>.from(rows.first));
+      await EmployeeSessionStore.save(session);
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
           builder: (_) => Directionality(
             textDirection: TextDirection.rtl,
-            child: HomePage(initialSession: EmployeeSession(rows.first)),
+            child: HomePage(initialSession: session),
           ),
         ),
       );
@@ -533,9 +743,10 @@ class _LoginPageState extends State<LoginPage> {
 }
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key, required this.initialSession});
+  const HomePage({super.key, required this.initialSession, this.restoredSession = false});
 
   final EmployeeSession initialSession;
+  final bool restoredSession;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -548,6 +759,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   StreamSubscription<RemoteMessage>? openedMessages;
   StreamSubscription<Map<String, dynamic>>? pushyClicks;
   StreamSubscription<Map<String, dynamic>>? richNotificationClickSubscription;
+  StreamSubscription<String>? transferDeepLinkSubscription;
   Timer? notificationRegistrationTimer;
   Timer? inAppNotificationsTimer;
   Timer? unreadMessagesTimer;
@@ -557,12 +769,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   int unreadChatMessages = 0;
   final seenInAppNotificationIds = <String>{};
   DateTime inAppNotificationCursor = DateTime.now().toUtc();
+  bool notificationServicesInitialized = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     session = widget.initialSession;
+    unawaited(EmployeeSessionStore.save(session));
+    unawaited(touchEmployeePresence(session.id, online: true));
+    startInAppNotificationMonitor();
+    startUnreadMessagesMonitor();
+    if (kIsBetaBuild) {
+      transferDeepLinkSubscription = transferDeepLinks.stream.listen(openTransferDeepLink);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final orderId = pendingTransferOrderId;
+        if (mounted && orderId != null) unawaited(openTransferDeepLink(orderId));
+      });
+    }
+    unawaited(initializeHomeNotificationServices());
+    if (widget.restoredSession) unawaited(refreshRestoredSession());
+  }
+
+  Future<void> initializeHomeNotificationServices() async {
+    if (notificationServicesInitialized) return;
+    await initializeDeferredServices();
+    if (!mounted || !deferredServicesReady || notificationServicesInitialized) return;
+    notificationServicesInitialized = true;
     initializePushyNotifications();
     richNotificationClickSubscription = richNotificationClicks.stream.listen((data) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -570,10 +803,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       });
     });
     unawaited(RichNotificationService.emitPendingClick());
-    unawaited(touchEmployeePresence(session.id, online: true));
     startNotificationRegistrationMonitor();
-    startInAppNotificationMonitor();
-    startUnreadMessagesMonitor();
     foregroundMessages = FirebaseMessaging.onMessage.listen((message) {
       if (!mounted) return;
       if (message.data['sender_id'] == session.id) return;
@@ -634,6 +864,35 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }));
   }
 
+  Future<void> refreshRestoredSession() async {
+    try {
+      final rows = await supabase
+          .from('ansar_employees')
+          .select()
+          .eq('id', session.id)
+          .eq('is_active', true)
+          .limit(1);
+      if (!mounted) return;
+      if (rows.isEmpty) {
+        await logout();
+        return;
+      }
+      updateSession(EmployeeSession(Map<String, dynamic>.from(rows.first)));
+    } catch (_) {
+      // A saved session remains usable when the background account check cannot connect.
+    }
+  }
+
+  Future<void> openTransferDeepLink(String orderId) async {
+    if (!mounted || orderId.isEmpty) return;
+    pendingTransferOrderId = null;
+    await openNotificationData({
+      'type': 'transfer_link',
+      'route': 'transfer',
+      'order_id': orderId,
+    });
+  }
+
   void initializePushyNotifications() {
     initializePushyService();
     pushyClicks?.cancel();
@@ -686,7 +945,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void updateSession(EmployeeSession value) {
     setState(() => session = value);
-    startNotificationRegistrationMonitor();
+    unawaited(EmployeeSessionStore.save(value));
+    if (notificationServicesInitialized) startNotificationRegistrationMonitor();
     startInAppNotificationMonitor();
     startUnreadMessagesMonitor();
   }
@@ -801,6 +1061,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     openedMessages?.cancel();
     pushyClicks?.cancel();
     richNotificationClickSubscription?.cancel();
+    transferDeepLinkSubscription?.cancel();
     notificationRegistrationTimer?.cancel();
     inAppNotificationsTimer?.cancel();
     unreadMessagesTimer?.cancel();
@@ -812,9 +1073,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      startNotificationRegistrationMonitor();
+      if (notificationServicesInitialized) {
+        startNotificationRegistrationMonitor();
+        unawaited(RichNotificationService.retryPendingReplies());
+      } else {
+        unawaited(initializeHomeNotificationServices());
+      }
       startInAppNotificationMonitor();
-      unawaited(RichNotificationService.retryPendingReplies());
       unawaited(touchEmployeePresence(session.id, online: true));
       unawaited(refreshUnreadChatMessages());
     } else if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
@@ -877,8 +1142,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     } catch (_) {
       // Older installations continue to work until the additive device migration is applied.
     }
-    final preferences = await SharedPreferences.getInstance();
-    await preferences.remove('ansar_employee_id');
+    await EmployeeSessionStore.clear();
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(
@@ -1383,9 +1647,13 @@ class _DashboardPageState extends State<DashboardPage> {
     final branches = await loadAppBranchesMap();
     final employeeRows = await supabase
         .from('ansar_employees')
-        .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url')
+        .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url, can_manage_all_branches')
         .eq('is_active', true);
-    final employees = employeeRows.cast<Map<String, dynamic>>().map(EmployeeLite.fromRow).toList();
+    final employees = employeeRows
+        .cast<Map<String, dynamic>>()
+        .map(EmployeeLite.fromRow)
+        .where((employee) => !employee.isGeneralAdmin)
+        .toList();
     final employeeById = {for (final employee in employees) employee.id: employee};
     final employeeIds = employeeById.keys.toSet();
     Map<String, dynamic>? myOpenLog;
@@ -1470,7 +1738,9 @@ class _DashboardPageState extends State<DashboardPage> {
       activeNow: activeEmployees.length,
       checkedInToday: checkedInToday.length,
       openLog: myOpenLog,
-      branchName: branchLabel(branches, widget.session.branchNum),
+      branchName: widget.session.isGeneralAdmin
+          ? 'إدارة جميع الفروع'
+          : branchLabel(branches, widget.session.branchNum),
     );
   }
 
@@ -1619,10 +1889,13 @@ class _DashboardPageState extends State<DashboardPage> {
           }
 
           final data = snapshot.data!;
-          final isWorking = data.openLog != null;
+          final isGeneralAdmin = widget.session.isGeneralAdmin;
+          final isWorking = !isGeneralAdmin && data.openLog != null;
           final attendanceTitle = isWorking
               ? 'دوامك مستمر منذ ${attendanceDurationLabel(data.openLog!['check_in_at'] as String?)}'
-              : 'أنت خارج العمل الآن';
+              : isGeneralAdmin
+                  ? widget.session.name
+                  : 'أنت خارج العمل الآن';
           return ListView(
             key: const PageStorageKey('dashboard-list'),
             padding: pagePadding,
@@ -1652,11 +1925,15 @@ class _DashboardPageState extends State<DashboardPage> {
                                 const SizedBox(height: 7),
                                 Row(
                                   children: [
-                                    const Icon(Icons.location_on_outlined, size: 18, color: mutedInk),
+                                    Icon(
+                                      isGeneralAdmin ? Icons.account_balance_rounded : Icons.location_on_outlined,
+                                      size: 18,
+                                      color: mutedInk,
+                                    ),
                                     const SizedBox(width: 5),
                                     Expanded(
                                       child: Text(
-                                        'الفرع: ${data.branchName}',
+                                        isGeneralAdmin ? 'إدارة جميع الفروع' : 'الفرع: ${data.branchName}',
                                         style: const TextStyle(color: mutedInk),
                                       ),
                                     ),
@@ -1669,12 +1946,21 @@ class _DashboardPageState extends State<DashboardPage> {
                             width: 12,
                             height: 12,
                             decoration: BoxDecoration(
-                              color: isWorking ? successColor : dangerColor,
+                              color: isGeneralAdmin
+                                  ? accentColor
+                                  : isWorking
+                                      ? successColor
+                                      : dangerColor,
                               shape: BoxShape.circle,
                               border: Border.all(color: panelSurface, width: 2),
                               boxShadow: [
                                 BoxShadow(
-                                  color: (isWorking ? successColor : dangerColor).withValues(alpha: 0.18),
+                                  color: (isGeneralAdmin
+                                          ? accentColor
+                                          : isWorking
+                                              ? successColor
+                                              : dangerColor)
+                                      .withValues(alpha: 0.18),
                                   blurRadius: 0,
                                   spreadRadius: 5,
                                 ),
@@ -1683,10 +1969,11 @@ class _DashboardPageState extends State<DashboardPage> {
                           ),
                         ],
                       ),
-                      const SizedBox(height: 18),
-                      const Divider(),
-                      const SizedBox(height: 16),
-                      FilledButton.icon(
+                      if (!isGeneralAdmin) ...[
+                        const SizedBox(height: 18),
+                        const Divider(),
+                        const SizedBox(height: 16),
+                        FilledButton.icon(
                         style: FilledButton.styleFrom(
                           backgroundColor: isWorking ? dangerColor : brandColor,
                           foregroundColor: Colors.white,
@@ -1712,7 +1999,8 @@ class _DashboardPageState extends State<DashboardPage> {
                                   ? 'تسجيل خروج'
                                   : 'تسجيل دخول',
                         ),
-                      ),
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -2299,7 +2587,7 @@ class _BranchTodayPageState extends State<BranchTodayPage> {
     final nextDay = dayStart.add(const Duration(days: 1));
     final employeeRows = await supabase
         .from('ansar_employees')
-        .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url');
+        .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url, can_manage_all_branches');
     final employees = employeeRows.cast<Map<String, dynamic>>().map(EmployeeLite.fromRow).toList();
     final employeesById = {for (final employee in employees) employee.id: employee};
 
@@ -2328,6 +2616,7 @@ class _BranchTodayPageState extends State<BranchTodayPage> {
       final rawCheckIn = row['check_in_at'] as String?;
       if (employeeId == null || rawCheckIn == null) continue;
       final knownEmployee = employeesById[employeeId];
+      if (knownEmployee?.isGeneralAdmin == true) continue;
       final branchNum = (row['branch_num'] as num?)?.toInt() ?? knownEmployee?.branchNum ?? 0;
       if (branchNum != widget.branch.branchNum) continue;
       final checkIn = DateTime.tryParse(rawCheckIn)?.toLocal();
@@ -2815,6 +3104,7 @@ class _ReportsPageState extends State<ReportsPage> {
   Future<ReportData> loadReports() async {
     final branches = await loadAppBranchesMap();
     var employees = await loadEmployeesForScope(widget.session, includeInactive: false);
+    employees = employees.where((employee) => !employee.isGeneralAdmin).toList();
     if (selectedBranch != null) {
       employees = employees.where((employee) => employee.branchNum == selectedBranch).toList();
     }
@@ -3531,6 +3821,17 @@ class _QueriesPageState extends State<QueriesPage> {
     );
   }
 
+  Future<void> openAccountInvoices() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => const Directionality(
+          textDirection: TextDirection.rtl,
+          child: AccountInvoicesPage(),
+        ),
+      ),
+    );
+  }
+
   Future<void> pickQueryDate(TextEditingController controller) async {
     final initial = DateTime.tryParse(controller.text) ?? DateTime.now();
     final selected = await showDatePicker(
@@ -3673,6 +3974,12 @@ class _QueriesPageState extends State<QueriesPage> {
                 future = runDailySales();
               });
             },
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            onPressed: openAccountInvoices,
+            icon: const Icon(Icons.manage_accounts_rounded),
+            label: const Text('فواتير مورد أو زبون'),
           ),
         ],
         if (queryMode == 2 || queryMode == 3) ...[
@@ -3884,7 +4191,7 @@ class SalesDailySummary extends StatelessWidget {
           const Text('إجمالي المبيعات', style: TextStyle(color: Colors.white70, fontSize: 12)),
           const SizedBox(height: 3),
           Text(
-            formatMoneyValue(total),
+            '\$ ${formatMoneyValue(total)}',
             style: const TextStyle(color: Colors.white, fontSize: 27, fontWeight: FontWeight.w900),
           ),
           const SizedBox(height: 13),
@@ -3943,6 +4250,7 @@ class SalesBillTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final payment = paymentLabelFromRemark(bill['remark']);
+    final isPurchase = nullableIntValue(bill['kind']) == 1;
     return Material(
       color: panelSurface,
       child: InkWell(
@@ -3969,7 +4277,7 @@ class SalesBillTile extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'فاتورة ${bill['bnum']} · ${salesBookName(bill['book'])}',
+                      '${isPurchase ? 'فاتورة شراء' : 'فاتورة مبيع'} ${bill['bnum']} · ${salesBookName(bill['book'])}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(fontWeight: FontWeight.w900),
@@ -3989,7 +4297,7 @@ class SalesBillTile extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
                   Text(
-                    formatMoneyValue(bill['totalvalue']),
+                    '\$ ${formatMoneyValue(bill['totalvalue'])}',
                     style: const TextStyle(color: brandColor, fontWeight: FontWeight.w900, fontSize: 14),
                   ),
                   const SizedBox(height: 4),
@@ -4182,6 +4490,407 @@ class _AccountStatementPageState extends State<AccountStatementPage> {
   }
 }
 
+class AccountInvoicesPage extends StatefulWidget {
+  const AccountInvoicesPage({super.key});
+
+  @override
+  State<AccountInvoicesPage> createState() => _AccountInvoicesPageState();
+}
+
+class _AccountInvoicesPageState extends State<AccountInvoicesPage> {
+  final accountSearch = TextEditingController();
+  late final TextEditingController startDate;
+  late final TextEditingController endDate;
+  Timer? debounce;
+  List<Map<String, dynamic>> suggestions = [];
+  Map<String, dynamic>? selectedAccount;
+  Future<List<Map<String, dynamic>>>? future;
+  String period = 'month';
+  String kind = 'all';
+  String payment = 'all';
+  bool searching = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final today = DateTime.now();
+    startDate = TextEditingController(text: formatDateKey(DateTime(today.year, today.month, 1)));
+    endDate = TextEditingController(text: formatDateKey(today));
+  }
+
+  @override
+  void dispose() {
+    debounce?.cancel();
+    accountSearch.dispose();
+    startDate.dispose();
+    endDate.dispose();
+    super.dispose();
+  }
+
+  void queueAccountSearch(String value) {
+    debounce?.cancel();
+    final query = value.trim();
+    if (query.isEmpty) {
+      setState(() => suggestions = []);
+      return;
+    }
+    debounce = Timer(const Duration(milliseconds: 260), () => searchAccounts(query));
+  }
+
+  Future<void> searchAccounts(String value) async {
+    setState(() => searching = true);
+    try {
+      final normalized = normalizeSearch(value);
+      final words = normalized.split(' ').where((word) => word.isNotEmpty).toList();
+      final numeric = int.tryParse(value);
+      final accounts = await loadAccountsCached();
+      final matches = accounts.where((account) {
+        final number = '${account['num'] ?? ''}';
+        final name = normalizeSearch(account['name']?.toString() ?? '');
+        if (numeric != null) return number.contains(value);
+        return words.every(name.contains);
+      }).toList()
+        ..sort((a, b) {
+          final aName = normalizeSearch(a['name']?.toString() ?? '');
+          final bName = normalizeSearch(b['name']?.toString() ?? '');
+          final aScore = aName == normalized
+              ? 0
+              : aName.startsWith(normalized)
+                  ? 1
+                  : 2;
+          final bScore = bName == normalized
+              ? 0
+              : bName.startsWith(normalized)
+                  ? 1
+                  : 2;
+          if (aScore != bScore) return aScore.compareTo(bScore);
+          return aName.compareTo(bName);
+        });
+      if (mounted && accountSearch.text.trim() == value) {
+        setState(() {
+          suggestions = matches.take(30).toList();
+          searching = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => searching = false);
+    }
+  }
+
+  void chooseAccount(Map<String, dynamic> account) {
+    setState(() {
+      selectedAccount = account;
+      accountSearch.text = account['name']?.toString() ?? '${account['num']}';
+      suggestions = [];
+      future = loadBills();
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> loadBills() async {
+    final account = selectedAccount;
+    if (account == null) return [];
+    dynamic query = supabase
+        .from('bills_full')
+        .select('book, bnum, date, accnum, totalvalue, remark, kind')
+        .eq('accnum', account['num'])
+        .gte('date', startDate.text)
+        .lte('date', endDate.text);
+    if (kind != 'all') query = query.eq('kind', int.parse(kind));
+    final rows = await query.order('date', ascending: false).order('bnum', ascending: false).limit(300);
+    return rows.cast<Map<String, dynamic>>().where((bill) {
+      final info = paymentLabelFromRemark(bill['remark']);
+      if (payment == 'cash') return info.isCash;
+      if (payment == 'credit') return !info.isCash && info.text == 'آجل';
+      return true;
+    }).map((bill) => {...bill, 'account_name': account['name']}).toList();
+  }
+
+  void reload() {
+    if (selectedAccount == null) return;
+    setState(() => future = loadBills());
+  }
+
+  void applyPeriod(String value) {
+    final today = DateTime.now();
+    DateTime start = today;
+    DateTime end = today;
+    if (value == 'yesterday') {
+      start = today.subtract(const Duration(days: 1));
+      end = start;
+    } else if (value == 'week') {
+      start = today.subtract(const Duration(days: 6));
+    } else if (value == 'month') {
+      start = DateTime(today.year, today.month, 1);
+    }
+    setState(() {
+      period = value;
+      startDate.text = formatDateKey(start);
+      endDate.text = formatDateKey(end);
+      if (selectedAccount != null) future = loadBills();
+    });
+  }
+
+  Future<void> pickDate(TextEditingController controller) async {
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: DateTime.tryParse(controller.text) ?? DateTime.now(),
+      firstDate: DateTime(2020),
+      lastDate: DateTime.now().add(const Duration(days: 1)),
+    );
+    if (picked == null || !mounted) return;
+    setState(() {
+      period = 'custom';
+      controller.text = formatDateKey(picked);
+      if (selectedAccount != null) future = loadBills();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const periods = [
+      ('today', 'اليوم'),
+      ('yesterday', 'الأمس'),
+      ('week', 'الأسبوع'),
+      ('month', 'الشهر'),
+    ];
+    return Scaffold(
+      appBar: AppBar(title: const Text('فواتير مورد أو زبون')),
+      body: ListView(
+        padding: pagePadding,
+        children: [
+          const AnsarPageHeader(
+            title: 'فواتير الحساب',
+            subtitle: 'مبيعات ومشتريات حساب محدد ضمن الفترة التي تختارها',
+            icon: Icons.manage_accounts_rounded,
+          ),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  TextField(
+                    controller: accountSearch,
+                    decoration: InputDecoration(
+                      labelText: 'المورد أو الزبون',
+                      hintText: 'اكتب الاسم أو رقم الحساب',
+                      prefixIcon: const Icon(Icons.search_rounded),
+                      suffixIcon: searching
+                          ? const Padding(
+                              padding: EdgeInsets.all(13),
+                              child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                            )
+                          : null,
+                    ),
+                    onChanged: (value) {
+                      selectedAccount = null;
+                      future = null;
+                      queueAccountSearch(value);
+                    },
+                  ),
+                  if (suggestions.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Container(
+                      constraints: const BoxConstraints(maxHeight: 260),
+                      decoration: BoxDecoration(
+                        color: softSurface,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: borderColor),
+                      ),
+                      child: ListView.separated(
+                        shrinkWrap: true,
+                        itemCount: suggestions.length,
+                        separatorBuilder: (_, __) => const Divider(height: 1),
+                        itemBuilder: (context, index) {
+                          final account = suggestions[index];
+                          return ListTile(
+                            leading: const Icon(Icons.account_circle_outlined, color: brandColor),
+                            title: Text(account['name']?.toString() ?? 'حساب'),
+                            subtitle: Text('رقم ${account['num']}'),
+                            onTap: () => chooseAccount(account),
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          if (selectedAccount != null) ...[
+            const SizedBox(height: 10),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(selectedAccount!['name']?.toString() ?? 'حساب', style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 17)),
+                    Text('رقم الحساب ${selectedAccount!['num']}', style: const TextStyle(color: mutedInk)),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 7,
+                      runSpacing: 7,
+                      children: periods
+                          .map((item) => ChoiceChip(
+                                selected: period == item.$1,
+                                label: Text(item.$2),
+                                onSelected: (_) => applyPeriod(item.$1),
+                              ))
+                          .toList(),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: startDate,
+                            readOnly: true,
+                            onTap: () => pickDate(startDate),
+                            decoration: const InputDecoration(labelText: 'من تاريخ', prefixIcon: Icon(Icons.calendar_today_outlined)),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: TextField(
+                            controller: endDate,
+                            readOnly: true,
+                            onTap: () => pickDate(endDate),
+                            decoration: const InputDecoration(labelText: 'إلى تاريخ', prefixIcon: Icon(Icons.event_available_outlined)),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: DropdownButtonFormField<String>(
+                            initialValue: kind,
+                            decoration: const InputDecoration(labelText: 'نوع الفاتورة'),
+                            items: const [
+                              DropdownMenuItem(value: 'all', child: Text('الكل')),
+                              DropdownMenuItem(value: '0', child: Text('مبيع')),
+                              DropdownMenuItem(value: '1', child: Text('شراء')),
+                            ],
+                            onChanged: (value) {
+                              kind = value ?? 'all';
+                              reload();
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: DropdownButtonFormField<String>(
+                            initialValue: payment,
+                            decoration: const InputDecoration(labelText: 'الدفع'),
+                            items: const [
+                              DropdownMenuItem(value: 'all', child: Text('الكل')),
+                              DropdownMenuItem(value: 'cash', child: Text('نقداً')),
+                              DropdownMenuItem(value: 'credit', child: Text('آجل')),
+                            ],
+                            onChanged: (value) {
+                              payment = value ?? 'all';
+                              reload();
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (future != null)
+              FutureBuilder<List<Map<String, dynamic>>>(
+                future: future,
+                builder: (context, snapshot) {
+                  if (snapshot.connectionState != ConnectionState.done) return const AnsarSkeleton(rows: 4);
+                  if (snapshot.hasError) return ErrorState(message: cleanError(snapshot.error), onRetry: reload);
+                  final bills = snapshot.data ?? [];
+                  if (bills.isEmpty) return const EmptyState(icon: Icons.receipt_long_outlined, text: 'لا توجد فواتير ضمن هذه الفترة');
+                  final total = bills.fold<double>(0, (sum, bill) => sum + doubleValue(bill['totalvalue']));
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(child: AccountInvoiceMetric(label: 'الفواتير', value: '${bills.length}', icon: Icons.receipt_long_rounded)),
+                          const SizedBox(width: 7),
+                          Expanded(child: AccountInvoiceMetric(label: 'الإجمالي', value: '\$ ${formatMoneyValue(total)}', icon: Icons.summarize_rounded)),
+                          const SizedBox(width: 7),
+                          Expanded(child: AccountInvoiceMetric(label: 'المتوسط', value: '\$ ${formatMoneyValue(total / bills.length)}', icon: Icons.analytics_outlined)),
+                        ],
+                      ),
+                      const SizedBox(height: 14),
+                      Container(
+                        clipBehavior: Clip.antiAlias,
+                        decoration: BoxDecoration(
+                          color: panelSurface,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: borderColor),
+                        ),
+                        child: Column(
+                          children: [
+                            for (var i = 0; i < bills.length; i++) ...[
+                              SalesBillTile(
+                                bill: bills[i],
+                                onTap: () => Navigator.of(context).push(
+                                  MaterialPageRoute(
+                                    builder: (_) => Directionality(
+                                      textDirection: TextDirection.rtl,
+                                      child: SalesBillDetailsPage(bill: bills[i]),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              if (i != bills.length - 1) const Divider(indent: 68, height: 1),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class AccountInvoiceMetric extends StatelessWidget {
+  const AccountInvoiceMetric({super.key, required this.label, required this.value, required this.icon});
+
+  final String label;
+  final String value;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      constraints: const BoxConstraints(minHeight: 86),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: softSurface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: borderColor),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(icon, size: 20, color: brandColor),
+          const SizedBox(height: 5),
+          Text(value, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 12)),
+          Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: mutedInk, fontSize: 10)),
+        ],
+      ),
+    );
+  }
+}
+
 class SalesBillDetailsPage extends StatefulWidget {
   const SalesBillDetailsPage({super.key, required this.bill});
 
@@ -4193,6 +4902,7 @@ class SalesBillDetailsPage extends StatefulWidget {
 
 class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
   late Future<SalesBillDetailsData> future;
+  bool pdfBusy = false;
 
   @override
   void initState() {
@@ -4206,7 +4916,7 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
         .select('item, matnum, quantity, price, value, remarki')
         .eq('book', widget.bill['book'])
         .eq('bnum', widget.bill['bnum'])
-        .eq('kind', 0)
+        .eq('kind', nullableIntValue(widget.bill['kind']) ?? 0)
         .order('item', ascending: true);
     final items = rows.cast<Map<String, dynamic>>();
     final matNums = items.map((row) => nullableIntValue(row['matnum'])).whereType<int>().toSet().toList();
@@ -4225,10 +4935,221 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
     );
   }
 
+  String get invoiceFileName {
+    final kind = nullableIntValue(widget.bill['kind']) == 1 ? 'purchase' : 'sale';
+    final book = '${widget.bill['book'] ?? 'book'}'.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '-');
+    final number = '${widget.bill['bnum'] ?? 'invoice'}'.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '-');
+    return 'ansar-$kind-$book-$number.pdf';
+  }
+
+  Future<void> printInvoice(SalesBillDetailsData data) async {
+    setState(() => pdfBusy = true);
+    try {
+      await Printing.layoutPdf(
+        name: invoiceFileName,
+        onLayout: (_) => buildInvoicePdf(data),
+      );
+    } catch (error) {
+      if (mounted) showSnack(context, 'تعذر طباعة الفاتورة. ${cleanError(error)}');
+    } finally {
+      if (mounted) setState(() => pdfBusy = false);
+    }
+  }
+
+  Future<void> shareInvoice(SalesBillDetailsData data) async {
+    setState(() => pdfBusy = true);
+    try {
+      final bytes = await buildInvoicePdf(data);
+      await Printing.sharePdf(bytes: bytes, filename: invoiceFileName);
+    } catch (error) {
+      if (mounted) showSnack(context, 'تعذر مشاركة الفاتورة. ${cleanError(error)}');
+    } finally {
+      if (mounted) setState(() => pdfBusy = false);
+    }
+  }
+
+  Future<Uint8List> buildInvoicePdf(SalesBillDetailsData data) async {
+    final fontBytes = await rootBundle.load('assets/fonts/Amiri-Regular.ttf');
+    final logoBytes = await rootBundle.load('assets/logo.png');
+    final font = pw.Font.ttf(fontBytes);
+    final logo = pw.MemoryImage(
+      logoBytes.buffer.asUint8List(logoBytes.offsetInBytes, logoBytes.lengthInBytes),
+    );
+    final document = pw.Document(theme: pw.ThemeData.withFont(base: font, bold: font));
+    final isPurchase = nullableIntValue(widget.bill['kind']) == 1;
+    final total = doubleValue(widget.bill['totalvalue']);
+    final gross = data.items.fold<double>(
+      0,
+      (sum, item) => sum + doubleValue(item['quantity']) * doubleValue(item['price']),
+    );
+    final discount = gross > total && gross > 0 ? gross - total : 0.0;
+    final payment = paymentLabelFromRemark(widget.bill['remark']);
+    final stoNum = parseStoNum(widget.bill['remark']);
+    final branchName = stoNum == null ? salesBookName(widget.bill['book']) : branchLabel(data.branches, stoNum);
+    final itemRows = data.items.asMap().entries.map((entry) {
+      final item = entry.value;
+      final quantity = doubleValue(item['quantity']);
+      final price = doubleValue(item['price']);
+      final value = doubleValue(item['value']);
+      final productName = item['product_name']?.toString();
+      final discountPercent = invoiceItemDiscountPercent(item);
+      final netUnit = quantity == 0 ? 0 : value / quantity;
+      return [
+        '${entry.key + 1}',
+        productName == null || productName.isEmpty ? 'مادة ${item['matnum'] ?? '-'}' : productName,
+        formatMoneyValue(quantity),
+        '\$ ${formatMoneyValue(price)}',
+        discountPercent <= 0 ? '-' : '${formatMoneyValue(discountPercent)}%',
+        '\$ ${formatMoneyValue(netUnit)}',
+        '\$ ${formatMoneyValue(value)}',
+      ];
+    }).toList();
+
+    document.addPage(
+      pw.MultiPage(
+        textDirection: pw.TextDirection.rtl,
+        pageTheme: pw.PageTheme(
+          pageFormat: PdfPageFormat.a4,
+          margin: const pw.EdgeInsets.fromLTRB(28, 26, 28, 30),
+        ),
+        footer: (context) => pw.Align(
+          alignment: pw.Alignment.centerLeft,
+          child: pw.Text(
+            'صفحة ${context.pageNumber} من ${context.pagesCount}',
+            style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey600),
+          ),
+        ),
+        build: (context) => [
+          pw.Row(
+            crossAxisAlignment: pw.CrossAxisAlignment.center,
+            children: [
+              pw.Container(
+                width: 58,
+                height: 58,
+                padding: const pw.EdgeInsets.all(4),
+                decoration: pw.BoxDecoration(
+                  border: pw.Border.all(color: PdfColors.grey300),
+                  borderRadius: pw.BorderRadius.circular(6),
+                ),
+                child: pw.Image(logo, fit: pw.BoxFit.contain),
+              ),
+              pw.SizedBox(width: 12),
+              pw.Expanded(
+                child: pw.Column(
+                  crossAxisAlignment: pw.CrossAxisAlignment.start,
+                  children: [
+                    pw.Text('مكتبة الأنصار', style: pw.TextStyle(fontSize: 27, fontWeight: pw.FontWeight.bold)),
+                    pw.Text(branchName, style: pw.TextStyle(fontSize: 13, color: const PdfColor.fromInt(0xffc43c2f))),
+                  ],
+                ),
+              ),
+              pw.Container(
+                padding: const pw.EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                decoration: pw.BoxDecoration(
+                  color: const PdfColor.fromInt(0xffe7f4f1),
+                  borderRadius: pw.BorderRadius.circular(5),
+                ),
+                child: pw.Text(
+                  isPurchase ? 'فاتورة شراء' : 'فاتورة مبيع',
+                  style: pw.TextStyle(fontSize: 16, fontWeight: pw.FontWeight.bold, color: const PdfColor.fromInt(0xff087568)),
+                ),
+              ),
+            ],
+          ),
+          pw.SizedBox(height: 14),
+          pw.Container(
+            padding: const pw.EdgeInsets.all(10),
+            decoration: pw.BoxDecoration(
+              color: PdfColors.grey100,
+              border: pw.Border.all(color: PdfColors.grey300),
+              borderRadius: pw.BorderRadius.circular(5),
+            ),
+            child: pw.Wrap(
+              spacing: 24,
+              runSpacing: 7,
+              children: [
+                pw.Text('الحساب: ${widget.bill['account_name'] ?? 'حساب ${widget.bill['accnum'] ?? '-'}'}'),
+                pw.Text('الدفع: ${payment.text}'),
+                pw.Text('التاريخ: ${widget.bill['date'] ?? '-'}'),
+                pw.Text('رقم الفاتورة: ${widget.bill['bnum'] ?? '-'}', style: pw.TextStyle(color: const PdfColor.fromInt(0xffc43c2f))),
+              ],
+            ),
+          ),
+          pw.SizedBox(height: 14),
+          pw.TableHelper.fromTextArray(
+            headers: const ['#', 'البيان', 'الكمية', 'السعر', 'الحسم %', 'صافي سعر الوحدة', 'الإجمالي'],
+            data: itemRows,
+            headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white, fontSize: 10),
+            headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
+            oddRowDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xfff4f8f7)),
+            cellStyle: const pw.TextStyle(fontSize: 9),
+            cellPadding: const pw.EdgeInsets.symmetric(horizontal: 5, vertical: 7),
+            cellAlignment: pw.Alignment.centerRight,
+            headerAlignment: pw.Alignment.centerRight,
+            border: pw.TableBorder.all(color: PdfColors.grey300, width: 0.6),
+            columnWidths: const {
+              0: pw.FixedColumnWidth(24),
+              1: pw.FlexColumnWidth(4),
+              2: pw.FlexColumnWidth(1.2),
+              3: pw.FlexColumnWidth(1.5),
+              4: pw.FlexColumnWidth(1.2),
+              5: pw.FlexColumnWidth(1.8),
+              6: pw.FlexColumnWidth(1.7),
+            },
+          ),
+          pw.SizedBox(height: 14),
+          pw.Align(
+            alignment: pw.Alignment.centerLeft,
+            child: pw.Container(
+              width: 245,
+              padding: const pw.EdgeInsets.all(10),
+              decoration: pw.BoxDecoration(
+                border: pw.Border.all(color: PdfColors.grey300),
+                borderRadius: pw.BorderRadius.circular(5),
+              ),
+              child: pw.Column(
+                children: [
+                  pdfTotalLine('الإجمالي قبل الحسم', '\$ ${formatMoneyValue(gross)}'),
+                  if (discount > 0) ...[
+                    pw.SizedBox(height: 5),
+                    pdfTotalLine('الحسم', '- \$ ${formatMoneyValue(discount)}', color: const PdfColor.fromInt(0xffd98218)),
+                  ],
+                  pw.Divider(color: PdfColors.grey300),
+                  pdfTotalLine(
+                    'صافي الفاتورة',
+                    '\$ ${formatMoneyValue(total)}',
+                    color: const PdfColor.fromInt(0xff087568),
+                    bold: true,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          pw.SizedBox(height: 12),
+          pw.Container(
+            width: double.infinity,
+            padding: const pw.EdgeInsets.all(10),
+            decoration: pw.BoxDecoration(
+              color: const PdfColor.fromInt(0xffeef5fb),
+              borderRadius: pw.BorderRadius.circular(5),
+            ),
+            child: pw.Text(
+              arabicUsdAmountInWords(total),
+              textAlign: pw.TextAlign.center,
+              style: pw.TextStyle(color: const PdfColor.fromInt(0xff1d5d8f), fontWeight: pw.FontWeight.bold, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+    return document.save();
+  }
+
   @override
   Widget build(BuildContext context) {
+    final isPurchase = nullableIntValue(widget.bill['kind']) == 1;
     return Scaffold(
-      appBar: AppBar(title: Text('فاتورة ${widget.bill['bnum']}')),
+      appBar: AppBar(title: Text('${isPurchase ? 'فاتورة شراء' : 'فاتورة مبيع'} ${widget.bill['bnum']}')),
       body: FutureBuilder<SalesBillDetailsData>(
         future: future,
         builder: (context, snapshot) {
@@ -4273,7 +5194,10 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Text('فاتورة ${widget.bill['bnum']}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 17)),
+                                Text(
+                                  '${isPurchase ? 'فاتورة شراء' : 'فاتورة مبيع'} ${widget.bill['bnum']}',
+                                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 17),
+                                ),
                                 Text('${widget.bill['account_name'] ?? 'حساب ${widget.bill['accnum']}'}'),
                               ],
                             ),
@@ -4292,8 +5216,13 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
                           InfoChip(icon: Icons.storefront_rounded, label: salesBookName(widget.bill['book'])),
                           InfoChip(icon: Icons.warehouse_rounded, label: stoNum == null ? 'مستودع غير محدد' : branchLabel(data.branches, stoNum)),
                           InfoChip(icon: Icons.calendar_month_rounded, label: '${widget.bill['date']}'),
-                          InfoChip(icon: Icons.summarize_rounded, label: 'الإجمالي ${formatMoneyValue(total)}'),
-                          if (discount > 0) InfoChip(icon: Icons.percent_rounded, label: 'حسم ${formatMoneyValue(discount)}'),
+                          InfoChip(icon: Icons.summarize_rounded, label: 'الإجمالي \$ ${formatMoneyValue(total)}'),
+                          if (discount > 0)
+                            InfoChip(
+                              icon: Icons.percent_rounded,
+                              label: 'حسم \$ ${formatMoneyValue(discount)}',
+                              color: accentColor,
+                            ),
                         ],
                       ),
                     ],
@@ -4307,6 +5236,33 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
                 InvoiceItemsTable(items: items, branches: data.branches),
               const SizedBox(height: 12),
               InvoiceTotals(gross: gross, discount: discount, total: total),
+              const SizedBox(height: 10),
+              AnsarInlineNotice(
+                icon: Icons.text_fields_rounded,
+                message: arabicUsdAmountInWords(total),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: pdfBusy ? null : () => printInvoice(data),
+                      icon: const Icon(Icons.print_rounded),
+                      label: const Text('طباعة PDF'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: pdfBusy ? null : () => shareInvoice(data),
+                      icon: pdfBusy
+                          ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                          : const Icon(Icons.share_rounded),
+                      label: const Text('مشاركة PDF'),
+                    ),
+                  ),
+                ],
+              ),
             ],
           );
         },
@@ -4398,9 +5354,9 @@ class InvoiceTableRow extends StatelessWidget {
       name: '$index. ${productName == null || productName.isEmpty ? 'مادة ${item['matnum']}' : productName}',
       subtitle: branchName == null ? 'رقم ${item['matnum'] ?? '-'}' : 'رقم ${item['matnum'] ?? '-'} · $branchName',
       quantity: formatMoneyValue(item['quantity']),
-      price: formatMoneyValue(item['price']),
       discount: discountDisplay(item),
-      total: formatMoneyValue(item['value']),
+      price: '\$ ${formatMoneyValue(item['price'])}',
+      total: '\$ ${formatMoneyValue(item['value'])}',
       shaded: shaded,
     );
   }
@@ -4452,7 +5408,12 @@ class InvoiceTableRow extends StatelessWidget {
           ),
           InvoiceValueCell(value: quantity, flex: 2, header: header),
           InvoiceValueCell(value: price, flex: 3, header: header),
-          InvoiceValueCell(value: discount, flex: 2, header: header),
+          InvoiceValueCell(
+            value: discount,
+            flex: 2,
+            header: header,
+            color: !header && discount != '-' ? accentColor : null,
+          ),
           InvoiceValueCell(value: total, flex: 3, header: header, strong: !header),
         ],
       ),
@@ -4467,12 +5428,14 @@ class InvoiceValueCell extends StatelessWidget {
     required this.flex,
     required this.header,
     this.strong = false,
+    this.color,
   });
 
   final String value;
   final int flex;
   final bool header;
   final bool strong;
+  final Color? color;
 
   @override
   Widget build(BuildContext context) {
@@ -4486,7 +5449,7 @@ class InvoiceValueCell extends StatelessWidget {
           overflow: TextOverflow.ellipsis,
           textAlign: TextAlign.center,
           style: TextStyle(
-            color: header ? Colors.white : strong ? brandColor : inkColor,
+            color: header ? Colors.white : color ?? (strong ? brandColor : inkColor),
             fontSize: header ? 9 : 10,
             fontWeight: header || strong ? FontWeight.w900 : FontWeight.w600,
           ),
@@ -4517,13 +5480,13 @@ class InvoiceTotals extends StatelessWidget {
         ),
         child: Column(
           children: [
-            InvoiceTotalLine(label: 'الإجمالي قبل الحسم', value: formatMoneyValue(gross)),
+            InvoiceTotalLine(label: 'الإجمالي قبل الحسم', value: '\$ ${formatMoneyValue(gross)}'),
             if (discount > 0) ...[
               const SizedBox(height: 6),
-              InvoiceTotalLine(label: 'الحسم', value: '- ${formatMoneyValue(discount)}', color: dangerColor),
+              InvoiceTotalLine(label: 'الحسم', value: '- \$ ${formatMoneyValue(discount)}', color: accentColor),
             ],
             const Divider(height: 18),
-            InvoiceTotalLine(label: 'صافي الفاتورة', value: formatMoneyValue(total), color: brandColor, strong: true),
+            InvoiceTotalLine(label: 'صافي الفاتورة', value: '\$ ${formatMoneyValue(total)}', color: brandColor, strong: true),
           ],
         ),
       ),
@@ -4850,16 +5813,24 @@ class PriceChip extends StatelessWidget {
 }
 
 class InfoChip extends StatelessWidget {
-  const InfoChip({super.key, required this.icon, required this.label});
+  const InfoChip({super.key, required this.icon, required this.label, this.color});
 
   final IconData icon;
   final String label;
+  final Color? color;
 
   @override
   Widget build(BuildContext context) {
     return Chip(
-      avatar: Icon(icon, size: 16),
-      label: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
+      avatar: Icon(icon, size: 16, color: color),
+      label: Text(
+        label,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: color == null ? null : TextStyle(color: color, fontWeight: FontWeight.w700),
+      ),
+      backgroundColor: color?.withValues(alpha: 0.09),
+      side: color == null ? null : BorderSide(color: color!.withValues(alpha: 0.22)),
       materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
     );
   }
@@ -4974,10 +5945,6 @@ class _EmployeesPageState extends State<EmployeesPage> {
     required Map<int, BranchOption> branches,
     Map<String, dynamic>? employee,
   }) async {
-    if (branches.isEmpty) {
-      showSnack(context, 'أضف فرعا أولا من تبويب الفروع');
-      return;
-    }
     final result = await showDialog<Map<String, dynamic>>(
       context: context,
       builder: (_) => EmployeeDialog(branches: branches, employee: employee),
@@ -5055,13 +6022,18 @@ class _EmployeesPageState extends State<EmployeesPage> {
               final employee = data.employees[i];
               final branchNum = (employee['branch_num'] as num?)?.toInt() ?? 0;
               final active = employee['is_active'] != false;
+              final generalAdmin = employee['role'] == 'admin' || employee['can_manage_all_branches'] == true;
               return ListTile(
                 leading: EmployeeAvatar(
                   name: employee['display_name'] ?? employee['full_name'] ?? '',
                   imageUrl: employee['avatar_url'] as String?,
                 ),
                 title: Text(employee['display_name'] ?? employee['full_name'] ?? ''),
-                subtitle: Text('${branchLabel(data.branches, branchNum)} · ${roleLabel(employee['role']?.toString() ?? 'employee')}'),
+                subtitle: Text(
+                  generalAdmin
+                      ? 'إدارة جميع الفروع · مدير عام'
+                      : '${branchLabel(data.branches, branchNum)} · ${roleLabel(employee['role']?.toString() ?? 'employee')}',
+                ),
                 trailing: PopupMenuButton<String>(
                   onSelected: employeeBusy ? null : (value) {
                     if (value == 'edit') {
@@ -5131,7 +6103,9 @@ class _EmployeeDialogState extends State<EmployeeDialog> {
       phone.text = employee['phone'] as String? ?? '';
       email.text = employee['email'] as String? ?? '';
       jobTitle.text = employee['job_title'] as String? ?? '';
-      role = employee['role'] as String? ?? 'employee';
+      role = employee['can_manage_all_branches'] == true
+          ? 'admin'
+          : employee['role'] as String? ?? 'employee';
       branchNum = (employee['branch_num'] as num?)?.toInt();
     } else if (widget.branches.isNotEmpty) {
       branchNum = widget.branches.keys.first;
@@ -5140,6 +6114,7 @@ class _EmployeeDialogState extends State<EmployeeDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final isGeneralAdmin = role == 'admin';
     return AlertDialog(
       title: Text(widget.employee == null ? 'إضافة موظف' : 'تعديل موظف'),
       content: SingleChildScrollView(
@@ -5151,14 +6126,6 @@ class _EmployeeDialogState extends State<EmployeeDialog> {
             TextField(controller: jobTitle, decoration: const InputDecoration(labelText: 'المسمى الوظيفي')),
             TextField(controller: phone, decoration: const InputDecoration(labelText: 'الهاتف')),
             TextField(controller: email, decoration: const InputDecoration(labelText: 'البريد')),
-            DropdownButtonFormField<int>(
-              initialValue: branchNum,
-              decoration: const InputDecoration(labelText: 'الفرع'),
-              items: widget.branches.values
-                  .map((branch) => DropdownMenuItem(value: branch.number, child: Text(branch.label)))
-                  .toList(),
-              onChanged: (value) => setState(() => branchNum = value),
-            ),
             DropdownButtonFormField<String>(
               initialValue: role,
               decoration: const InputDecoration(labelText: 'الصلاحية'),
@@ -5167,15 +6134,38 @@ class _EmployeeDialogState extends State<EmployeeDialog> {
                 DropdownMenuItem(value: 'branch_manager', child: Text('مدير فرع')),
                 DropdownMenuItem(value: 'admin', child: Text('مدير عام')),
               ],
-              onChanged: (value) => setState(() => role = value ?? 'employee'),
+              onChanged: (value) {
+                setState(() {
+                  role = value ?? 'employee';
+                  if (role == 'admin') {
+                    branchNum = null;
+                  } else if (branchNum == null && widget.branches.isNotEmpty) {
+                    branchNum = widget.branches.keys.first;
+                  }
+                });
+              },
             ),
+            if (isGeneralAdmin)
+              const AnsarInlineNotice(
+                message: 'المدير العام يدير جميع الفروع ولا يرتبط بفرع أو دوام.',
+                icon: Icons.account_balance_rounded,
+              )
+            else
+              DropdownButtonFormField<int>(
+                initialValue: branchNum,
+                decoration: const InputDecoration(labelText: 'الفرع'),
+                items: widget.branches.values
+                    .map((branch) => DropdownMenuItem(value: branch.number, child: Text(branch.label)))
+                    .toList(),
+                onChanged: (value) => setState(() => branchNum = value),
+              ),
           ],
         ),
       ),
       actions: [
         TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
         FilledButton(
-          onPressed: branchNum == null
+          onPressed: !isGeneralAdmin && branchNum == null
               ? null
               : () {
                   Navigator.pop(context, {
@@ -5185,7 +6175,7 @@ class _EmployeeDialogState extends State<EmployeeDialog> {
                     'phone': emptyToNull(phone.text),
                     'email': emptyToNull(email.text),
                     'job_title': emptyToNull(jobTitle.text),
-                    'branch_num': branchNum,
+                    'branch_num': isGeneralAdmin ? null : branchNum,
                     'role': role,
                     'can_manage_employees': role == 'admin',
                     'can_manage_all_branches': role == 'admin',
@@ -6029,14 +7019,14 @@ class _TransfersPageState extends State<TransfersPage> {
       final inserted = await supabase
           .from('ansar_transfer_orders')
           .insert({
-            'from_branch_num': widget.session.branchNum,
+            'from_branch_num': result.fromBranch,
             'to_branch_num': result.toBranch,
             'requested_by': widget.session.id,
             'status': 'submitted',
             'requester_note': emptyToNull(result.note),
             'submitted_at': DateTime.now().toUtc().toIso8601String(),
           })
-          .select('id')
+          .select('id, order_no')
           .single();
       await supabase.from('ansar_transfer_order_items').insert(
             result.items
@@ -6058,7 +7048,7 @@ class _TransfersPageState extends State<TransfersPage> {
       unawaited(enqueueNotification(
         title: 'مناقلة جديدة',
         body:
-            'طلب مناقلة من ${branchLabel(data.branches, widget.session.branchNum)} إلى ${branchLabel(data.branches, result.toBranch)}',
+            'طلب مناقلة من ${branchLabel(data.branches, result.fromBranch)} إلى ${branchLabel(data.branches, result.toBranch)}',
         data: {
           'type': 'transfer_created',
           'route': 'transfer',
@@ -6067,7 +7057,7 @@ class _TransfersPageState extends State<TransfersPage> {
           'sender_name': widget.session.name,
           'sender_avatar_url': widget.session.avatarUrl ?? '',
           'order_no': inserted['order_no'] ?? '',
-          'from_branch_name': branchLabel(data.branches, widget.session.branchNum),
+          'from_branch_name': branchLabel(data.branches, result.fromBranch),
           'to_branch_name': branchLabel(data.branches, result.toBranch),
         },
       ));
@@ -6367,6 +7357,67 @@ class _TransferFilters extends StatelessWidget {
     }).length;
   }
 
+  Future<void> showStatusFilters(BuildContext context) async {
+    final selected = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('حالة المناقلات', style: TextStyle(fontSize: 19, fontWeight: FontWeight.w800)),
+                const SizedBox(height: 4),
+                const Text('اختر الحالة التي تريد عرضها', style: TextStyle(color: mutedInk)),
+                const SizedBox(height: 12),
+                ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxHeight: MediaQuery.sizeOf(sheetContext).height * 0.62,
+                  ),
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: transferStatusTabs.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final value = transferStatusTabs[index];
+                      final active = value == statusFilter;
+                      final color = value == 'all' || value == 'active' ? brandColor : transferStatusColor(value);
+                      return ListTile(
+                        selected: active,
+                        selectedTileColor: color.withValues(alpha: 0.08),
+                        leading: Icon(
+                          value == 'all' ? Icons.all_inbox_rounded : transferStatusIcon(value),
+                          color: color,
+                        ),
+                        title: Text(transferTabLabel(value), style: const TextStyle(fontWeight: FontWeight.w700)),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            StatusPill(label: '${statusCount(value)}', color: color),
+                            if (active) ...[
+                              const SizedBox(width: 8),
+                              Icon(Icons.check_circle_rounded, color: color),
+                            ],
+                          ],
+                        ),
+                        onTap: () => Navigator.pop(sheetContext, value),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    if (selected != null && selected != statusFilter) onStatusChanged(selected);
+  }
+
   Future<void> showBranchFilters(BuildContext context) async {
     var nextFrom = fromBranchFilter;
     var nextTo = toBranchFilter;
@@ -6439,30 +7490,13 @@ class _TransferFilters extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          SizedBox(
-            height: 48,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              itemCount: transferStatusTabs.length,
-              separatorBuilder: (_, __) => const SizedBox(width: 8),
-              itemBuilder: (context, index) {
-                final value = transferStatusTabs[index];
-                final selected = value == statusFilter;
-                final color = value == 'all' || value == 'active' ? brandColor : transferStatusColor(value);
-                return ChoiceChip(
-                  selected: selected,
-                  avatar: Icon(
-                    value == 'all' ? Icons.all_inbox_rounded : transferStatusIcon(value),
-                    size: 18,
-                    color: selected ? Colors.white : color,
-                  ),
-                  label: Text('${transferTabLabel(value)} ${statusCount(value)}'),
-                  selectedColor: color,
-                  labelStyle: TextStyle(color: selected ? Colors.white : inkColor),
-                  onSelected: (_) => onStatusChanged(value),
-                );
-              },
-            ),
+          AnsarFilterSummary(
+            title: 'حالة المناقلات',
+            labels: [
+              transferTabLabel(statusFilter),
+              '${statusCount(statusFilter)} طلب',
+            ],
+            onTap: () => showStatusFilters(context),
           ),
           const SizedBox(height: 6),
           AnsarFilterSummary(
@@ -6922,6 +7956,23 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     );
   }
 
+  Future<void> shareOnWhatsApp() async {
+    final orderId = '${widget.order['id']}';
+    final orderNumber = '${widget.order['order_no'] ?? orderId}';
+    final from = branchLabel(widget.branches, intValue(widget.order['from_branch_num']));
+    final to = branchLabel(widget.branches, intValue(widget.order['to_branch_num']));
+    final status = statusLabel(widget.order['status'] as String? ?? 'submitted');
+    final publicUrl = 'https://ansar-team.web.app/transfer/${Uri.encodeComponent(orderId)}';
+    final message = 'طلب مناقلة رقم $orderNumber\nمن $from إلى $to\nالحالة: $status\n$publicUrl';
+    final whatsappUri = Uri.https('wa.me', '/', {'text': message});
+    try {
+      final opened = await launchUrl(whatsappUri, mode: LaunchMode.externalApplication);
+      if (!opened) throw StateError('WhatsApp is unavailable');
+    } catch (_) {
+      await Share.share(message, subject: 'مناقلة رقم $orderNumber');
+    }
+  }
+
   Future<void> sharePdf(TransferDetailsData data) async {
     setState(() => sharingPdf = true);
     try {
@@ -6967,6 +8018,8 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     final document = pw.Document(theme: theme);
     final fromName = branchLabel(widget.branches, fromBranch);
     final toName = branchLabel(widget.branches, toBranch);
+    final fromLogo = await loadPdfMemoryImage(branchLogoAsset(fromName));
+    final toLogo = await loadPdfMemoryImage(branchLogoAsset(toName));
     final headers = ['#', 'الكتاب', 'الرقم', 'المطلوب', 'المرسل', 'المستلم', 'التالف', 'الحالة', 'الملاحظة'];
     final rows = data.items.asMap().entries.map((entry) {
       final item = entry.value;
@@ -7050,6 +8103,23 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
             ],
           ),
           pw.SizedBox(height: 14),
+          pw.Row(
+            mainAxisAlignment: pw.MainAxisAlignment.center,
+            children: [
+              transferPdfBranchBadge(fromName, fromLogo),
+              pw.Padding(
+                padding: const pw.EdgeInsets.symmetric(horizontal: 18),
+                child: pw.Column(
+                  children: [
+                    pw.Text('إلى', style: const pw.TextStyle(fontSize: 10, color: PdfColors.grey600)),
+                    pw.Text('←', style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold, color: const PdfColor.fromInt(0xff087568))),
+                  ],
+                ),
+              ),
+              transferPdfBranchBadge(toName, toLogo),
+            ],
+          ),
+          pw.SizedBox(height: 12),
           pw.Container(
             padding: const pw.EdgeInsets.all(12),
             decoration: pw.BoxDecoration(
@@ -7357,6 +8427,14 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                         icon: const Icon(Icons.forum_outlined),
                         label: const Text('مشاركة في الدردشة'),
                       ),
+                      if (kIsBetaBuild) ...[
+                        const SizedBox(height: 8),
+                        OutlinedButton.icon(
+                          onPressed: shareOnWhatsApp,
+                          icon: const Icon(Icons.share_rounded),
+                          label: const Text('مشاركة عبر واتساب'),
+                        ),
+                      ],
                       if (fromBranch == widget.session.branchNum && widget.order['status'] == 'preparing') ...[
                         const SizedBox(height: 10),
                         Container(
@@ -7568,8 +8646,9 @@ class TransferDetailsData {
 }
 
 class CreateTransferResult {
-  CreateTransferResult({required this.toBranch, required this.note, required this.items});
+  CreateTransferResult({required this.fromBranch, required this.toBranch, required this.note, required this.items});
 
+  final int fromBranch;
   final int toBranch;
   final String note;
   final List<TransferItemDraft> items;
@@ -7611,12 +8690,14 @@ class _TransferDialogState extends State<TransferDialog> {
   bool cacheLoading = true;
   int productsCount = 0;
   Timer? searchDebounce;
+  int? fromBranch;
   int? toBranch;
   int currentStep = 0;
 
   @override
   void initState() {
     super.initState();
+    fromBranch = widget.session.isGeneralAdmin ? null : widget.session.assignedBranchNum;
     unawaited(prepareSearchCache());
   }
 
@@ -7705,7 +8786,7 @@ class _TransferDialogState extends State<TransferDialog> {
 
   @override
   Widget build(BuildContext context) {
-    final canSubmit = toBranch != null && items.isNotEmpty;
+    final canSubmit = fromBranch != null && toBranch != null && items.isNotEmpty;
     return Scaffold(
       appBar: AppBar(
         title: const Text('طلب مناقلة جديد'),
@@ -7734,6 +8815,37 @@ class _TransferDialogState extends State<TransferDialog> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
+                  if (widget.session.isGeneralAdmin) ...[
+                    DropdownButtonFormField<int>(
+                      initialValue: fromBranch,
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        labelText: 'الفرع الطالب',
+                        prefixIcon: Icon(Icons.outbox_rounded),
+                      ),
+                      items: widget.branches.values
+                          .map((branch) => DropdownMenuItem(value: branch.number, child: Text(branch.label)))
+                          .toList(),
+                      onChanged: (value) {
+                        setState(() {
+                          fromBranch = value;
+                          if (toBranch == value) toBranch = null;
+                        });
+                      },
+                    ),
+                    const SizedBox(height: 10),
+                  ] else
+                    InputDecorator(
+                      decoration: const InputDecoration(
+                        labelText: 'الفرع الطالب',
+                        prefixIcon: Icon(Icons.outbox_rounded),
+                      ),
+                      child: Text(
+                        fromBranch == null ? 'لا يوجد فرع مرتبط بالحساب' : branchLabel(widget.branches, fromBranch!),
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                  if (!widget.session.isGeneralAdmin) const SizedBox(height: 10),
                   DropdownButtonFormField<int>(
                     initialValue: toBranch,
                     isExpanded: true,
@@ -7742,7 +8854,7 @@ class _TransferDialogState extends State<TransferDialog> {
                       prefixIcon: Icon(Icons.storefront_rounded),
                     ),
                     items: widget.branches.values
-                        .where((branch) => branch.number != widget.session.branchNum)
+                        .where((branch) => branch.number != fromBranch)
                         .map((branch) => DropdownMenuItem(value: branch.number, child: Text(branch.label)))
                         .toList(),
                     onChanged: (value) => setState(() => toBranch = value),
@@ -7895,6 +9007,7 @@ class _TransferDialogState extends State<TransferDialog> {
             TransferDraftReview(
               session: widget.session,
               branches: widget.branches,
+              fromBranch: fromBranch,
               toBranch: toBranch,
               note: note.text.trim(),
               items: items,
@@ -7927,13 +9040,18 @@ class _TransferDialogState extends State<TransferDialog> {
                 flex: 2,
                 child: FilledButton.icon(
                   onPressed: currentStep == 0
-                      ? (toBranch == null ? null : () => setState(() => currentStep = 1))
+                      ? (fromBranch == null || toBranch == null ? null : () => setState(() => currentStep = 1))
                       : currentStep == 1
                           ? (items.isEmpty ? null : () => setState(() => currentStep = 2))
                           : canSubmit
                               ? () => Navigator.pop(
                                     context,
-                                    CreateTransferResult(toBranch: toBranch!, note: note.text.trim(), items: items),
+                                    CreateTransferResult(
+                                      fromBranch: fromBranch!,
+                                      toBranch: toBranch!,
+                                      note: note.text.trim(),
+                                      items: items,
+                                    ),
                                   )
                               : null,
                   icon: Icon(currentStep == 2 ? Icons.send_rounded : Icons.arrow_back_rounded),
@@ -8003,6 +9121,7 @@ class TransferDraftReview extends StatelessWidget {
     super.key,
     required this.session,
     required this.branches,
+    required this.fromBranch,
     required this.toBranch,
     required this.note,
     required this.items,
@@ -8010,6 +9129,7 @@ class TransferDraftReview extends StatelessWidget {
 
   final EmployeeSession session;
   final Map<int, BranchOption> branches;
+  final int? fromBranch;
   final int? toBranch;
   final String note;
   final List<TransferItemDraft> items;
@@ -8028,9 +9148,9 @@ class TransferDraftReview extends StatelessWidget {
               children: [
                 Row(
                   children: [
-                    BranchLogo(branchName: branchLabel(branches, session.branchNum), size: 42),
+                    BranchLogo(branchName: branchLabel(branches, fromBranch ?? 0), size: 42),
                     const SizedBox(width: 8),
-                    Expanded(child: Text(branchLabel(branches, session.branchNum), style: const TextStyle(fontWeight: FontWeight.w800))),
+                    Expanded(child: Text(branchLabel(branches, fromBranch ?? 0), style: const TextStyle(fontWeight: FontWeight.w800))),
                     const Icon(Icons.arrow_back_rounded, color: brandColor),
                     const SizedBox(width: 8),
                     BranchLogo(branchName: branchLabel(branches, toBranch ?? 0), size: 42),
@@ -8933,6 +10053,7 @@ class _ChatPageState extends State<ChatPage> {
                       for (var i = 0; i < filteredThreads.length; i++) ...[
                         ChatThreadTile(
                           thread: filteredThreads[i],
+                          currentEmployeeId: widget.session.id,
                           onTap: () => openThread(filteredThreads[i]),
                           onLongPress: () => showThreadActions(filteredThreads[i]),
                         ),
@@ -8950,9 +10071,16 @@ class _ChatPageState extends State<ChatPage> {
 }
 
 class ChatThreadTile extends StatelessWidget {
-  const ChatThreadTile({super.key, required this.thread, required this.onTap, this.onLongPress});
+  const ChatThreadTile({
+    super.key,
+    required this.thread,
+    this.currentEmployeeId = '',
+    required this.onTap,
+    this.onLongPress,
+  });
 
   final Map<String, dynamic> thread;
+  final String currentEmployeeId;
   final VoidCallback onTap;
   final VoidCallback? onLongPress;
 
@@ -8964,6 +10092,7 @@ class ChatThreadTile extends StatelessWidget {
     final contact = type == 'contact';
     final latest = thread['last_message'] as Map<String, dynamic>?;
     final senderName = thread['last_sender_name']?.toString();
+    final latestIsMine = latest?['sender_id']?.toString() == currentEmployeeId;
     final unread = intValue(thread['unread_count']);
     final emptySubtitle = contact
         ? 'بدء محادثة خاصة'
@@ -9021,7 +10150,7 @@ class ChatThreadTile extends StatelessWidget {
                     Text(
                       latest == null
                           ? emptySubtitle
-                          : '${senderName == null ? '' : '$senderName: '}${latest['body'] ?? ''}',
+                          : '${latestIsMine ? 'أنت: ' : senderName == null ? '' : '$senderName: '}${latest['body'] ?? ''}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(color: mutedInk, fontSize: 12),
@@ -13260,7 +14389,7 @@ Future<List<EmployeeLite>> loadEmployeesForScope(
 }) async {
   var query = supabase
       .from('ansar_employees')
-      .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url');
+      .select('id, display_name, full_name, username, branch_num, role, is_active, avatar_url, can_manage_all_branches');
   if (!includeInactive) query = query.eq('is_active', true);
   if (!session.isAdmin && session.isBranchManager) {
     query = query.eq('branch_num', session.branchNum);
@@ -13274,7 +14403,7 @@ Future<List<EmployeeLite>> loadEmployeesForScope(
 Future<List<EmployeeLite>> loadAllActiveEmployees() async {
   final rows = await supabase
       .from('ansar_employees')
-      .select('id, display_name, full_name, branch_num, role, is_active, avatar_url')
+      .select('id, display_name, full_name, branch_num, role, is_active, avatar_url, can_manage_all_branches')
       .eq('is_active', true)
       .order('display_name', ascending: true);
   return rows.cast<Map<String, dynamic>>().map(EmployeeLite.fromRow).toList();
@@ -14087,16 +15216,182 @@ PaymentInfo paymentLabelFromRemark(Object? remark) {
 }
 
 String discountDisplay(Map<String, dynamic> item) {
+  final discount = invoiceItemDiscountPercent(item);
+  if (discount > 0) return '${formatMoneyValue(discount)}%';
+  return '-';
+}
+
+double invoiceItemDiscountPercent(Map<String, dynamic> item) {
   final explicit = parseDiscountItem(item['remarki']);
-  if (explicit > 0) return '${formatMoneyValue(explicit)}%';
+  if (explicit > 0) return explicit;
   final quantity = doubleValue(item['quantity']);
   final price = doubleValue(item['price']);
   final value = doubleValue(item['value']);
   final gross = quantity * price;
   if (gross > 0 && value < gross - 0.001) {
-    return '${formatMoneyValue((1 - value / gross) * 100)}%';
+    return (1 - value / gross) * 100;
   }
-  return '-';
+  return 0;
+}
+
+pw.Widget pdfTotalLine(
+  String label,
+  String value, {
+  PdfColor color = PdfColors.black,
+  bool bold = false,
+}) {
+  return pw.Row(
+    children: [
+      pw.Expanded(child: pw.Text(label, style: const pw.TextStyle(fontSize: 10, color: PdfColors.grey700))),
+      pw.Text(
+        value,
+        style: pw.TextStyle(
+          color: color,
+          fontSize: bold ? 13 : 10,
+          fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
+        ),
+      ),
+    ],
+  );
+}
+
+Future<pw.MemoryImage?> loadPdfMemoryImage(String? assetPath) async {
+  if (assetPath == null || assetPath.isEmpty) return null;
+  try {
+    final bytes = await rootBundle.load(assetPath);
+    return pw.MemoryImage(
+      bytes.buffer.asUint8List(bytes.offsetInBytes, bytes.lengthInBytes),
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+pw.Widget transferPdfBranchBadge(String name, pw.MemoryImage? logo) {
+  return pw.Container(
+    width: 180,
+    padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+    decoration: pw.BoxDecoration(
+      color: const PdfColor.fromInt(0xfff4f8f7),
+      border: pw.Border.all(color: PdfColors.grey300),
+      borderRadius: pw.BorderRadius.circular(6),
+    ),
+    child: pw.Row(
+      children: [
+        pw.Container(
+          width: 38,
+          height: 38,
+          padding: const pw.EdgeInsets.all(3),
+          decoration: pw.BoxDecoration(
+            color: PdfColors.white,
+            border: pw.Border.all(color: PdfColors.grey300),
+            borderRadius: pw.BorderRadius.circular(5),
+          ),
+          child: logo == null
+              ? pw.Center(
+                  child: pw.Text(
+                    name.isEmpty ? '-' : name.substring(0, 1),
+                    style: pw.TextStyle(fontSize: 14, fontWeight: pw.FontWeight.bold),
+                  ),
+                )
+              : pw.Image(logo, fit: pw.BoxFit.contain),
+        ),
+        pw.SizedBox(width: 9),
+        pw.Expanded(
+          child: pw.Text(
+            name,
+            maxLines: 2,
+            style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+String arabicUsdAmountInWords(double amount) {
+  final safeAmount = amount.isFinite ? amount.abs() : 0.0;
+  final totalCents = (safeAmount * 100).round();
+  final dollars = totalCents ~/ 100;
+  final cents = totalCents % 100;
+  final dollarText = dollars == 0
+      ? 'صفر دولار أمريكي'
+      : dollars == 1
+          ? 'دولار أمريكي واحد'
+          : dollars == 2
+              ? 'دولاران أمريكيان'
+              : '${arabicIntegerInWords(dollars)} دولاراً أمريكياً';
+  final centText = cents == 0
+      ? ''
+      : cents == 1
+          ? ' وسنت واحد'
+          : cents == 2
+              ? ' وسنتان'
+              : ' و${arabicIntegerInWords(cents)} سنتاً';
+  return 'فقط $dollarText$centText لا غير';
+}
+
+String arabicIntegerInWords(int value) {
+  if (value == 0) return 'صفر';
+  if (value < 0) return 'سالب ${arabicIntegerInWords(-value)}';
+  final parts = <String>[];
+  final billions = value ~/ 1000000000;
+  final millions = (value ~/ 1000000) % 1000;
+  final thousands = (value ~/ 1000) % 1000;
+  final remainder = value % 1000;
+  if (billions > 0) parts.add(arabicScaleWords(billions, 'مليار', 'ملياران', 'مليارات'));
+  if (millions > 0) parts.add(arabicScaleWords(millions, 'مليون', 'مليونان', 'ملايين'));
+  if (thousands > 0) parts.add(arabicScaleWords(thousands, 'ألف', 'ألفان', 'آلاف'));
+  if (remainder > 0) parts.add(arabicBelowThousand(remainder));
+  return parts.join(' و');
+}
+
+String arabicScaleWords(int value, String singular, String dual, String plural) {
+  if (value == 1) return singular;
+  if (value == 2) return dual;
+  if (value >= 3 && value <= 10) return '${arabicBelowThousand(value)} $plural';
+  return '${arabicBelowThousand(value)} $singular';
+}
+
+String arabicBelowThousand(int value) {
+  const ones = [
+    '',
+    'واحد',
+    'اثنان',
+    'ثلاثة',
+    'أربعة',
+    'خمسة',
+    'ستة',
+    'سبعة',
+    'ثمانية',
+    'تسعة',
+    'عشرة',
+    'أحد عشر',
+    'اثنا عشر',
+    'ثلاثة عشر',
+    'أربعة عشر',
+    'خمسة عشر',
+    'ستة عشر',
+    'سبعة عشر',
+    'ثمانية عشر',
+    'تسعة عشر',
+  ];
+  const tens = ['', '', 'عشرون', 'ثلاثون', 'أربعون', 'خمسون', 'ستون', 'سبعون', 'ثمانون', 'تسعون'];
+  const hundreds = ['', 'مائة', 'مائتان', 'ثلاثمائة', 'أربعمائة', 'خمسمائة', 'ستمائة', 'سبعمائة', 'ثمانمائة', 'تسعمائة'];
+  final parts = <String>[];
+  final hundred = value ~/ 100;
+  final rest = value % 100;
+  if (hundred > 0) parts.add(hundreds[hundred]);
+  if (rest > 0) {
+    if (rest < 20) {
+      parts.add(ones[rest]);
+    } else {
+      final unit = rest % 10;
+      final ten = rest ~/ 10;
+      parts.add(unit == 0 ? tens[ten] : '${ones[unit]} و${tens[ten]}');
+    }
+  }
+  return parts.join(' و');
 }
 
 class PaymentInfo {

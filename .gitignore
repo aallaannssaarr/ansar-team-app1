@@ -10,3 +10,4 @@ android/.gradle/
 android/app/google-services.json
 *.jks
 key.properties
+/tmp/

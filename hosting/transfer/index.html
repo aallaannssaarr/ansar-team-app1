@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#087568" />
+    <title>فتح المناقلة - فريق الأنصار</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        background: #f7faf8;
+        color: #173b35;
+        font-family: system-ui, "Noto Sans Arabic", sans-serif;
+      }
+      main { width: min(100%, 420px); text-align: center; }
+      img { width: 112px; height: 112px; object-fit: contain; }
+      h1 { margin: 18px 0 8px; font-size: 26px; }
+      p { margin: 0 0 22px; color: #5f716e; line-height: 1.8; }
+      a {
+        display: block;
+        width: 100%;
+        min-height: 52px;
+        padding: 14px 18px;
+        border-radius: 8px;
+        background: #087568;
+        color: white;
+        font-weight: 800;
+        text-decoration: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <img src="/logo.png" alt="فريق الأنصار" />
+      <h1>فتح طلب المناقلة</h1>
+      <p>سيتم فتح الطلب داخل تطبيق فريق الأنصار. يجب تسجيل الدخول بحساب يملك صلاحية رؤية المناقلة.</p>
+      <a id="open-app" href="#">فتح في فريق الأنصار</a>
+    </main>
+    <script>
+      const parts = location.pathname.split('/').filter(Boolean);
+      const orderId = parts[0] === 'transfer' && parts[1] ? parts[1] : '';
+      const appUrl = `ansarteambeta://transfer/${encodeURIComponent(orderId)}`;
+      const button = document.getElementById('open-app');
+      button.href = appUrl;
+      if (orderId) setTimeout(() => { location.href = appUrl; }, 180);
+    </script>
+  </body>
+</html>
