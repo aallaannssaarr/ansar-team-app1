@@ -29,6 +29,19 @@ android {
         multiDexEnabled = true
     }
 
+    flavorDimensions += "edition"
+    productFlavors {
+        create("stable") {
+            dimension = "edition"
+            applicationId = "com.example.ansar_team_app"
+        }
+        create("beta") {
+            dimension = "edition"
+            applicationId = "com.example.ansar_team_app.beta"
+            versionNameSuffix = "-beta"
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false

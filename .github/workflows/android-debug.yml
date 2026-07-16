@@ -56,13 +56,13 @@ jobs:
       - name: Run automated tests
         run: flutter test --reporter expanded
 
-      - name: Build debug APK
-        run: flutter build apk --debug
+      - name: Build stable debug APK
+        run: flutter build apk --debug --flavor stable
 
       - name: Prepare APK file
         run: |
           mkdir -p release
-          cp build/app/outputs/flutter-apk/app-debug.apk release/ansar-team-latest-debug.apk
+          cp build/app/outputs/flutter-apk/app-stable-debug.apk release/ansar-team-stable-debug.apk
 
       - name: Distribute APK to Firebase testers
         if: ${{ env.FIREBASE_SERVICE_ACCOUNT_JSON != '' }}
@@ -73,7 +73,7 @@ jobs:
           APP_ID=$(python -c "import json; print(json.load(open('google-services.json'))['client'][0]['client_info']['mobilesdk_app_id'])")
           GROUPS=${FIREBASE_TESTER_GROUPS:-ansar-testers}
           RELEASE_NOTES=$(git log -1 --pretty=%s)
-          if ! firebase appdistribution:distribute release/ansar-team-latest-debug.apk \
+          if ! firebase appdistribution:distribute release/ansar-team-stable-debug.apk \
               --app "$APP_ID" \
               --groups "$GROUPS" \
               --release-notes "$RELEASE_NOTES"; then
@@ -83,8 +83,8 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ansar-team-debug-apk
-          path: release/ansar-team-latest-debug.apk
+          name: ansar-team-stable-debug-apk
+          path: release/ansar-team-stable-debug.apk
 
       - name: Publish latest debug APK
         uses: ncipollo/release-action@v1
@@ -92,7 +92,7 @@ jobs:
           tag: debug-latest
           name: Latest debug APK
           body: "Always contains the latest debug APK built from main."
-          artifacts: release/ansar-team-latest-debug.apk
+          artifacts: release/ansar-team-stable-debug.apk
           allowUpdates: true
           replacesArtifacts: true
           removeArtifacts: true
