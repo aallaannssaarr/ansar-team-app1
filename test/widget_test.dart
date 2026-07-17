@@ -527,6 +527,17 @@ void main() {
     expect(find.byType(SingleChildScrollView), findsOneWidget);
   });
 
+  testWidgets('account invoice page starts with a usable account search', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(_testShell(const AccountInvoicesPage()));
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('فواتير مورد أو زبون'), findsOneWidget);
+    expect(find.text('المورد أو الزبون'), findsOneWidget);
+    expect(find.byIcon(Icons.search_rounded), findsOneWidget);
+  });
+
   testWidgets('new group page lists employees from different branches', (tester) async {
     await tester.binding.setSurfaceSize(const Size(390, 844));
     addTearDown(() => tester.binding.setSurfaceSize(null));

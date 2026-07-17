@@ -4589,10 +4589,11 @@ class _AccountInvoicesPageState extends State<AccountInvoicesPage> {
   Future<List<Map<String, dynamic>>> loadBills() async {
     final account = selectedAccount;
     if (account == null) return [];
+    final accountNumber = nullableIntValue(account['num']) ?? account['num'];
     dynamic query = supabase
         .from('bills_full')
         .select('book, bnum, date, accnum, totalvalue, remark, kind')
-        .eq('accnum', account['num'])
+        .eq('accnum', accountNumber)
         .gte('date', startDate.text)
         .lte('date', endDate.text);
     if (kind != 'all') query = query.eq('kind', int.parse(kind));
@@ -4645,6 +4646,79 @@ class _AccountInvoicesPageState extends State<AccountInvoicesPage> {
     });
   }
 
+  Future<String?> pickFilterValue({
+    required String title,
+    required String currentValue,
+    required List<(String, String)> options,
+  }) {
+    return showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      useSafeArea: true,
+      builder: (context) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 4, 20, 10),
+              child: Text(title, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+            ),
+            for (final option in options)
+              ListTile(
+                leading: Icon(
+                  option.$1 == currentValue ? Icons.check_circle_rounded : Icons.circle_outlined,
+                  color: option.$1 == currentValue ? brandColor : mutedInk,
+                ),
+                title: Text(option.$2, style: const TextStyle(fontWeight: FontWeight.w700)),
+                onTap: () => Navigator.of(context).pop(option.$1),
+              ),
+            const SizedBox(height: 12),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> chooseKindFilter() async {
+    final value = await pickFilterValue(
+      title: 'نوع الفاتورة',
+      currentValue: kind,
+      options: const [('all', 'الكل'), ('0', 'مبيع'), ('1', 'شراء')],
+    );
+    if (value == null || !mounted) return;
+    setState(() {
+      kind = value;
+      if (selectedAccount != null) future = loadBills();
+    });
+  }
+
+  Future<void> choosePaymentFilter() async {
+    final value = await pickFilterValue(
+      title: 'طريقة الدفع',
+      currentValue: payment,
+      options: const [('all', 'الكل'), ('cash', 'نقداً'), ('credit', 'آجل')],
+    );
+    if (value == null || !mounted) return;
+    setState(() {
+      payment = value;
+      if (selectedAccount != null) future = loadBills();
+    });
+  }
+
+  String get kindLabel => switch (kind) {
+        '0' => 'مبيع',
+        '1' => 'شراء',
+        _ => 'الكل',
+      };
+
+  String get paymentLabel => switch (payment) {
+        'cash' => 'نقداً',
+        'credit' => 'آجل',
+        _ => 'الكل',
+      };
+
   @override
   Widget build(BuildContext context) {
     const periods = [
@@ -4683,8 +4757,10 @@ class _AccountInvoicesPageState extends State<AccountInvoicesPage> {
                           : null,
                     ),
                     onChanged: (value) {
-                      selectedAccount = null;
-                      future = null;
+                      setState(() {
+                        selectedAccount = null;
+                        future = null;
+                      });
                       queueAccountSearch(value);
                     },
                   ),
@@ -4731,32 +4807,36 @@ class _AccountInvoicesPageState extends State<AccountInvoicesPage> {
                     Wrap(
                       spacing: 7,
                       runSpacing: 7,
-                      children: periods
-                          .map((item) => ChoiceChip(
-                                selected: period == item.$1,
+                      children: periods.map((item) {
+                        final selected = period == item.$1;
+                        return selected
+                            ? FilledButton.icon(
+                                onPressed: () => applyPeriod(item.$1),
+                                icon: const Icon(Icons.check_rounded, size: 17),
                                 label: Text(item.$2),
-                                onSelected: (_) => applyPeriod(item.$1),
-                              ))
-                          .toList(),
+                              )
+                            : OutlinedButton(
+                                onPressed: () => applyPeriod(item.$1),
+                                child: Text(item.$2),
+                              );
+                      }).toList(),
                     ),
                     const SizedBox(height: 10),
                     Row(
                       children: [
                         Expanded(
-                          child: TextField(
-                            controller: startDate,
-                            readOnly: true,
-                            onTap: () => pickDate(startDate),
-                            decoration: const InputDecoration(labelText: 'من تاريخ', prefixIcon: Icon(Icons.calendar_today_outlined)),
+                          child: OutlinedButton.icon(
+                            onPressed: () => pickDate(startDate),
+                            icon: const Icon(Icons.calendar_today_outlined, size: 18),
+                            label: Text('من ${startDate.text}', overflow: TextOverflow.ellipsis),
                           ),
                         ),
                         const SizedBox(width: 8),
                         Expanded(
-                          child: TextField(
-                            controller: endDate,
-                            readOnly: true,
-                            onTap: () => pickDate(endDate),
-                            decoration: const InputDecoration(labelText: 'إلى تاريخ', prefixIcon: Icon(Icons.event_available_outlined)),
+                          child: OutlinedButton.icon(
+                            onPressed: () => pickDate(endDate),
+                            icon: const Icon(Icons.event_available_outlined, size: 18),
+                            label: Text('إلى ${endDate.text}', overflow: TextOverflow.ellipsis),
                           ),
                         ),
                       ],
@@ -4765,37 +4845,27 @@ class _AccountInvoicesPageState extends State<AccountInvoicesPage> {
                     Row(
                       children: [
                         Expanded(
-                          child: DropdownButtonFormField<String>(
-                            initialValue: kind,
-                            decoration: const InputDecoration(labelText: 'نوع الفاتورة'),
-                            items: const [
-                              DropdownMenuItem(value: 'all', child: Text('الكل')),
-                              DropdownMenuItem(value: '0', child: Text('مبيع')),
-                              DropdownMenuItem(value: '1', child: Text('شراء')),
-                            ],
-                            onChanged: (value) {
-                              kind = value ?? 'all';
-                              reload();
-                            },
+                          child: OutlinedButton.icon(
+                            onPressed: chooseKindFilter,
+                            icon: const Icon(Icons.receipt_long_outlined, size: 18),
+                            label: Text('النوع: $kindLabel'),
                           ),
                         ),
                         const SizedBox(width: 8),
                         Expanded(
-                          child: DropdownButtonFormField<String>(
-                            initialValue: payment,
-                            decoration: const InputDecoration(labelText: 'الدفع'),
-                            items: const [
-                              DropdownMenuItem(value: 'all', child: Text('الكل')),
-                              DropdownMenuItem(value: 'cash', child: Text('نقداً')),
-                              DropdownMenuItem(value: 'credit', child: Text('آجل')),
-                            ],
-                            onChanged: (value) {
-                              payment = value ?? 'all';
-                              reload();
-                            },
+                          child: OutlinedButton.icon(
+                            onPressed: choosePaymentFilter,
+                            icon: const Icon(Icons.payments_outlined, size: 18),
+                            label: Text('الدفع: $paymentLabel'),
                           ),
                         ),
                       ],
+                    ),
+                    const SizedBox(height: 10),
+                    FilledButton.icon(
+                      onPressed: reload,
+                      icon: const Icon(Icons.search_rounded),
+                      label: const Text('عرض الفواتير'),
                     ),
                   ],
                 ),
@@ -4945,10 +5015,17 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
   Future<void> printInvoice(SalesBillDetailsData data) async {
     setState(() => pdfBusy = true);
     try {
-      await Printing.layoutPdf(
-        name: invoiceFileName,
-        onLayout: (_) => buildInvoicePdf(data),
-      );
+      final bytes = await buildInvoicePdf(data);
+      try {
+        final opened = await Printing.layoutPdf(
+          name: invoiceFileName,
+          onLayout: (_) async => bytes,
+        );
+        if (!opened) await shareInvoiceBytes(bytes);
+      } catch (_) {
+        await shareInvoiceBytes(bytes);
+        if (mounted) showSnack(context, 'تم إنشاء ملف الفاتورة ويمكنك حفظه أو مشاركته');
+      }
     } catch (error) {
       if (mounted) showSnack(context, 'تعذر طباعة الفاتورة. ${cleanError(error)}');
     } finally {
@@ -4960,7 +5037,7 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
     setState(() => pdfBusy = true);
     try {
       final bytes = await buildInvoicePdf(data);
-      await Printing.sharePdf(bytes: bytes, filename: invoiceFileName);
+      await shareInvoiceBytes(bytes);
     } catch (error) {
       if (mounted) showSnack(context, 'تعذر مشاركة الفاتورة. ${cleanError(error)}');
     } finally {
@@ -4968,7 +5045,28 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
     }
   }
 
+  Future<void> shareInvoiceBytes(Uint8List bytes) async {
+    try {
+      await Share.shareXFiles(
+        [XFile.fromData(bytes, mimeType: 'application/pdf')],
+        subject: 'فاتورة ${widget.bill['bnum'] ?? ''}',
+        text: 'فاتورة ${widget.bill['account_name'] ?? widget.bill['accnum'] ?? ''}',
+        fileNameOverrides: [invoiceFileName],
+      );
+    } catch (_) {
+      await Printing.sharePdf(bytes: bytes, filename: invoiceFileName);
+    }
+  }
+
   Future<Uint8List> buildInvoicePdf(SalesBillDetailsData data) async {
+    try {
+      return await buildRichInvoicePdf(data);
+    } catch (_) {
+      return buildFallbackInvoicePdf(data);
+    }
+  }
+
+  Future<Uint8List> buildRichInvoicePdf(SalesBillDetailsData data) async {
     final fontBytes = await rootBundle.load('assets/fonts/Amiri-Regular.ttf');
     final logoBytes = await rootBundle.load('assets/logo.png');
     final font = pw.Font.ttf(fontBytes);
@@ -5139,6 +5237,69 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
               style: pw.TextStyle(color: const PdfColor.fromInt(0xff1d5d8f), fontWeight: pw.FontWeight.bold, fontSize: 12),
             ),
           ),
+        ],
+      ),
+    );
+    return document.save();
+  }
+
+  Future<Uint8List> buildFallbackInvoicePdf(SalesBillDetailsData data) async {
+    final fontBytes = await rootBundle.load('assets/fonts/NotoSansArabic-Variable.ttf');
+    final font = pw.Font.ttf(fontBytes);
+    final document = pw.Document(theme: pw.ThemeData.withFont(base: font, bold: font));
+    final isPurchase = nullableIntValue(widget.bill['kind']) == 1;
+    final total = doubleValue(widget.bill['totalvalue']);
+    final payment = paymentLabelFromRemark(widget.bill['remark']);
+    final rows = data.items.asMap().entries.map((entry) {
+      final item = entry.value;
+      return [
+        '${entry.key + 1}',
+        shortPdfText(item['product_name']?.toString() ?? 'مادة ${item['matnum'] ?? '-'}', 70),
+        formatMoneyValue(item['quantity']),
+        '\$ ${formatMoneyValue(item['price'])}',
+        '\$ ${formatMoneyValue(item['value'])}',
+      ];
+    }).toList();
+    document.addPage(
+      pw.MultiPage(
+        textDirection: pw.TextDirection.rtl,
+        pageTheme: pw.PageTheme(
+          pageFormat: PdfPageFormat.a4,
+          margin: const pw.EdgeInsets.all(28),
+        ),
+        footer: (context) => pw.Align(
+          alignment: pw.Alignment.centerLeft,
+          child: pw.Text('صفحة ${context.pageNumber} من ${context.pagesCount}', style: const pw.TextStyle(fontSize: 8)),
+        ),
+        build: (_) => [
+          pw.Text('مكتبة الأنصار', style: pw.TextStyle(fontSize: 25, fontWeight: pw.FontWeight.bold)),
+          pw.SizedBox(height: 6),
+          pw.Text(isPurchase ? 'فاتورة شراء' : 'فاتورة مبيع', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+          pw.SizedBox(height: 10),
+          pw.Text('رقم الفاتورة: ${widget.bill['bnum'] ?? '-'}'),
+          pw.Text('الحساب: ${widget.bill['account_name'] ?? 'حساب ${widget.bill['accnum'] ?? '-'}'}'),
+          pw.Text('التاريخ: ${widget.bill['date'] ?? '-'} · الدفع: ${payment.text}'),
+          pw.SizedBox(height: 14),
+          pw.TableHelper.fromTextArray(
+            headers: const ['#', 'البيان', 'الكمية', 'السعر', 'الإجمالي'],
+            data: rows,
+            headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
+            headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
+            border: pw.TableBorder.all(color: PdfColors.grey400),
+            cellAlignment: pw.Alignment.centerRight,
+            headerAlignment: pw.Alignment.centerRight,
+            columnWidths: const {
+              0: pw.FixedColumnWidth(24),
+              1: pw.FlexColumnWidth(4),
+              2: pw.FlexColumnWidth(1.2),
+              3: pw.FlexColumnWidth(1.5),
+              4: pw.FlexColumnWidth(1.7),
+            },
+          ),
+          pw.SizedBox(height: 14),
+          pw.Text('الصافي: \$ ${formatMoneyValue(total)}', style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
+          pw.SizedBox(height: 6),
+          pw.Text(arabicUsdAmountInWords(total), textAlign: pw.TextAlign.center),
         ],
       ),
     );
