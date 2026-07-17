@@ -157,6 +157,28 @@ void main() {
     expect(formatDurationCompact(duration), '4 س 30 د');
   });
 
+  test('open attendance displays its full duration across midnight', () {
+    final employee = EmployeeLite(
+      id: 'overnight',
+      name: 'موظف ليلي',
+      username: 'overnight',
+      branchNum: 1,
+      role: 'employee',
+      isActive: true,
+    );
+    final entry = BranchAttendanceEntry(
+      id: 'open',
+      employee: employee,
+      checkIn: DateTime(2026, 7, 16, 21),
+      checkOut: null,
+    );
+    final now = DateTime(2026, 7, 17, 4);
+    final dayStart = DateTime(2026, 7, 17);
+
+    expect(entry.workedUntil(now, dayStart), const Duration(hours: 4));
+    expect(entry.displayedWorkedUntil(now, dayStart), const Duration(hours: 7));
+  });
+
   test('times use the Arabic 12 hour clock and branch logos map safely', () {
     expect(formatTime(DateTime(2026, 7, 12, 0, 5)), '12:05 ص');
     expect(formatTime(DateTime(2026, 7, 12, 16, 45)), '4:45 م');
@@ -538,6 +560,45 @@ void main() {
     expect(find.byIcon(Icons.search_rounded), findsOneWidget);
   });
 
+  test('invoice rows accept an untyped API list', () {
+    final raw = <dynamic>[
+      <dynamic, dynamic>{'book': '1', 'bnum': 12, 'kind': 0},
+    ];
+
+    final rows = invoiceRowsFromResponse(raw);
+
+    expect(rows, hasLength(1));
+    expect(rows.single['bnum'], 12);
+  });
+
+  testWidgets('portable Arabic invoice PDF is generated', (tester) async {
+    final bytes = await buildPortableInvoicePdf(
+      {
+        'bnum': 15,
+        'kind': 0,
+        'date': '2026-07-17',
+        'account_name': 'حساب تجريبي',
+        'totalvalue': 25,
+        'remark': 'نقداً',
+      },
+      SalesBillDetailsData(
+        branches: const {},
+        items: [
+          {
+            'matnum': 1,
+            'product_name': 'كتاب تجريبي',
+            'quantity': 2,
+            'price': 12.5,
+            'value': 25,
+          },
+        ],
+      ),
+    );
+
+    expect(bytes.length, greaterThan(1000));
+    expect(String.fromCharCodes(bytes.take(4)), '%PDF');
+  });
+
   testWidgets('new group page lists employees from different branches', (tester) async {
     await tester.binding.setSurfaceSize(const Size(390, 844));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -688,5 +749,42 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(find.text('التقارير والإحصائيات'), findsOneWidget);
     expect(find.text('المراجعة'), findsOneWidget);
+  });
+
+  testWidgets('report metric grid has enough height for Arabic text', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _testShell(
+        MediaQuery(
+          data: MediaQueryData(textScaler: TextScaler.linear(1.3)),
+          child: GridView.count(
+            crossAxisCount: 2,
+            crossAxisSpacing: 10,
+            mainAxisSpacing: 10,
+            mainAxisExtent: 136,
+            children: const [
+              AnsarMetricCard(
+                label: 'إجمالي الساعات',
+                value: '128.5',
+                caption: 'ضمن النطاق المحدد',
+                icon: Icons.timer_rounded,
+                color: brandColor,
+              ),
+              AnsarMetricCard(
+                label: 'متوسط الوردية',
+                value: '7.5',
+                caption: 'ساعة لكل وردية',
+                icon: Icons.speed_rounded,
+                color: accentColor,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
   });
 }

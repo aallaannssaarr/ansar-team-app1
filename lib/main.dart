@@ -519,6 +519,12 @@ class BranchAttendanceEntry {
     if (effectiveEnd.isBefore(effectiveStart)) return Duration.zero;
     return effectiveEnd.difference(effectiveStart);
   }
+
+  Duration displayedWorkedUntil(DateTime now, DateTime dayStart) {
+    if (!isOpen) return workedUntil(now, dayStart);
+    if (now.isBefore(checkIn)) return Duration.zero;
+    return now.difference(checkIn);
+  }
 }
 
 class BranchEmployeeDay {
@@ -543,6 +549,13 @@ class BranchEmployeeDay {
     return entries.fold(
       Duration.zero,
       (total, entry) => total + entry.workedUntil(now, dayStart),
+    );
+  }
+
+  Duration displayedWorkedUntil(DateTime now, DateTime dayStart) {
+    return entries.fold(
+      Duration.zero,
+      (total, entry) => total + entry.displayedWorkedUntil(now, dayStart),
     );
   }
 }
@@ -2847,7 +2860,7 @@ class BranchActiveEmployeeTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final openEntry = employeeDay.entries.firstWhere((entry) => entry.isOpen);
-    final worked = employeeDay.workedUntil(DateTime.now(), dayStart);
+    final worked = employeeDay.displayedWorkedUntil(DateTime.now(), dayStart);
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
       leading: EmployeeAvatar(name: employeeDay.employee.name, imageUrl: employeeDay.employee.avatarUrl),
@@ -2867,7 +2880,7 @@ class BranchEmployeeDayCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final now = DateTime.now();
-    final worked = employeeDay.workedUntil(now, dayStart);
+    final worked = employeeDay.displayedWorkedUntil(now, dayStart);
     return Card(
       margin: EdgeInsets.zero,
       child: Padding(
@@ -2918,7 +2931,7 @@ class BranchEmployeeDayCard extends StatelessWidget {
                     ),
                     const Spacer(),
                     Text(
-                      formatDurationCompact(entry.workedUntil(now, dayStart)),
+                      formatDurationCompact(entry.displayedWorkedUntil(now, dayStart)),
                       style: const TextStyle(color: brandColor, fontSize: 11, fontWeight: FontWeight.w800),
                     ),
                   ],
@@ -3250,7 +3263,7 @@ class _ReportsPageState extends State<ReportsPage> {
               physics: const NeverScrollableScrollPhysics(),
               crossAxisSpacing: 10,
               mainAxisSpacing: 10,
-              childAspectRatio: 1.48,
+              mainAxisExtent: 136,
               children: [
                 AnsarMetricCard(
                   label: 'إجمالي الساعات',
@@ -4597,13 +4610,14 @@ class _AccountInvoicesPageState extends State<AccountInvoicesPage> {
         .gte('date', startDate.text)
         .lte('date', endDate.text);
     if (kind != 'all') query = query.eq('kind', int.parse(kind));
-    final rows = await query.order('date', ascending: false).order('bnum', ascending: false).limit(300);
-    return rows.cast<Map<String, dynamic>>().where((bill) {
+    final rawRows = await query.order('date', ascending: false).order('bnum', ascending: false).limit(300);
+    final rows = invoiceRowsFromResponse(rawRows);
+    return rows.where((bill) {
       final info = paymentLabelFromRemark(bill['remark']);
       if (payment == 'cash') return info.isCash;
       if (payment == 'credit') return !info.isCash && info.text == 'آجل';
       return true;
-    }).map((bill) => {...bill, 'account_name': account['name']}).toList();
+    }).map<Map<String, dynamic>>((bill) => {...bill, 'account_name': account['name']}).toList();
   }
 
   void reload() {
@@ -5046,12 +5060,14 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
   }
 
   Future<void> shareInvoiceBytes(Uint8List bytes) async {
+    final directory = await Directory.systemTemp.createTemp('ansar-invoice-');
+    final file = File('${directory.path}${Platform.pathSeparator}$invoiceFileName');
+    await file.writeAsBytes(bytes, flush: true);
     try {
       await Share.shareXFiles(
-        [XFile.fromData(bytes, mimeType: 'application/pdf')],
+        [XFile(file.path, mimeType: 'application/pdf', name: invoiceFileName)],
         subject: 'فاتورة ${widget.bill['bnum'] ?? ''}',
         text: 'فاتورة ${widget.bill['account_name'] ?? widget.bill['accnum'] ?? ''}',
-        fileNameOverrides: [invoiceFileName],
       );
     } catch (_) {
       await Printing.sharePdf(bytes: bytes, filename: invoiceFileName);
@@ -5244,66 +5260,7 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
   }
 
   Future<Uint8List> buildFallbackInvoicePdf(SalesBillDetailsData data) async {
-    final fontBytes = await rootBundle.load('assets/fonts/NotoSansArabic-Variable.ttf');
-    final font = pw.Font.ttf(fontBytes);
-    final document = pw.Document(theme: pw.ThemeData.withFont(base: font, bold: font));
-    final isPurchase = nullableIntValue(widget.bill['kind']) == 1;
-    final total = doubleValue(widget.bill['totalvalue']);
-    final payment = paymentLabelFromRemark(widget.bill['remark']);
-    final rows = data.items.asMap().entries.map((entry) {
-      final item = entry.value;
-      return [
-        '${entry.key + 1}',
-        shortPdfText(item['product_name']?.toString() ?? 'مادة ${item['matnum'] ?? '-'}', 70),
-        formatMoneyValue(item['quantity']),
-        '\$ ${formatMoneyValue(item['price'])}',
-        '\$ ${formatMoneyValue(item['value'])}',
-      ];
-    }).toList();
-    document.addPage(
-      pw.MultiPage(
-        textDirection: pw.TextDirection.rtl,
-        pageTheme: pw.PageTheme(
-          pageFormat: PdfPageFormat.a4,
-          margin: const pw.EdgeInsets.all(28),
-        ),
-        footer: (context) => pw.Align(
-          alignment: pw.Alignment.centerLeft,
-          child: pw.Text('صفحة ${context.pageNumber} من ${context.pagesCount}', style: const pw.TextStyle(fontSize: 8)),
-        ),
-        build: (_) => [
-          pw.Text('مكتبة الأنصار', style: pw.TextStyle(fontSize: 25, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 6),
-          pw.Text(isPurchase ? 'فاتورة شراء' : 'فاتورة مبيع', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 10),
-          pw.Text('رقم الفاتورة: ${widget.bill['bnum'] ?? '-'}'),
-          pw.Text('الحساب: ${widget.bill['account_name'] ?? 'حساب ${widget.bill['accnum'] ?? '-'}'}'),
-          pw.Text('التاريخ: ${widget.bill['date'] ?? '-'} · الدفع: ${payment.text}'),
-          pw.SizedBox(height: 14),
-          pw.TableHelper.fromTextArray(
-            headers: const ['#', 'البيان', 'الكمية', 'السعر', 'الإجمالي'],
-            data: rows,
-            headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
-            headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
-            border: pw.TableBorder.all(color: PdfColors.grey400),
-            cellAlignment: pw.Alignment.centerRight,
-            headerAlignment: pw.Alignment.centerRight,
-            columnWidths: const {
-              0: pw.FixedColumnWidth(24),
-              1: pw.FlexColumnWidth(4),
-              2: pw.FlexColumnWidth(1.2),
-              3: pw.FlexColumnWidth(1.5),
-              4: pw.FlexColumnWidth(1.7),
-            },
-          ),
-          pw.SizedBox(height: 14),
-          pw.Text('الصافي: \$ ${formatMoneyValue(total)}', style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 6),
-          pw.Text(arabicUsdAmountInWords(total), textAlign: pw.TextAlign.center),
-        ],
-      ),
-    );
-    return document.save();
+    return buildPortableInvoicePdf(widget.bill, data);
   }
 
   @override
@@ -5437,6 +5394,80 @@ class SalesBillDetailsData {
 
   final List<Map<String, dynamic>> items;
   final Map<int, BranchOption> branches;
+}
+
+Future<Uint8List> buildPortableInvoicePdf(
+  Map<String, dynamic> bill,
+  SalesBillDetailsData data,
+) async {
+  final fontBytes = await rootBundle.load('assets/fonts/Amiri-Regular.ttf');
+  final font = pw.Font.ttf(fontBytes);
+  final document = pw.Document(theme: pw.ThemeData.withFont(base: font, bold: font));
+  final isPurchase = nullableIntValue(bill['kind']) == 1;
+  final total = doubleValue(bill['totalvalue']);
+  final payment = paymentLabelFromRemark(bill['remark']);
+  final rows = data.items.asMap().entries.map((entry) {
+    final item = entry.value;
+    return [
+      '${entry.key + 1}',
+      shortPdfText(item['product_name']?.toString() ?? 'مادة ${item['matnum'] ?? '-'}', 70),
+      formatMoneyValue(item['quantity']),
+      '\$ ${formatMoneyValue(item['price'])}',
+      '\$ ${formatMoneyValue(item['value'])}',
+    ];
+  }).toList();
+  document.addPage(
+    pw.MultiPage(
+      textDirection: pw.TextDirection.rtl,
+      pageTheme: pw.PageTheme(
+        pageFormat: PdfPageFormat.a4,
+        margin: const pw.EdgeInsets.all(28),
+      ),
+      footer: (context) => pw.Align(
+        alignment: pw.Alignment.centerLeft,
+        child: pw.Text('صفحة ${context.pageNumber} من ${context.pagesCount}', style: const pw.TextStyle(fontSize: 8)),
+      ),
+      build: (_) => [
+        pw.Text('مكتبة الأنصار', style: pw.TextStyle(fontSize: 25, fontWeight: pw.FontWeight.bold)),
+        pw.SizedBox(height: 6),
+        pw.Text(isPurchase ? 'فاتورة شراء' : 'فاتورة مبيع', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+        pw.SizedBox(height: 10),
+        pw.Text('رقم الفاتورة: ${bill['bnum'] ?? '-'}'),
+        pw.Text('الحساب: ${bill['account_name'] ?? 'حساب ${bill['accnum'] ?? '-'}'}'),
+        pw.Text('التاريخ: ${bill['date'] ?? '-'} · الدفع: ${payment.text}'),
+        pw.SizedBox(height: 14),
+        pw.TableHelper.fromTextArray(
+          headers: const ['#', 'البيان', 'الكمية', 'السعر', 'الإجمالي'],
+          data: rows,
+          headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
+          headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
+          border: pw.TableBorder.all(color: PdfColors.grey400),
+          cellAlignment: pw.Alignment.centerRight,
+          headerAlignment: pw.Alignment.centerRight,
+          columnWidths: const {
+            0: pw.FixedColumnWidth(24),
+            1: pw.FlexColumnWidth(4),
+            2: pw.FlexColumnWidth(1.2),
+            3: pw.FlexColumnWidth(1.5),
+            4: pw.FlexColumnWidth(1.7),
+          },
+        ),
+        pw.SizedBox(height: 14),
+        pw.Text('الصافي: \$ ${formatMoneyValue(total)}', style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
+        pw.SizedBox(height: 6),
+        pw.Text(arabicUsdAmountInWords(total), textAlign: pw.TextAlign.center),
+      ],
+    ),
+  );
+  return document.save();
+}
+
+List<Map<String, dynamic>> invoiceRowsFromResponse(Object? value) {
+  if (value is! List) return <Map<String, dynamic>>[];
+  return value
+      .whereType<Map>()
+      .map((row) => Map<String, dynamic>.from(row))
+      .toList(growable: false);
 }
 
 class InvoiceItemsTable extends StatelessWidget {
