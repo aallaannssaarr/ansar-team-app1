@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:app_links/app_links.dart';
 import 'package:fl_chart/fl_chart.dart';
@@ -95,6 +96,10 @@ void initializePushyService() {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  ui.PlatformDispatcher.instance.onError = (error, stack) {
+    debugPrint('Unhandled application error: $error\n$stack');
+    return true;
+  };
   ErrorWidget.builder = (details) => const Material(
         color: softSurface,
         child: Directionality(
@@ -116,14 +121,13 @@ Future<void> main() async {
           ),
         ),
       );
-  unawaited(initializeAppLinks());
   runApp(const AnsarApp());
-  unawaited(initializeDeferredServices());
 }
 
 Future<void>? coreServicesFuture;
 Future<void>? deferredServicesFuture;
 bool deferredServicesReady = false;
+bool firebaseServicesReady = false;
 final transferDeepLinks = StreamController<String>.broadcast();
 AppLinks? appLinks;
 StreamSubscription<Uri>? globalAppLinkSubscription;
@@ -150,16 +154,20 @@ Future<void> initializeDeferredServices() {
 }
 
 Future<void> _initializeDeferredServices() async {
+  firebaseServicesReady = false;
   try {
     await Firebase.initializeApp();
     FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
-    await RichNotificationService.initialize();
-    initializePushyService();
-    deferredServicesReady = true;
+    firebaseServicesReady = true;
   } catch (_) {
-    deferredServicesReady = false;
-    deferredServicesFuture = null;
+    // Firebase is optional at startup. Pushy can still be attempted later.
   }
+  try {
+    await RichNotificationService.initialize();
+  } catch (_) {
+    // Notification presentation must never prevent the application from opening.
+  }
+  deferredServicesReady = true;
 }
 
 String? transferOrderIdFromUri(Uri uri) {
@@ -200,11 +208,13 @@ Future<void> initializeAppLinks() async {
 }
 
 class EmployeeSessionStore {
-  static const sessionKey = 'ansar_employee_session_v1';
+  static const sessionKey = 'ansar_employee_session_v2';
+  static const legacySessionKey = 'ansar_employee_session_v1';
 
   static Future<void> save(EmployeeSession session) async {
     final preferences = await SharedPreferences.getInstance();
     await preferences.setString(sessionKey, jsonEncode(session.data));
+    await preferences.remove(legacySessionKey);
     await preferences.setString('ansar_employee_id', session.id);
   }
 
@@ -216,10 +226,20 @@ class EmployeeSessionStore {
       final decoded = jsonDecode(raw);
       if (decoded is! Map) return null;
       final data = Map<String, dynamic>.from(decoded);
-      if (data['id'] == null || data['username'] == null) return null;
+      final id = data['id']?.toString().trim() ?? '';
+      final username = data['username']?.toString().trim() ?? '';
+      if (id.isEmpty || username.isEmpty) {
+        await clear();
+        return null;
+      }
+      data['id'] = id;
+      data['username'] = username;
+      for (final key in ['display_name', 'full_name', 'role', 'avatar_url', 'phone', 'email', 'job_title']) {
+        if (data[key] != null) data[key] = data[key].toString();
+      }
       return EmployeeSession(data);
     } catch (_) {
-      await preferences.remove(sessionKey);
+      await clear();
       return null;
     }
   }
@@ -227,6 +247,7 @@ class EmployeeSessionStore {
   static Future<void> clear() async {
     final preferences = await SharedPreferences.getInstance();
     await preferences.remove(sessionKey);
+    await preferences.remove(legacySessionKey);
     await preferences.remove('ansar_employee_id');
   }
 }
@@ -281,7 +302,6 @@ class _BootstrapPageState extends State<BootstrapPage> {
     final services = initializeCoreServices();
     final session = await EmployeeSessionStore.load();
     await services;
-    unawaited(initializeDeferredServices());
     return session;
   }
 
@@ -359,22 +379,27 @@ class EmployeeSession {
 
   final Map<String, dynamic> data;
 
-  String get id => data['id'] as String;
-  String get name => (data['display_name'] ?? data['full_name'] ?? username) as String;
-  String get fullName => (data['full_name'] ?? name) as String;
-  String get username => data['username'] as String? ?? '';
+  String get id => data['id']?.toString() ?? '';
+  String get name => (data['display_name'] ?? data['full_name'] ?? username).toString();
+  String get fullName => (data['full_name'] ?? name).toString();
+  String get username => data['username']?.toString() ?? '';
   int? get assignedBranchNum => nullableIntValue(data['branch_num']);
   int get branchNum => assignedBranchNum ?? 0;
-  String get role => data['role'] as String? ?? 'employee';
-  String? get avatarUrl => data['avatar_url'] as String?;
-  String? get phone => data['phone'] as String?;
-  String? get email => data['email'] as String?;
-  String? get jobTitle => data['job_title'] as String?;
+  String get role => data['role']?.toString() ?? 'employee';
+  String? get avatarUrl => _optionalSessionString('avatar_url');
+  String? get phone => _optionalSessionString('phone');
+  String? get email => _optionalSessionString('email');
+  String? get jobTitle => _optionalSessionString('job_title');
   bool get canManageEmployees => data['can_manage_employees'] == true;
   bool get canManageAllBranches => data['can_manage_all_branches'] == true;
   bool get isAdmin => role == 'admin' || canManageAllBranches;
   bool get isGeneralAdmin => role == 'admin' || canManageAllBranches;
   bool get isBranchManager => role == 'branch_manager';
+
+  String? _optionalSessionString(String key) {
+    final value = data[key]?.toString().trim();
+    return value == null || value.isEmpty ? null : value;
+  }
 }
 
 class BranchOption {
@@ -775,21 +800,39 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     session = widget.initialSession;
-    unawaited(EmployeeSessionStore.save(session));
-    unawaited(touchEmployeePresence(session.id, online: true));
-    startInAppNotificationMonitor();
-    startUnreadMessagesMonitor();
-    transferDeepLinkSubscription = transferDeepLinks.stream.listen(openTransferDeepLink);
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      runGuardedStartupTask('save-session', () => EmployeeSessionStore.save(session));
+      runGuardedStartupTask('presence', () => touchEmployeePresence(session.id, online: true));
+      try {
+        startInAppNotificationMonitor();
+        startUnreadMessagesMonitor();
+        transferDeepLinkSubscription = transferDeepLinks.stream.listen(openTransferDeepLink);
+      } catch (error, stack) {
+        debugPrint('Home startup monitor error: $error\n$stack');
+      }
+      runGuardedStartupTask('app-links', initializeAppLinks);
       final orderId = pendingTransferOrderId;
-      if (mounted && orderId != null) unawaited(openTransferDeepLink(orderId));
+      if (orderId != null) runGuardedStartupTask('transfer-link', () => openTransferDeepLink(orderId));
+      runGuardedStartupTask('notifications', initializeHomeNotificationServices);
+      if (widget.restoredSession) runGuardedStartupTask('refresh-session', refreshRestoredSession);
     });
-    unawaited(initializeHomeNotificationServices());
-    if (widget.restoredSession) unawaited(refreshRestoredSession());
+  }
+
+  void runGuardedStartupTask(String name, Future<void> Function() task) {
+    unawaited(() async {
+      try {
+        await task();
+      } catch (error, stack) {
+        debugPrint('Startup task $name failed: $error\n$stack');
+      }
+    }());
   }
 
   Future<void> initializeHomeNotificationServices() async {
     if (notificationServicesInitialized) return;
+    await Future<void>.delayed(const Duration(milliseconds: 900));
+    if (!mounted) return;
     await initializeDeferredServices();
     if (!mounted || !deferredServicesReady || notificationServicesInitialized) return;
     notificationServicesInitialized = true;
@@ -801,6 +844,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
     unawaited(RichNotificationService.emitPendingClick());
     startNotificationRegistrationMonitor();
+    if (!firebaseServicesReady) return;
     foregroundMessages = FirebaseMessaging.onMessage.listen((message) {
       if (!mounted) return;
       if (message.data['sender_id'] == session.id) return;
@@ -891,7 +935,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   void initializePushyNotifications() {
-    initializePushyService();
     pushyClicks?.cancel();
     pushyClicks = pushyNotificationClicks.stream.listen((data) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -14964,18 +15007,20 @@ Future<void> registerDeviceForNotifications(EmployeeSession session) async {
     firebaseError = error;
   }
 
-  try {
-    Pushy.listen();
-    final token = await Pushy.register();
-    if (token.isNotEmpty) {
-      pushyToken = token;
+  if (fcmToken == null) {
+    try {
+      initializePushyService();
+      final token = await Pushy.register();
+      if (token.isNotEmpty) {
+        pushyToken = token;
+        final preferences = await SharedPreferences.getInstance();
+        await preferences.setString('ansar_pushy_token', token);
+      }
+    } catch (error) {
+      pushyError = error;
       final preferences = await SharedPreferences.getInstance();
-      await preferences.setString('ansar_pushy_token', token);
+      pushyToken = preferences.getString('ansar_pushy_token');
     }
-  } catch (error) {
-    pushyError = error;
-    final preferences = await SharedPreferences.getInstance();
-    pushyToken = preferences.getString('ansar_pushy_token');
   }
 
   try {
