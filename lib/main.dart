@@ -5100,24 +5100,9 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
     final payment = paymentLabelFromRemark(widget.bill['remark']);
     final stoNum = parseStoNum(widget.bill['remark']);
     final branchName = stoNum == null ? salesBookName(widget.bill['book']) : branchLabel(data.branches, stoNum);
-    final itemRows = data.items.asMap().entries.map((entry) {
-      final item = entry.value;
-      final quantity = doubleValue(item['quantity']);
-      final price = doubleValue(item['price']);
-      final value = doubleValue(item['value']);
-      final productName = item['product_name']?.toString();
-      final discountPercent = invoiceItemDiscountPercent(item);
-      final netUnit = quantity == 0 ? 0 : value / quantity;
-      return [
-        '${entry.key + 1}',
-        productName == null || productName.isEmpty ? 'مادة ${item['matnum'] ?? '-'}' : productName,
-        formatMoneyValue(quantity),
-        '\$ ${formatMoneyValue(price)}',
-        discountPercent <= 0 ? '-' : '${formatMoneyValue(discountPercent)}%',
-        '\$ ${formatMoneyValue(netUnit)}',
-        '\$ ${formatMoneyValue(value)}',
-      ];
-    }).toList();
+    final itemRows = data.items.asMap().entries.map(
+      (entry) => invoicePdfRtlRow(entry.value, entry.key),
+    ).toList();
 
     document.addPage(
       pw.MultiPage(
@@ -5189,7 +5174,7 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
           ),
           pw.SizedBox(height: 14),
           pw.TableHelper.fromTextArray(
-            headers: const ['#', 'البيان', 'الكمية', 'السعر', 'الحسم %', 'صافي سعر الوحدة', 'الإجمالي'],
+            headers: invoicePdfRtlHeaders,
             data: itemRows,
             headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white, fontSize: 10),
             headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
@@ -5200,13 +5185,13 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
             headerAlignment: pw.Alignment.centerRight,
             border: pw.TableBorder.all(color: PdfColors.grey300, width: 0.6),
             columnWidths: const {
-              0: pw.FixedColumnWidth(24),
-              1: pw.FlexColumnWidth(4),
+              0: pw.FlexColumnWidth(1.7),
+              1: pw.FlexColumnWidth(1.8),
               2: pw.FlexColumnWidth(1.2),
               3: pw.FlexColumnWidth(1.5),
               4: pw.FlexColumnWidth(1.2),
-              5: pw.FlexColumnWidth(1.8),
-              6: pw.FlexColumnWidth(1.7),
+              5: pw.FlexColumnWidth(4),
+              6: pw.FixedColumnWidth(24),
             },
           ),
           pw.SizedBox(height: 14),
@@ -5394,6 +5379,38 @@ class SalesBillDetailsData {
   final Map<int, BranchOption> branches;
 }
 
+// PDF tables lay out their stored columns in the opposite visual order when
+// the page direction is RTL. Keep the stored order reversed so the rendered
+// invoice starts with the row number on the right and ends with the total on
+// the left.
+const invoicePdfRtlHeaders = <String>[
+  'الإجمالي',
+  'صافي سعر الوحدة',
+  'الحسم %',
+  'السعر',
+  'الكمية',
+  'البيان',
+  '#',
+];
+
+List<String> invoicePdfRtlRow(Map<String, dynamic> item, int index) {
+  final quantity = doubleValue(item['quantity']);
+  final price = doubleValue(item['price']);
+  final value = doubleValue(item['value']);
+  final productName = item['product_name']?.toString();
+  final discountPercent = invoiceItemDiscountPercent(item);
+  final netUnit = quantity == 0 ? 0 : value / quantity;
+  return [
+    '\$ ${formatMoneyValue(value)}',
+    '\$ ${formatMoneyValue(netUnit)}',
+    discountPercent <= 0 ? '-' : '${formatMoneyValue(discountPercent)}%',
+    '\$ ${formatMoneyValue(price)}',
+    formatMoneyValue(quantity),
+    productName == null || productName.isEmpty ? 'مادة ${item['matnum'] ?? '-'}' : productName,
+    '${index + 1}',
+  ];
+}
+
 Future<Uint8List> buildPortableInvoicePdf(
   Map<String, dynamic> bill,
   SalesBillDetailsData data,
@@ -5405,14 +5422,9 @@ Future<Uint8List> buildPortableInvoicePdf(
   final total = doubleValue(bill['totalvalue']);
   final payment = paymentLabelFromRemark(bill['remark']);
   final rows = data.items.asMap().entries.map((entry) {
-    final item = entry.value;
-    return [
-      '${entry.key + 1}',
-      shortPdfText(item['product_name']?.toString() ?? 'مادة ${item['matnum'] ?? '-'}', 70),
-      formatMoneyValue(item['quantity']),
-      '\$ ${formatMoneyValue(item['price'])}',
-      '\$ ${formatMoneyValue(item['value'])}',
-    ];
+    final row = invoicePdfRtlRow(entry.value, entry.key);
+    row[5] = shortPdfText(row[5], 70);
+    return row;
   }).toList();
   document.addPage(
     pw.MultiPage(
@@ -5433,7 +5445,7 @@ Future<Uint8List> buildPortableInvoicePdf(
         pw.Text('التاريخ: ${bill['date'] ?? '-'} · الدفع: ${payment.text}'),
         pw.SizedBox(height: 14),
         pw.TableHelper.fromTextArray(
-          headers: const ['#', 'البيان', 'الكمية', 'السعر', 'الإجمالي'],
+          headers: invoicePdfRtlHeaders,
           data: rows,
           headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
           headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
@@ -5441,11 +5453,13 @@ Future<Uint8List> buildPortableInvoicePdf(
           cellAlignment: pw.Alignment.centerRight,
           headerAlignment: pw.Alignment.centerRight,
           columnWidths: const {
-            0: pw.FixedColumnWidth(24),
-            1: pw.FlexColumnWidth(4),
+            0: pw.FlexColumnWidth(1.7),
+            1: pw.FlexColumnWidth(1.8),
             2: pw.FlexColumnWidth(1.2),
             3: pw.FlexColumnWidth(1.5),
-            4: pw.FlexColumnWidth(1.7),
+            4: pw.FlexColumnWidth(1.2),
+            5: pw.FlexColumnWidth(4),
+            6: pw.FixedColumnWidth(24),
           },
         ),
         pw.SizedBox(height: 14),

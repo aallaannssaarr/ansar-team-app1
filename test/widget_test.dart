@@ -571,6 +571,25 @@ void main() {
     expect(rows.single['bnum'], 12);
   });
 
+  test('invoice PDF columns render from row number on the right to total on the left', () {
+    final row = invoicePdfRtlRow(
+      {
+        'matnum': 1,
+        'product_name': 'كتاب تجريبي',
+        'quantity': 2,
+        'price': 15,
+        'value': 24,
+      },
+      0,
+    );
+
+    expect(invoicePdfRtlHeaders.first, 'الإجمالي');
+    expect(invoicePdfRtlHeaders.last, '#');
+    expect(row.first, '\$ 24');
+    expect(row[5], 'كتاب تجريبي');
+    expect(row.last, '1');
+  });
+
   testWidgets('portable Arabic invoice PDF is generated', (tester) async {
     final bytes = await buildPortableInvoicePdf(
       {
