@@ -116,20 +116,20 @@ Future<void> main() async {
           ),
         ),
       );
+  appLinks ??= AppLinks();
+  unawaited(initializeAppLinks());
+  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
   if (kIsBetaBuild) {
-    appLinks ??= AppLinks();
-    unawaited(initializeAppLinks());
-    FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
     runApp(const AnsarApp());
     return;
   }
 
   await Firebase.initializeApp();
-  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
   await Supabase.initialize(
     url: AnsarConfig.supabaseUrl,
     publishableKey: AnsarConfig.supabaseServiceKey,
   );
+  coreServicesFuture = Future<void>.value();
   await RichNotificationService.initialize();
   initializePushyService();
   deferredServicesReady = true;
@@ -205,9 +205,21 @@ Future<void> initializeAppLinks() async {
 class EmployeeSessionStore {
   static const sessionKey = 'ansar_employee_session_v1';
 
+  static Map<String, dynamic> persistableData(Map<String, dynamic> source) {
+    final data = Map<String, dynamic>.from(source);
+    data.removeWhere((key, _) {
+      final normalized = key.toLowerCase();
+      return normalized.contains('password') ||
+          normalized.contains('secret') ||
+          normalized == 'pin' ||
+          normalized == 'passcode';
+    });
+    return data;
+  }
+
   static Future<void> save(EmployeeSession session) async {
     final preferences = await SharedPreferences.getInstance();
-    await preferences.setString(sessionKey, jsonEncode(session.data));
+    await preferences.setString(sessionKey, jsonEncode(persistableData(session.data)));
     await preferences.setString('ansar_employee_id', session.id);
   }
 
@@ -218,8 +230,9 @@ class EmployeeSessionStore {
     try {
       final decoded = jsonDecode(raw);
       if (decoded is! Map) return null;
-      final data = Map<String, dynamic>.from(decoded);
+      final data = persistableData(Map<String, dynamic>.from(decoded));
       if (data['id'] == null || data['username'] == null) return null;
+      await preferences.setString(sessionKey, jsonEncode(data));
       return EmployeeSession(data);
     } catch (_) {
       await preferences.remove(sessionKey);
@@ -258,7 +271,7 @@ class AnsarApp extends StatelessWidget {
       theme: buildAnsarTheme(),
       home: Directionality(
         textDirection: TextDirection.rtl,
-        child: kIsBetaBuild ? const BootstrapPage() : const LoginPage(),
+        child: const BootstrapPage(),
       ),
     );
   }
@@ -793,13 +806,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     unawaited(touchEmployeePresence(session.id, online: true));
     startInAppNotificationMonitor();
     startUnreadMessagesMonitor();
-    if (kIsBetaBuild) {
-      transferDeepLinkSubscription = transferDeepLinks.stream.listen(openTransferDeepLink);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        final orderId = pendingTransferOrderId;
-        if (mounted && orderId != null) unawaited(openTransferDeepLink(orderId));
-      });
-    }
+    transferDeepLinkSubscription = transferDeepLinks.stream.listen(openTransferDeepLink);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final orderId = pendingTransferOrderId;
+      if (mounted && orderId != null) unawaited(openTransferDeepLink(orderId));
+    });
     unawaited(initializeHomeNotificationServices());
     if (widget.restoredSession) unawaited(refreshRestoredSession());
   }
@@ -8627,14 +8638,12 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                         icon: const Icon(Icons.forum_outlined),
                         label: const Text('مشاركة في الدردشة'),
                       ),
-                      if (kIsBetaBuild) ...[
-                        const SizedBox(height: 8),
-                        OutlinedButton.icon(
-                          onPressed: shareOnWhatsApp,
-                          icon: const Icon(Icons.share_rounded),
-                          label: const Text('مشاركة عبر واتساب'),
-                        ),
-                      ],
+                      const SizedBox(height: 8),
+                      OutlinedButton.icon(
+                        onPressed: shareOnWhatsApp,
+                        icon: const Icon(Icons.share_rounded),
+                        label: const Text('مشاركة عبر واتساب'),
+                      ),
                       if (fromBranch == widget.session.branchNum && widget.order['status'] == 'preparing') ...[
                         const SizedBox(height: 10),
                         Container(

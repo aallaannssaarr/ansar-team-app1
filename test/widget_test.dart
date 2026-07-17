@@ -2,6 +2,7 @@ import 'package:ansar_team_app/main.dart';
 import 'package:ansar_team_app/product_cache.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 Widget _testShell(Widget child) {
   return MaterialApp(
@@ -263,6 +264,10 @@ void main() {
     expect(wording, contains('خمسون'));
     expect(wording, contains('سنت'));
     expect(
+      transferOrderIdFromUri(Uri.parse('ansarteam://transfer/order-18')),
+      'order-18',
+    );
+    expect(
       transferOrderIdFromUri(Uri.parse('ansarteambeta://transfer/order-19')),
       'order-19',
     );
@@ -270,6 +275,30 @@ void main() {
       transferOrderIdFromUri(Uri.parse('https://ansar-team.web.app/transfer/order-20')),
       'order-20',
     );
+  });
+
+  test('employee session remains saved until logout without sensitive fields', () async {
+    SharedPreferences.setMockInitialValues({});
+    final session = EmployeeSession({
+      'id': 'employee-1',
+      'display_name': 'موظف تجريبي',
+      'username': 'employee1',
+      'branch_num': 2,
+      'role': 'employee',
+      'password': 'must-not-be-saved',
+    });
+
+    await EmployeeSessionStore.save(session);
+    final preferences = await SharedPreferences.getInstance();
+    expect(preferences.getString(EmployeeSessionStore.sessionKey), isNot(contains('must-not-be-saved')));
+
+    final restored = await EmployeeSessionStore.load();
+    expect(restored?.id, 'employee-1');
+    expect(restored?.username, 'employee1');
+    expect(restored?.data.containsKey('password'), isFalse);
+
+    await EmployeeSessionStore.clear();
+    expect(await EmployeeSessionStore.load(), isNull);
   });
 
   testWidgets('chat list labels the current employee last message as mine', (tester) async {
