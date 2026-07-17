@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:ui' as ui;
 
 import 'package:app_links/app_links.dart';
 import 'package:fl_chart/fl_chart.dart';
@@ -96,10 +95,6 @@ void initializePushyService() {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  ui.PlatformDispatcher.instance.onError = (error, stack) {
-    debugPrint('Unhandled application error: $error\n$stack');
-    return true;
-  };
   ErrorWidget.builder = (details) => const Material(
         color: softSurface,
         child: Directionality(
@@ -121,32 +116,40 @@ Future<void> main() async {
           ),
         ),
       );
+  if (kIsBetaBuild) {
+    appLinks ??= AppLinks();
+    unawaited(initializeAppLinks());
+    FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
+    runApp(const AnsarApp());
+    return;
+  }
+
+  await Firebase.initializeApp();
+  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
+  await Supabase.initialize(
+    url: AnsarConfig.supabaseUrl,
+    publishableKey: AnsarConfig.supabaseServiceKey,
+  );
+  await RichNotificationService.initialize();
+  initializePushyService();
+  deferredServicesReady = true;
+  deferredServicesFuture = Future<void>.value();
   runApp(const AnsarApp());
 }
 
 Future<void>? coreServicesFuture;
 Future<void>? deferredServicesFuture;
 bool deferredServicesReady = false;
-bool firebaseServicesReady = false;
 final transferDeepLinks = StreamController<String>.broadcast();
 AppLinks? appLinks;
 StreamSubscription<Uri>? globalAppLinkSubscription;
 String? pendingTransferOrderId;
 
 Future<void> initializeCoreServices() {
-  return coreServicesFuture ??= _initializeCoreServices();
-}
-
-Future<void> _initializeCoreServices() async {
-  try {
-    await Supabase.initialize(
-      url: AnsarConfig.supabaseUrl,
-      publishableKey: AnsarConfig.supabaseServiceKey,
-    );
-  } catch (_) {
-    coreServicesFuture = null;
-    rethrow;
-  }
+  return coreServicesFuture ??= Supabase.initialize(
+    url: AnsarConfig.supabaseUrl,
+    publishableKey: AnsarConfig.supabaseServiceKey,
+  );
 }
 
 Future<void> initializeDeferredServices() {
@@ -154,20 +157,15 @@ Future<void> initializeDeferredServices() {
 }
 
 Future<void> _initializeDeferredServices() async {
-  firebaseServicesReady = false;
   try {
     await Firebase.initializeApp();
-    FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
-    firebaseServicesReady = true;
-  } catch (_) {
-    // Firebase is optional at startup. Pushy can still be attempted later.
-  }
-  try {
     await RichNotificationService.initialize();
+    initializePushyService();
+    deferredServicesReady = true;
   } catch (_) {
-    // Notification presentation must never prevent the application from opening.
+    deferredServicesReady = false;
+    deferredServicesFuture = null;
   }
-  deferredServicesReady = true;
 }
 
 String? transferOrderIdFromUri(Uri uri) {
@@ -194,12 +192,9 @@ void rememberTransferDeepLink(Uri uri) {
 }
 
 Future<void> initializeAppLinks() async {
+  appLinks ??= AppLinks();
+  globalAppLinkSubscription ??= appLinks!.uriLinkStream.listen(rememberTransferDeepLink);
   try {
-    appLinks ??= AppLinks();
-    globalAppLinkSubscription ??= appLinks!.uriLinkStream.listen(
-      rememberTransferDeepLink,
-      onError: (_) {},
-    );
     final initialLink = await appLinks!.getInitialLink();
     if (initialLink != null) rememberTransferDeepLink(initialLink);
   } catch (_) {
@@ -208,13 +203,11 @@ Future<void> initializeAppLinks() async {
 }
 
 class EmployeeSessionStore {
-  static const sessionKey = 'ansar_employee_session_v2';
-  static const legacySessionKey = 'ansar_employee_session_v1';
+  static const sessionKey = 'ansar_employee_session_v1';
 
   static Future<void> save(EmployeeSession session) async {
     final preferences = await SharedPreferences.getInstance();
     await preferences.setString(sessionKey, jsonEncode(session.data));
-    await preferences.remove(legacySessionKey);
     await preferences.setString('ansar_employee_id', session.id);
   }
 
@@ -226,20 +219,10 @@ class EmployeeSessionStore {
       final decoded = jsonDecode(raw);
       if (decoded is! Map) return null;
       final data = Map<String, dynamic>.from(decoded);
-      final id = data['id']?.toString().trim() ?? '';
-      final username = data['username']?.toString().trim() ?? '';
-      if (id.isEmpty || username.isEmpty) {
-        await clear();
-        return null;
-      }
-      data['id'] = id;
-      data['username'] = username;
-      for (final key in ['display_name', 'full_name', 'role', 'avatar_url', 'phone', 'email', 'job_title']) {
-        if (data[key] != null) data[key] = data[key].toString();
-      }
+      if (data['id'] == null || data['username'] == null) return null;
       return EmployeeSession(data);
     } catch (_) {
-      await clear();
+      await preferences.remove(sessionKey);
       return null;
     }
   }
@@ -247,7 +230,6 @@ class EmployeeSessionStore {
   static Future<void> clear() async {
     final preferences = await SharedPreferences.getInstance();
     await preferences.remove(sessionKey);
-    await preferences.remove(legacySessionKey);
     await preferences.remove('ansar_employee_id');
   }
 }
@@ -276,7 +258,7 @@ class AnsarApp extends StatelessWidget {
       theme: buildAnsarTheme(),
       home: Directionality(
         textDirection: TextDirection.rtl,
-        child: const BootstrapPage(),
+        child: kIsBetaBuild ? const BootstrapPage() : const LoginPage(),
       ),
     );
   }
@@ -299,9 +281,9 @@ class _BootstrapPageState extends State<BootstrapPage> {
   }
 
   Future<EmployeeSession?> prepareApplication() async {
-    final services = initializeCoreServices();
+    await initializeCoreServices();
     final session = await EmployeeSessionStore.load();
-    await services;
+    unawaited(initializeDeferredServices());
     return session;
   }
 
@@ -379,27 +361,22 @@ class EmployeeSession {
 
   final Map<String, dynamic> data;
 
-  String get id => data['id']?.toString() ?? '';
-  String get name => (data['display_name'] ?? data['full_name'] ?? username).toString();
-  String get fullName => (data['full_name'] ?? name).toString();
-  String get username => data['username']?.toString() ?? '';
+  String get id => data['id'] as String;
+  String get name => (data['display_name'] ?? data['full_name'] ?? username) as String;
+  String get fullName => (data['full_name'] ?? name) as String;
+  String get username => data['username'] as String? ?? '';
   int? get assignedBranchNum => nullableIntValue(data['branch_num']);
   int get branchNum => assignedBranchNum ?? 0;
-  String get role => data['role']?.toString() ?? 'employee';
-  String? get avatarUrl => _optionalSessionString('avatar_url');
-  String? get phone => _optionalSessionString('phone');
-  String? get email => _optionalSessionString('email');
-  String? get jobTitle => _optionalSessionString('job_title');
+  String get role => data['role'] as String? ?? 'employee';
+  String? get avatarUrl => data['avatar_url'] as String?;
+  String? get phone => data['phone'] as String?;
+  String? get email => data['email'] as String?;
+  String? get jobTitle => data['job_title'] as String?;
   bool get canManageEmployees => data['can_manage_employees'] == true;
   bool get canManageAllBranches => data['can_manage_all_branches'] == true;
   bool get isAdmin => role == 'admin' || canManageAllBranches;
   bool get isGeneralAdmin => role == 'admin' || canManageAllBranches;
   bool get isBranchManager => role == 'branch_manager';
-
-  String? _optionalSessionString(String key) {
-    final value = data[key]?.toString().trim();
-    return value == null || value.isEmpty ? null : value;
-  }
 }
 
 class BranchOption {
@@ -633,7 +610,6 @@ class _LoginPageState extends State<LoginPage> {
     });
 
     try {
-      await initializeCoreServices();
       final username = usernameController.text.trim();
       final rows = await supabase
           .from('ansar_employees')
@@ -800,39 +776,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     session = widget.initialSession;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      runGuardedStartupTask('save-session', () => EmployeeSessionStore.save(session));
-      runGuardedStartupTask('presence', () => touchEmployeePresence(session.id, online: true));
-      try {
-        startInAppNotificationMonitor();
-        startUnreadMessagesMonitor();
-        transferDeepLinkSubscription = transferDeepLinks.stream.listen(openTransferDeepLink);
-      } catch (error, stack) {
-        debugPrint('Home startup monitor error: $error\n$stack');
-      }
-      runGuardedStartupTask('app-links', initializeAppLinks);
-      final orderId = pendingTransferOrderId;
-      if (orderId != null) runGuardedStartupTask('transfer-link', () => openTransferDeepLink(orderId));
-      runGuardedStartupTask('notifications', initializeHomeNotificationServices);
-      if (widget.restoredSession) runGuardedStartupTask('refresh-session', refreshRestoredSession);
-    });
-  }
-
-  void runGuardedStartupTask(String name, Future<void> Function() task) {
-    unawaited(() async {
-      try {
-        await task();
-      } catch (error, stack) {
-        debugPrint('Startup task $name failed: $error\n$stack');
-      }
-    }());
+    unawaited(EmployeeSessionStore.save(session));
+    unawaited(touchEmployeePresence(session.id, online: true));
+    startInAppNotificationMonitor();
+    startUnreadMessagesMonitor();
+    if (kIsBetaBuild) {
+      transferDeepLinkSubscription = transferDeepLinks.stream.listen(openTransferDeepLink);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final orderId = pendingTransferOrderId;
+        if (mounted && orderId != null) unawaited(openTransferDeepLink(orderId));
+      });
+    }
+    unawaited(initializeHomeNotificationServices());
+    if (widget.restoredSession) unawaited(refreshRestoredSession());
   }
 
   Future<void> initializeHomeNotificationServices() async {
     if (notificationServicesInitialized) return;
-    await Future<void>.delayed(const Duration(milliseconds: 900));
-    if (!mounted) return;
     await initializeDeferredServices();
     if (!mounted || !deferredServicesReady || notificationServicesInitialized) return;
     notificationServicesInitialized = true;
@@ -844,7 +804,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
     unawaited(RichNotificationService.emitPendingClick());
     startNotificationRegistrationMonitor();
-    if (!firebaseServicesReady) return;
     foregroundMessages = FirebaseMessaging.onMessage.listen((message) {
       if (!mounted) return;
       if (message.data['sender_id'] == session.id) return;
@@ -935,6 +894,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   void initializePushyNotifications() {
+    initializePushyService();
     pushyClicks?.cancel();
     pushyClicks = pushyNotificationClicks.stream.listen((data) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -4629,11 +4589,10 @@ class _AccountInvoicesPageState extends State<AccountInvoicesPage> {
   Future<List<Map<String, dynamic>>> loadBills() async {
     final account = selectedAccount;
     if (account == null) return [];
-    final accountNumber = nullableIntValue(account['num']) ?? account['num'];
     dynamic query = supabase
         .from('bills_full')
         .select('book, bnum, date, accnum, totalvalue, remark, kind')
-        .eq('accnum', accountNumber)
+        .eq('accnum', account['num'])
         .gte('date', startDate.text)
         .lte('date', endDate.text);
     if (kind != 'all') query = query.eq('kind', int.parse(kind));
@@ -4686,79 +4645,6 @@ class _AccountInvoicesPageState extends State<AccountInvoicesPage> {
     });
   }
 
-  Future<String?> pickFilterValue({
-    required String title,
-    required String currentValue,
-    required List<(String, String)> options,
-  }) {
-    return showModalBottomSheet<String>(
-      context: context,
-      showDragHandle: true,
-      useSafeArea: true,
-      builder: (context) => Directionality(
-        textDirection: TextDirection.rtl,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 4, 20, 10),
-              child: Text(title, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
-            ),
-            for (final option in options)
-              ListTile(
-                leading: Icon(
-                  option.$1 == currentValue ? Icons.check_circle_rounded : Icons.circle_outlined,
-                  color: option.$1 == currentValue ? brandColor : mutedInk,
-                ),
-                title: Text(option.$2, style: const TextStyle(fontWeight: FontWeight.w700)),
-                onTap: () => Navigator.of(context).pop(option.$1),
-              ),
-            const SizedBox(height: 12),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Future<void> chooseKindFilter() async {
-    final value = await pickFilterValue(
-      title: 'نوع الفاتورة',
-      currentValue: kind,
-      options: const [('all', 'الكل'), ('0', 'مبيع'), ('1', 'شراء')],
-    );
-    if (value == null || !mounted) return;
-    setState(() {
-      kind = value;
-      if (selectedAccount != null) future = loadBills();
-    });
-  }
-
-  Future<void> choosePaymentFilter() async {
-    final value = await pickFilterValue(
-      title: 'طريقة الدفع',
-      currentValue: payment,
-      options: const [('all', 'الكل'), ('cash', 'نقداً'), ('credit', 'آجل')],
-    );
-    if (value == null || !mounted) return;
-    setState(() {
-      payment = value;
-      if (selectedAccount != null) future = loadBills();
-    });
-  }
-
-  String get kindLabel => switch (kind) {
-        '0' => 'مبيع',
-        '1' => 'شراء',
-        _ => 'الكل',
-      };
-
-  String get paymentLabel => switch (payment) {
-        'cash' => 'نقداً',
-        'credit' => 'آجل',
-        _ => 'الكل',
-      };
-
   @override
   Widget build(BuildContext context) {
     const periods = [
@@ -4797,10 +4683,8 @@ class _AccountInvoicesPageState extends State<AccountInvoicesPage> {
                           : null,
                     ),
                     onChanged: (value) {
-                      setState(() {
-                        selectedAccount = null;
-                        future = null;
-                      });
+                      selectedAccount = null;
+                      future = null;
                       queueAccountSearch(value);
                     },
                   ),
@@ -4847,36 +4731,32 @@ class _AccountInvoicesPageState extends State<AccountInvoicesPage> {
                     Wrap(
                       spacing: 7,
                       runSpacing: 7,
-                      children: periods.map((item) {
-                        final selected = period == item.$1;
-                        return selected
-                            ? FilledButton.icon(
-                                onPressed: () => applyPeriod(item.$1),
-                                icon: const Icon(Icons.check_rounded, size: 17),
+                      children: periods
+                          .map((item) => ChoiceChip(
+                                selected: period == item.$1,
                                 label: Text(item.$2),
-                              )
-                            : OutlinedButton(
-                                onPressed: () => applyPeriod(item.$1),
-                                child: Text(item.$2),
-                              );
-                      }).toList(),
+                                onSelected: (_) => applyPeriod(item.$1),
+                              ))
+                          .toList(),
                     ),
                     const SizedBox(height: 10),
                     Row(
                       children: [
                         Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: () => pickDate(startDate),
-                            icon: const Icon(Icons.calendar_today_outlined, size: 18),
-                            label: Text('من ${startDate.text}', overflow: TextOverflow.ellipsis),
+                          child: TextField(
+                            controller: startDate,
+                            readOnly: true,
+                            onTap: () => pickDate(startDate),
+                            decoration: const InputDecoration(labelText: 'من تاريخ', prefixIcon: Icon(Icons.calendar_today_outlined)),
                           ),
                         ),
                         const SizedBox(width: 8),
                         Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: () => pickDate(endDate),
-                            icon: const Icon(Icons.event_available_outlined, size: 18),
-                            label: Text('إلى ${endDate.text}', overflow: TextOverflow.ellipsis),
+                          child: TextField(
+                            controller: endDate,
+                            readOnly: true,
+                            onTap: () => pickDate(endDate),
+                            decoration: const InputDecoration(labelText: 'إلى تاريخ', prefixIcon: Icon(Icons.event_available_outlined)),
                           ),
                         ),
                       ],
@@ -4885,27 +4765,37 @@ class _AccountInvoicesPageState extends State<AccountInvoicesPage> {
                     Row(
                       children: [
                         Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: chooseKindFilter,
-                            icon: const Icon(Icons.receipt_long_outlined, size: 18),
-                            label: Text('النوع: $kindLabel'),
+                          child: DropdownButtonFormField<String>(
+                            initialValue: kind,
+                            decoration: const InputDecoration(labelText: 'نوع الفاتورة'),
+                            items: const [
+                              DropdownMenuItem(value: 'all', child: Text('الكل')),
+                              DropdownMenuItem(value: '0', child: Text('مبيع')),
+                              DropdownMenuItem(value: '1', child: Text('شراء')),
+                            ],
+                            onChanged: (value) {
+                              kind = value ?? 'all';
+                              reload();
+                            },
                           ),
                         ),
                         const SizedBox(width: 8),
                         Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: choosePaymentFilter,
-                            icon: const Icon(Icons.payments_outlined, size: 18),
-                            label: Text('الدفع: $paymentLabel'),
+                          child: DropdownButtonFormField<String>(
+                            initialValue: payment,
+                            decoration: const InputDecoration(labelText: 'الدفع'),
+                            items: const [
+                              DropdownMenuItem(value: 'all', child: Text('الكل')),
+                              DropdownMenuItem(value: 'cash', child: Text('نقداً')),
+                              DropdownMenuItem(value: 'credit', child: Text('آجل')),
+                            ],
+                            onChanged: (value) {
+                              payment = value ?? 'all';
+                              reload();
+                            },
                           ),
                         ),
                       ],
-                    ),
-                    const SizedBox(height: 10),
-                    FilledButton.icon(
-                      onPressed: reload,
-                      icon: const Icon(Icons.search_rounded),
-                      label: const Text('عرض الفواتير'),
                     ),
                   ],
                 ),
@@ -5055,17 +4945,10 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
   Future<void> printInvoice(SalesBillDetailsData data) async {
     setState(() => pdfBusy = true);
     try {
-      final bytes = await buildInvoicePdf(data);
-      try {
-        final opened = await Printing.layoutPdf(
-          name: invoiceFileName,
-          onLayout: (_) async => bytes,
-        );
-        if (!opened) await shareInvoiceBytes(bytes);
-      } catch (_) {
-        await shareInvoiceBytes(bytes);
-        if (mounted) showSnack(context, 'تم إنشاء ملف الفاتورة ويمكنك حفظه أو مشاركته');
-      }
+      await Printing.layoutPdf(
+        name: invoiceFileName,
+        onLayout: (_) => buildInvoicePdf(data),
+      );
     } catch (error) {
       if (mounted) showSnack(context, 'تعذر طباعة الفاتورة. ${cleanError(error)}');
     } finally {
@@ -5077,7 +4960,7 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
     setState(() => pdfBusy = true);
     try {
       final bytes = await buildInvoicePdf(data);
-      await shareInvoiceBytes(bytes);
+      await Printing.sharePdf(bytes: bytes, filename: invoiceFileName);
     } catch (error) {
       if (mounted) showSnack(context, 'تعذر مشاركة الفاتورة. ${cleanError(error)}');
     } finally {
@@ -5085,28 +4968,7 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
     }
   }
 
-  Future<void> shareInvoiceBytes(Uint8List bytes) async {
-    try {
-      await Share.shareXFiles(
-        [XFile.fromData(bytes, mimeType: 'application/pdf')],
-        subject: 'فاتورة ${widget.bill['bnum'] ?? ''}',
-        text: 'فاتورة ${widget.bill['account_name'] ?? widget.bill['accnum'] ?? ''}',
-        fileNameOverrides: [invoiceFileName],
-      );
-    } catch (_) {
-      await Printing.sharePdf(bytes: bytes, filename: invoiceFileName);
-    }
-  }
-
   Future<Uint8List> buildInvoicePdf(SalesBillDetailsData data) async {
-    try {
-      return await buildRichInvoicePdf(data);
-    } catch (_) {
-      return buildFallbackInvoicePdf(data);
-    }
-  }
-
-  Future<Uint8List> buildRichInvoicePdf(SalesBillDetailsData data) async {
     final fontBytes = await rootBundle.load('assets/fonts/Amiri-Regular.ttf');
     final logoBytes = await rootBundle.load('assets/logo.png');
     final font = pw.Font.ttf(fontBytes);
@@ -5277,69 +5139,6 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
               style: pw.TextStyle(color: const PdfColor.fromInt(0xff1d5d8f), fontWeight: pw.FontWeight.bold, fontSize: 12),
             ),
           ),
-        ],
-      ),
-    );
-    return document.save();
-  }
-
-  Future<Uint8List> buildFallbackInvoicePdf(SalesBillDetailsData data) async {
-    final fontBytes = await rootBundle.load('assets/fonts/NotoSansArabic-Variable.ttf');
-    final font = pw.Font.ttf(fontBytes);
-    final document = pw.Document(theme: pw.ThemeData.withFont(base: font, bold: font));
-    final isPurchase = nullableIntValue(widget.bill['kind']) == 1;
-    final total = doubleValue(widget.bill['totalvalue']);
-    final payment = paymentLabelFromRemark(widget.bill['remark']);
-    final rows = data.items.asMap().entries.map((entry) {
-      final item = entry.value;
-      return [
-        '${entry.key + 1}',
-        shortPdfText(item['product_name']?.toString() ?? 'مادة ${item['matnum'] ?? '-'}', 70),
-        formatMoneyValue(item['quantity']),
-        '\$ ${formatMoneyValue(item['price'])}',
-        '\$ ${formatMoneyValue(item['value'])}',
-      ];
-    }).toList();
-    document.addPage(
-      pw.MultiPage(
-        textDirection: pw.TextDirection.rtl,
-        pageTheme: pw.PageTheme(
-          pageFormat: PdfPageFormat.a4,
-          margin: const pw.EdgeInsets.all(28),
-        ),
-        footer: (context) => pw.Align(
-          alignment: pw.Alignment.centerLeft,
-          child: pw.Text('صفحة ${context.pageNumber} من ${context.pagesCount}', style: const pw.TextStyle(fontSize: 8)),
-        ),
-        build: (_) => [
-          pw.Text('مكتبة الأنصار', style: pw.TextStyle(fontSize: 25, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 6),
-          pw.Text(isPurchase ? 'فاتورة شراء' : 'فاتورة مبيع', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 10),
-          pw.Text('رقم الفاتورة: ${widget.bill['bnum'] ?? '-'}'),
-          pw.Text('الحساب: ${widget.bill['account_name'] ?? 'حساب ${widget.bill['accnum'] ?? '-'}'}'),
-          pw.Text('التاريخ: ${widget.bill['date'] ?? '-'} · الدفع: ${payment.text}'),
-          pw.SizedBox(height: 14),
-          pw.TableHelper.fromTextArray(
-            headers: const ['#', 'البيان', 'الكمية', 'السعر', 'الإجمالي'],
-            data: rows,
-            headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, color: PdfColors.white),
-            headerDecoration: const pw.BoxDecoration(color: PdfColor.fromInt(0xff087568)),
-            border: pw.TableBorder.all(color: PdfColors.grey400),
-            cellAlignment: pw.Alignment.centerRight,
-            headerAlignment: pw.Alignment.centerRight,
-            columnWidths: const {
-              0: pw.FixedColumnWidth(24),
-              1: pw.FlexColumnWidth(4),
-              2: pw.FlexColumnWidth(1.2),
-              3: pw.FlexColumnWidth(1.5),
-              4: pw.FlexColumnWidth(1.7),
-            },
-          ),
-          pw.SizedBox(height: 14),
-          pw.Text('الصافي: \$ ${formatMoneyValue(total)}', style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold)),
-          pw.SizedBox(height: 6),
-          pw.Text(arabicUsdAmountInWords(total), textAlign: pw.TextAlign.center),
         ],
       ),
     );
@@ -8628,12 +8427,14 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
                         icon: const Icon(Icons.forum_outlined),
                         label: const Text('مشاركة في الدردشة'),
                       ),
-                      const SizedBox(height: 8),
-                      OutlinedButton.icon(
-                        onPressed: shareOnWhatsApp,
-                        icon: const Icon(Icons.share_rounded),
-                        label: const Text('مشاركة عبر واتساب'),
-                      ),
+                      if (kIsBetaBuild) ...[
+                        const SizedBox(height: 8),
+                        OutlinedButton.icon(
+                          onPressed: shareOnWhatsApp,
+                          icon: const Icon(Icons.share_rounded),
+                          label: const Text('مشاركة عبر واتساب'),
+                        ),
+                      ],
                       if (fromBranch == widget.session.branchNum && widget.order['status'] == 'preparing') ...[
                         const SizedBox(height: 10),
                         Container(
@@ -15007,20 +14808,18 @@ Future<void> registerDeviceForNotifications(EmployeeSession session) async {
     firebaseError = error;
   }
 
-  if (fcmToken == null) {
-    try {
-      initializePushyService();
-      final token = await Pushy.register();
-      if (token.isNotEmpty) {
-        pushyToken = token;
-        final preferences = await SharedPreferences.getInstance();
-        await preferences.setString('ansar_pushy_token', token);
-      }
-    } catch (error) {
-      pushyError = error;
+  try {
+    Pushy.listen();
+    final token = await Pushy.register();
+    if (token.isNotEmpty) {
+      pushyToken = token;
       final preferences = await SharedPreferences.getInstance();
-      pushyToken = preferences.getString('ansar_pushy_token');
+      await preferences.setString('ansar_pushy_token', token);
     }
+  } catch (error) {
+    pushyError = error;
+    final preferences = await SharedPreferences.getInstance();
+    pushyToken = preferences.getString('ansar_pushy_token');
   }
 
   try {
