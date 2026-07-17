@@ -5122,10 +5122,8 @@ class _SalesBillDetailsPageState extends State<SalesBillDetailsPage> {
     document.addPage(
       pw.MultiPage(
         textDirection: pw.TextDirection.rtl,
-        pageTheme: pw.PageTheme(
-          pageFormat: PdfPageFormat.a4,
-          margin: const pw.EdgeInsets.fromLTRB(28, 26, 28, 30),
-        ),
+        pageFormat: PdfPageFormat.a4,
+        margin: const pw.EdgeInsets.fromLTRB(28, 26, 28, 30),
         footer: (context) => pw.Align(
           alignment: pw.Alignment.centerLeft,
           child: pw.Text(
@@ -5419,10 +5417,8 @@ Future<Uint8List> buildPortableInvoicePdf(
   document.addPage(
     pw.MultiPage(
       textDirection: pw.TextDirection.rtl,
-      pageTheme: pw.PageTheme(
-        pageFormat: PdfPageFormat.a4,
-        margin: const pw.EdgeInsets.all(28),
-      ),
+      pageFormat: PdfPageFormat.a4,
+      margin: const pw.EdgeInsets.all(28),
       footer: (context) => pw.Align(
         alignment: pw.Alignment.centerLeft,
         child: pw.Text('صفحة ${context.pageNumber} من ${context.pagesCount}', style: const pw.TextStyle(fontSize: 8)),
@@ -8244,10 +8240,8 @@ class _TransferDetailsPageState extends State<TransferDetailsPage> {
     document.addPage(
       pw.MultiPage(
         textDirection: pw.TextDirection.rtl,
-        pageTheme: pw.PageTheme(
-          pageFormat: PdfPageFormat.a4.landscape,
-          margin: const pw.EdgeInsets.all(24),
-        ),
+        pageFormat: PdfPageFormat.a4.landscape,
+        margin: const pw.EdgeInsets.all(24),
         footer: (context) => pw.Align(
           alignment: pw.Alignment.centerLeft,
           child: pw.Text(
