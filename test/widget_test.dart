@@ -1,8 +1,31 @@
+import 'package:ansar_team_app/chat/chat_local_store.dart';
 import 'package:ansar_team_app/main.dart';
 import 'package:ansar_team_app/product_cache.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite/sqflite.dart';
+
+class _RecordingDatabase implements Database {
+  final executedSql = <String>[];
+  final queriedSql = <String>[];
+
+  @override
+  Future<void> execute(String sql, [List<Object?>? arguments]) async {
+    executedSql.add(sql);
+  }
+
+  @override
+  Future<List<Map<String, Object?>>> rawQuery(String sql, [List<Object?>? arguments]) async {
+    queriedSql.add(sql);
+    return const [
+      {'journal_mode': 'wal'},
+    ];
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
 
 Widget _testShell(Widget child) {
   return MaterialApp(
@@ -15,6 +38,16 @@ Widget _testShell(Widget child) {
 }
 
 void main() {
+  test('chat database configures WAL through the query API', () async {
+    final database = _RecordingDatabase();
+
+    await configureChatDatabase(database);
+
+    expect(database.executedSql, contains('PRAGMA foreign_keys = ON'));
+    expect(database.executedSql, isNot(contains('PRAGMA journal_mode = WAL')));
+    expect(database.queriedSql, contains('PRAGMA journal_mode = WAL'));
+  });
+
   test('cleanError hides Flutter setState Future noise', () {
     expect(
       cleanError('setState() callback argument returned a Future'),

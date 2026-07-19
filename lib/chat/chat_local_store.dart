@@ -11,19 +11,32 @@ class ChatLocalStore {
   static final ChatLocalStore instance = ChatLocalStore._();
 
   Database? _database;
+  Future<Database>? _openingDatabase;
 
   Future<Database> get database async {
     final current = _database;
     if (current != null && current.isOpen) return current;
+    final opening = _openingDatabase;
+    if (opening != null) return opening;
+
+    final future = _openDatabase();
+    _openingDatabase = future;
+    try {
+      final opened = await future;
+      _database = opened;
+      return opened;
+    } finally {
+      if (identical(_openingDatabase, future)) _openingDatabase = null;
+    }
+  }
+
+  Future<Database> _openDatabase() async {
     final root = await getDatabasesPath();
     final path = '$root${Platform.pathSeparator}ansar_chat_v2.db';
-    final opened = await openDatabase(
+    return openDatabase(
       path,
       version: 1,
-      onConfigure: (db) async {
-        await db.execute('PRAGMA journal_mode=WAL');
-        await db.execute('PRAGMA foreign_keys=ON');
-      },
+      onConfigure: configureChatDatabase,
       onCreate: (db, _) async {
         await db.execute('''
           CREATE TABLE chat_threads (
@@ -91,8 +104,6 @@ class ChatLocalStore {
         ''');
       },
     );
-    _database = opened;
-    return opened;
   }
 
   String createClientMessageId(String employeeId) {
@@ -431,5 +442,15 @@ class ChatLocalStore {
     } catch (_) {
       return null;
     }
+  }
+}
+
+Future<void> configureChatDatabase(Database db) async {
+  await db.execute('PRAGMA foreign_keys = ON');
+  try {
+    // journal_mode returns a row, so Android requires the query API here.
+    await db.rawQuery('PRAGMA journal_mode = WAL');
+  } on DatabaseException {
+    // WAL is an optimization; the chat cache remains valid with the platform mode.
   }
 }
