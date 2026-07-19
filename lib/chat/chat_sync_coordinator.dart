@@ -324,6 +324,22 @@ class ChatSyncCoordinator {
     required Map<String, dynamic> payload,
     required List<Map<String, dynamic>> attachments,
   }) async {
+    // Core messages must not depend on the larger v2 RPC. That function also
+    // creates notifications, receipts and inbox events, so a failure in any of
+    // those secondary paths used to roll the message itself back.
+    if (payload['poll'] == null) {
+      final message = await _sendLegacyMessage(
+        employeeId: employeeId,
+        threadId: threadId,
+        clientMessageId: clientMessageId,
+        payload: payload,
+        attachments: attachments,
+      );
+      return {
+        'message': {...message, '_legacy_fallback': true},
+        'legacy_fallback': true,
+      };
+    }
     try {
       final result = await client.rpc('ansar_send_chat_message_v2', params: {
         'p_employee_id': employeeId,
@@ -373,12 +389,15 @@ class ChatSyncCoordinator {
       if (attachments.isNotEmpty) 'attachments': attachments,
       if (payload['reply_to_id'] != null) 'reply_to_id': payload['reply_to_id'],
     };
+    final upgradedRow = <String, dynamic>{
+      ...basicRow,
+      'client_message_id': clientMessageId,
+      if (payload['forwarded_from_id'] != null) 'forwarded_from_id': payload['forwarded_from_id'],
+      if ((payload['mentions'] as List?)?.isNotEmpty == true) 'mentions': payload['mentions'],
+      if (payload['requires_ack'] == true) 'requires_ack': true,
+    };
     try {
-      final inserted = await client
-          .from('ansar_chat_messages')
-          .insert({...basicRow, 'client_message_id': clientMessageId})
-          .select()
-          .single();
+      final inserted = await client.from('ansar_chat_messages').insert(upgradedRow).select().single();
       await _touchThread(threadId);
       return Map<String, dynamic>.from(inserted);
     } catch (error) {
@@ -530,7 +549,16 @@ bool shouldFallbackToLegacyChatSend(Object error) {
 
 bool shouldRetryBasicLegacyChatInsert(Object error) {
   final text = error.toString().toLowerCase();
-  return (text.contains('client_message_id') &&
-          (text.contains('does not exist') || text.contains('schema cache') || text.contains('pgrst204'))) ||
-      text.contains("could not find the 'client_message_id' column");
+  const upgradeColumns = <String>[
+    'client_message_id',
+    'forwarded_from_id',
+    'mentions',
+    'requires_ack',
+  ];
+  final missingUpgradeColumn = upgradeColumns.any(text.contains);
+  return missingUpgradeColumn &&
+      (text.contains('does not exist') ||
+          text.contains('schema cache') ||
+          text.contains('pgrst204') ||
+          text.contains('could not find'));
 }
