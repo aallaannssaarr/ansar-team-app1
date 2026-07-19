@@ -17028,6 +17028,10 @@ String formatTime(DateTime value) {
   return '$hour:$minute $period';
 }
 
+String formatDate(DateTime value) {
+  return '${value.year}/${value.month.toString().padLeft(2, '0')}/${value.day.toString().padLeft(2, '0')}';
+}
+
 String formatDateTime(DateTime value) {
   return '${shortDate(value)} ${formatTime(value)}';
 }
