@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - master
+      - codex/chat-v2
     paths:
       - "supabase/functions/send-notifications/**"
       - ".github/workflows/deploy-notification-function.yml"

@@ -1,7 +1,7 @@
 name: ansar_team_app
 description: Native mobile app for Al Ansar team operations.
 publish_to: "none"
-version: 0.5.8+17
+version: 0.6.6+24
 
 environment:
   sdk: ">=3.4.0 <4.0.0"
@@ -25,6 +25,9 @@ dependencies:
   intl: ^0.19.0
   pdf: ^3.11.1
   printing: ^5.13.4
+  connectivity_plus: ^6.1.5
+  just_audio: ^0.10.6
+  record: ^7.1.1
   share_plus: ^10.1.4
   url_launcher: ^6.3.1
 

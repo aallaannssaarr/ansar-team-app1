@@ -1,8 +1,32 @@
+import 'package:ansar_team_app/chat/chat_local_store.dart';
+import 'package:ansar_team_app/chat/chat_sync_coordinator.dart';
 import 'package:ansar_team_app/main.dart';
 import 'package:ansar_team_app/product_cache.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite/sqflite.dart';
+
+class _RecordingDatabase implements Database {
+  final executedSql = <String>[];
+  final queriedSql = <String>[];
+
+  @override
+  Future<void> execute(String sql, [List<Object?>? arguments]) async {
+    executedSql.add(sql);
+  }
+
+  @override
+  Future<List<Map<String, Object?>>> rawQuery(String sql, [List<Object?>? arguments]) async {
+    queriedSql.add(sql);
+    return const [
+      {'journal_mode': 'wal'},
+    ];
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
 
 Widget _testShell(Widget child) {
   return MaterialApp(
@@ -15,6 +39,74 @@ Widget _testShell(Widget child) {
 }
 
 void main() {
+  test('chat send falls back only when the v2 server function is unavailable', () {
+    expect(
+      shouldFallbackToLegacyChatSend(
+        'PostgrestException(message: Could not find the function public.ansar_send_chat_message_v2, code: PGRST202)',
+      ),
+      isTrue,
+    );
+    expect(
+      shouldFallbackToLegacyChatSend('PostgrestException(message: permission denied, code: 42501)'),
+      isFalse,
+    );
+  });
+
+  test('legacy chat insert retries without the client message column', () {
+    expect(
+      shouldRetryBasicLegacyChatInsert(
+        "PostgrestException(message: Could not find the 'client_message_id' column, code: PGRST204)",
+      ),
+      isTrue,
+    );
+  });
+
+  test('chat database configures WAL through the query API', () async {
+    final database = _RecordingDatabase();
+
+    await configureChatDatabase(database);
+
+    expect(database.executedSql, contains('PRAGMA foreign_keys = ON'));
+    expect(database.executedSql, isNot(contains('PRAGMA journal_mode = WAL')));
+    expect(database.queriedSql, contains('PRAGMA journal_mode = WAL'));
+  });
+
+  test('chat contact rows remain serializable in the local cache', () {
+    final employee = EmployeeLite(
+      id: 'employee-1',
+      name: 'موظف تجريبي',
+      username: 'employee1',
+      branchNum: 2,
+      role: 'employee',
+      isActive: true,
+      avatarUrl: 'https://example.com/avatar.jpg',
+    );
+    final thread = <String, dynamic>{
+      'id': 'contact:${employee.id}',
+      'thread_type': 'contact',
+      'title': employee.name,
+      'contact_employee': employee.toCacheRow(),
+    };
+
+    final payload = encodeChatCachePayload(thread);
+
+    expect(payload, isNotNull);
+    expect(EmployeeLite.fromRow(employee.toCacheRow()).id, employee.id);
+  });
+
+  test('an unsupported chat cache row is skipped instead of failing the snapshot', () {
+    final employee = EmployeeLite(
+      id: 'employee-2',
+      name: 'موظف',
+      username: 'employee2',
+      branchNum: 1,
+      role: 'employee',
+      isActive: true,
+    );
+
+    expect(encodeChatCachePayload({'id': 'bad', 'employee': employee}), isNull);
+  });
+
   test('cleanError hides Flutter setState Future noise', () {
     expect(
       cleanError('setState() callback argument returned a Future'),
@@ -834,5 +926,102 @@ void main() {
     );
 
     expect(tester.takeException(), isNull);
+  });
+
+  test('chat list preview describes rich message types', () {
+    expect(chatMessageListPreview({'message_type': 'voice'}), contains('صوتية'));
+    expect(
+      chatMessageListPreview({
+        'message_type': 'attachment',
+        'attachments': [
+          {'mime_type': 'audio/mp4', 'duration_ms': 1500},
+        ],
+      }),
+      contains('صوتية'),
+    );
+    expect(chatMessageListPreview({'message_type': 'poll', 'body': 'موعد الاجتماع'}), contains('موعد الاجتماع'));
+    expect(chatMessageListPreview({'message_type': 'attachment'}), 'مرفق');
+  });
+
+  test('poll drafts with plain string options are normalized for rendering', () {
+    final poll = normalizedChatPoll({
+      'question': 'اختر موعداً',
+      'options': ['صباحاً', 'مساءً'],
+      'allows_multiple': false,
+    }, seed: 'draft');
+
+    expect(poll, isNotNull);
+    expect((poll!['options'] as List).length, 2);
+    expect((poll['options'] as List).first['option_text'], 'صباحاً');
+    expect((poll['options'] as List).first['id'], 'local:draft:0');
+  });
+
+  testWidgets('chat unread divider and poll fit a narrow Arabic screen', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _testShell(
+        MediaQuery(
+          data: MediaQueryData(textScaler: TextScaler.linear(1.2)),
+          child: ListView(
+            padding: const EdgeInsets.all(12),
+            children: const [
+              ChatUnreadDivider(),
+              ChatPollCard(
+                poll: {
+                  'id': 'poll-1',
+                  'question': 'ما الموعد الأنسب للاجتماع القادم؟',
+                  'allows_multiple': false,
+                  'total_votes': 3,
+                  'options': [
+                    {'id': 'one', 'option_text': 'الساعة التاسعة صباحاً', 'votes': 2},
+                    {'id': 'two', 'option_text': 'الساعة الثانية ظهراً', 'votes': 1},
+                  ],
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('رسائل غير مقروءة'), findsOneWidget);
+    expect(find.textContaining('الموعد الأنسب'), findsOneWidget);
+  });
+
+  testWidgets('poll composer closes cleanly after returning a valid poll', (tester) async {
+    Map<String, dynamic>? result;
+    await tester.pumpWidget(
+      _testShell(
+        Builder(
+          builder: (context) => Center(
+            child: FilledButton(
+              onPressed: () async {
+                result = await showDialog<Map<String, dynamic>>(
+                  context: context,
+                  builder: (_) => const ChatPollComposerDialog(),
+                );
+              },
+              child: const Text('فتح الاستبيان'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('فتح الاستبيان'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const ValueKey('poll-question')), 'ما الموعد المناسب؟');
+    await tester.enterText(find.byKey(const ValueKey('poll-option-0')), 'صباحاً');
+    await tester.enterText(find.byKey(const ValueKey('poll-option-1')), 'مساءً');
+    await tester.tap(find.byKey(const ValueKey('send-poll')));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(result?['question'], 'ما الموعد المناسب؟');
+    expect(result?['options'], ['صباحاً', 'مساءً']);
+    expect(find.byType(ChatPollComposerDialog), findsNothing);
   });
 }

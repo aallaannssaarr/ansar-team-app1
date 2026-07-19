@@ -11,8 +11,10 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'ansar_config.dart';
 
 const _replyActionId = 'ansar_reply';
+const _markReadActionId = 'ansar_mark_read';
 const _pendingRepliesKey = 'ansar_pending_notification_replies';
 const _shownNotificationIdsKey = 'ansar_shown_notification_ids';
+const _conversationHistoryKey = 'ansar_notification_conversation_history';
 
 final richNotificationClicks = StreamController<Map<String, dynamic>>.broadcast();
 
@@ -101,16 +103,37 @@ class RichNotificationService {
     );
     const me = Person(name: 'أنت', key: 'me');
     final payload = jsonEncode(data);
-    final id = _notificationIntId(notificationId.isEmpty ? '$type-$threadId-$body' : notificationId);
+    final id = _notificationIntId(isChat && threadId.isNotEmpty
+        ? 'chat-thread:$threadId'
+        : (notificationId.isEmpty ? '$type-$threadId-$body' : notificationId));
 
     if (isChat) {
+      final history = await _appendConversationMessage(
+        threadId: threadId,
+        body: body,
+        senderId: senderId,
+        senderName: senderName,
+        createdAt: data['created_at']?.toString(),
+      );
       final style = MessagingStyleInformation(
         me,
         conversationTitle: data['thread_title']?.toString().trim().isNotEmpty == true
             ? data['thread_title']!.toString()
             : senderName,
         groupConversation: data['thread_type'] != 'direct',
-        messages: [Message(body, DateTime.now(), sender)],
+        messages: [
+          for (final entry in history)
+            Message(
+              entry['body']?.toString() ?? '',
+              DateTime.tryParse(entry['created_at']?.toString() ?? '') ?? DateTime.now(),
+              entry['sender_id']?.toString() == senderId
+                  ? sender
+                  : Person(
+                      name: entry['sender_name']?.toString() ?? 'موظف',
+                      key: entry['sender_id']?.toString() ?? 'employee',
+                    ),
+            ),
+        ],
       );
       final details = AndroidNotificationDetails(
         'ansar_messages_v1',
@@ -123,12 +146,20 @@ class RichNotificationService {
         groupKey: threadId.isEmpty ? 'ansar-chat' : 'ansar-chat-$threadId',
         largeIcon: avatarBytes == null ? null : ByteArrayAndroidBitmap(avatarBytes),
         number: int.tryParse(data['unread_count']?.toString() ?? ''),
-        actions: const [
-          AndroidNotificationAction(
-            _replyActionId,
-            'رد',
-            inputs: [AndroidNotificationActionInput(label: 'اكتب الرد')],
-            semanticAction: SemanticAction.reply,
+        actions: [
+          if (data['channel_kind'] != 'announcement')
+            const AndroidNotificationAction(
+              _replyActionId,
+              'رد',
+              inputs: [AndroidNotificationActionInput(label: 'اكتب الرد')],
+              semanticAction: SemanticAction.reply,
+              showsUserInterface: false,
+              cancelNotification: true,
+            ),
+          const AndroidNotificationAction(
+            _markReadActionId,
+            'تحديد كمقروء',
+            semanticAction: SemanticAction.markAsRead,
             showsUserInterface: false,
             cancelNotification: true,
           ),
@@ -180,6 +211,10 @@ class RichNotificationService {
       } catch (_) {
         await _queueReply(reply);
       }
+      return;
+    }
+    if (response.actionId == _markReadActionId) {
+      await _markConversationRead(data);
       return;
     }
     if (background) {
@@ -256,6 +291,80 @@ class RichNotificationService {
     pending.removeWhere((item) => item is Map && item['notification_id'] == reply['notification_id']);
     pending.add(reply);
     await preferences.setString(_pendingRepliesKey, jsonEncode(pending.take(20).toList()));
+  }
+
+  static Future<List<Map<String, dynamic>>> _appendConversationMessage({
+    required String threadId,
+    required String body,
+    required String senderId,
+    required String senderName,
+    String? createdAt,
+  }) async {
+    if (threadId.isEmpty) {
+      return [
+        {
+          'body': body,
+          'sender_id': senderId,
+          'sender_name': senderName,
+          'created_at': createdAt ?? DateTime.now().toUtc().toIso8601String(),
+        }
+      ];
+    }
+    final preferences = await SharedPreferences.getInstance();
+    final raw = preferences.getString(_conversationHistoryKey);
+    final histories = <String, dynamic>{};
+    if (raw != null) {
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) histories.addAll(Map<String, dynamic>.from(decoded));
+      } catch (_) {
+        // Replace invalid history with the current message.
+      }
+    }
+    final current = (histories[threadId] as List?)
+            ?.whereType<Map>()
+            .map((value) => Map<String, dynamic>.from(value))
+            .toList() ??
+        <Map<String, dynamic>>[];
+    current.add({
+      'body': body,
+      'sender_id': senderId,
+      'sender_name': senderName,
+      'created_at': createdAt ?? DateTime.now().toUtc().toIso8601String(),
+    });
+    histories[threadId] = current.length > 6 ? current.sublist(current.length - 6) : current;
+    if (histories.length > 30) histories.remove(histories.keys.first);
+    await preferences.setString(_conversationHistoryKey, jsonEncode(histories));
+    return (histories[threadId] as List).whereType<Map>().map((value) => Map<String, dynamic>.from(value)).toList();
+  }
+
+  static Future<void> _markConversationRead(Map<String, dynamic> data) async {
+    final threadId = data['thread_id']?.toString() ?? '';
+    if (threadId.isEmpty) return;
+    final preferences = await SharedPreferences.getInstance();
+    final employeeId = preferences.getString('ansar_employee_id');
+    if (employeeId != null && employeeId.isNotEmpty) {
+      try {
+        final client = SupabaseClient(AnsarConfig.supabaseUrl, AnsarConfig.supabaseServiceKey);
+        await client.rpc('ansar_mark_chat_read', params: {
+          'p_employee_id': employeeId,
+          'p_thread_id': threadId,
+        });
+      } catch (_) {
+        // Opening the chat later will repeat the read synchronization.
+      }
+    }
+    final raw = preferences.getString(_conversationHistoryKey);
+    if (raw != null) {
+      try {
+        final decoded = Map<String, dynamic>.from(jsonDecode(raw) as Map);
+        decoded.remove(threadId);
+        await preferences.setString(_conversationHistoryKey, jsonEncode(decoded));
+      } catch (_) {
+        await preferences.remove(_conversationHistoryKey);
+      }
+    }
+    await plugin.cancel(id: _notificationIntId('chat-thread:$threadId'));
   }
 
   static Future<String> _installationId() async {

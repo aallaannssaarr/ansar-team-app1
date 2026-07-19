@@ -279,6 +279,8 @@ async function sendFirebase(item: QueueItem, token: string, rich: boolean): Prom
   firebaseAccessToken ??= await getFirebaseAccessToken();
   const serviceAccount = JSON.parse(firebaseJson);
   const data = queueData(item);
+  const threadId = typeof data.thread_id === "string" ? data.thread_id : "";
+  const collapseKey = threadId ? `ansar-chat-${threadId}` : `ansar-${item.id}`;
   const senderImage =
     typeof data.sender_avatar_url === "string" && data.sender_avatar_url.startsWith("https://")
       ? data.sender_avatar_url
@@ -313,7 +315,7 @@ async function sendFirebase(item: QueueItem, token: string, rich: boolean): Prom
         data: payloadData,
         android: {
           priority: "HIGH",
-          collapse_key: `ansar-${item.id}`,
+          collapse_key: collapseKey.slice(0, 64),
           ttl: "604800s",
           ...(rich
             ? {}
@@ -342,6 +344,8 @@ async function sendPushy(item: QueueItem, token: string, rich: boolean): Promise
     provider: "pushy",
     rich_notification: rich,
   };
+  const threadId = typeof data.thread_id === "string" ? data.thread_id : "";
+  const collapseKey = threadId ? `ansar-chat-${threadId}` : `ansar-${item.id}`;
   const response = await fetch(`https://api.pushy.me/push?api_key=${encodeURIComponent(pushyApiKey)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -349,7 +353,7 @@ async function sendPushy(item: QueueItem, token: string, rich: boolean): Promise
       to: token,
       data,
       ...(rich ? {} : { notification: { title: item.title, body: item.body, sound: "default" } }),
-      collapse_key: `ansar-${item.id}`.slice(0, 32),
+      collapse_key: collapseKey.slice(0, 32),
       time_to_live: 604800,
     }),
   });
