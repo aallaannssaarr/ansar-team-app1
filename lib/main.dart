@@ -480,6 +480,17 @@ class EmployeeLite {
   }
 }
 
+class AnnouncementAckSelection {
+  const AnnouncementAckSelection.all()
+      : allEmployees = true,
+        employeeIds = const <String>{};
+
+  const AnnouncementAckSelection.selected(this.employeeIds) : allEmployees = false;
+
+  final bool allEmployees;
+  final Set<String> employeeIds;
+}
+
 class Movement {
   Movement({
     required this.employee,
@@ -10894,6 +10905,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   int messageLimit = 120;
   bool loadingOlderMessages = false;
   bool announcementRequiresAck = false;
+  AnnouncementAckSelection announcementAckSelection = const AnnouncementAckSelection.all();
   late final DateTime? openedLastReadAt;
   late final int openedUnreadCount;
 
@@ -11488,7 +11500,9 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     final pollsById = <String, Map<String, dynamic>>{};
     final acknowledgementCounts = <String, int>{};
     final acknowledgementsByMessage = <String, Set<String>>{};
+    final acknowledgementTimesByMessage = <String, Map<String, dynamic>>{};
     final acknowledgedIds = <String>{};
+    final acknowledgementTargetsByMessage = <String, Set<String>>{};
     if (kChatV2Enabled && messages.isNotEmpty) {
       final messageIds = messages.map((row) => '${row['id']}').toList();
       try {
@@ -11536,13 +11550,36 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
         }
         final acknowledgementRows = await supabase
             .from('ansar_chat_announcement_acknowledgements')
-            .select('message_id, employee_id')
+            .select('message_id, employee_id, acknowledged_at')
             .inFilter('message_id', messageIds);
         for (final acknowledgement in acknowledgementRows) {
           final messageId = '${acknowledgement['message_id']}';
           acknowledgementCounts[messageId] = (acknowledgementCounts[messageId] ?? 0) + 1;
           acknowledgementsByMessage.putIfAbsent(messageId, () => <String>{}).add('${acknowledgement['employee_id']}');
+          acknowledgementTimesByMessage.putIfAbsent(messageId, () => <String, dynamic>{})['${acknowledgement['employee_id']}'] =
+              acknowledgement['acknowledged_at'];
           if ('${acknowledgement['employee_id']}' == widget.session.id) acknowledgedIds.add(messageId);
+        }
+        final targetRows = await supabase
+            .from('ansar_chat_announcement_targets')
+            .select('message_id, employee_id')
+            .inFilter('message_id', messageIds);
+        for (final target in targetRows) {
+          acknowledgementTargetsByMessage
+              .putIfAbsent('${target['message_id']}', () => <String>{})
+              .add('${target['employee_id']}');
+        }
+        final targetEmployeeIds = acknowledgementTargetsByMessage.values.expand((ids) => ids).toSet();
+        final missingTargetProfiles = targetEmployeeIds.where((id) => !senderProfiles.containsKey(id)).toList();
+        if (missingTargetProfiles.isNotEmpty) {
+          final targetEmployees = await supabase
+              .from('ansar_employees')
+              .select('id, display_name, full_name, avatar_url')
+              .inFilter('id', missingTargetProfiles);
+          for (final raw in targetEmployees) {
+            final employee = Map<String, dynamic>.from(raw);
+            senderProfiles['${employee['id']}'] = employee;
+          }
         }
       } catch (_) {
         // The beta remains compatible until the optional chat-v2 migration is installed.
@@ -11553,6 +11590,29 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
       final reply = messageById[row['reply_to_id']?.toString()];
       final replyEmployee = reply == null ? null : employees['${reply['sender_id']}'];
       final receipts = receiptsByMessage['${row['id']}'] ?? <Map<String, dynamic>>[];
+      final messageId = '${row['id']}';
+      final acknowledgedEmployeeIds = acknowledgementsByMessage[messageId] ?? <String>{};
+      final explicitTargetIds = acknowledgementTargetsByMessage[messageId] ?? <String>{};
+      final acknowledgementTargetIds = explicitTargetIds.isNotEmpty
+          ? explicitTargetIds
+          : row['requires_ack'] == true
+              ? receipts.map((receipt) => '${receipt['employee_id']}').toSet()
+              : <String>{};
+      final acknowledgementDetails = acknowledgementTargetIds.map((employeeId) {
+        final employee = employees[employeeId] ?? const <String, dynamic>{};
+        return <String, dynamic>{
+          'employee_id': employeeId,
+          'employee_name': employeeDisplayName(employee),
+          'avatar_url': employee['avatar_url'],
+          'acknowledged': acknowledgedEmployeeIds.contains(employeeId),
+          'acknowledged_at': acknowledgementTimesByMessage[messageId]?[employeeId],
+        };
+      }).toList()
+        ..sort((first, second) {
+          final statusComparison = (first['acknowledged'] == true ? 1 : 0).compareTo(second['acknowledged'] == true ? 1 : 0);
+          if (statusComparison != 0) return statusComparison;
+          return '${first['employee_name']}'.compareTo('${second['employee_name']}');
+        });
       final receiptStatus = receipts.isEmpty
           ? 'sent'
           : receipts.every((receipt) => receipt['status'] == 'read')
@@ -11585,9 +11645,15 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
         'is_starred': starredIds.contains('${row['id']}'),
         'is_message_pinned': pinnedIds.contains('${row['id']}'),
         'poll': pollsById[row['poll_id']?.toString()],
-        'acknowledgement_count': acknowledgementCounts['${row['id']}'] ?? 0,
-        'acknowledged_employee_ids': acknowledgementsByMessage['${row['id']}']?.toList() ?? const <String>[],
-        'acknowledged_by_me': acknowledgedIds.contains('${row['id']}'),
+        'acknowledgement_count': acknowledgementCounts[messageId] ?? 0,
+        'acknowledged_employee_ids': acknowledgedEmployeeIds.toList(),
+        'acknowledged_by_me': acknowledgedIds.contains(messageId),
+        'ack_target_employee_ids': acknowledgementTargetIds.toList(),
+        'ack_target_count': acknowledgementTargetIds.length,
+        'ack_pending_count': acknowledgementTargetIds.difference(acknowledgedEmployeeIds).length,
+        'ack_required_for_me': acknowledgementTargetIds.contains(widget.session.id),
+        'ack_target_details': acknowledgementDetails,
+        'can_view_ack_report': '${row['sender_id']}' == widget.session.id || widget.session.isGeneralAdmin,
       };
     }).toList();
   }
@@ -11740,6 +11806,8 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
           });
         }
         final reply = replyingTo;
+        final requiresAcknowledgement = announcementRequiresAck;
+        final acknowledgementSelection = announcementAckSelection;
         final optimistic = await chatSyncCoordinator.enqueueMessage(
           employeeId: widget.session.id,
           threadId: '${widget.thread['id']}',
@@ -11748,13 +11816,17 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
           attachments: localAttachments,
           replyToId: reply?['id']?.toString(),
           mentions: pendingMentionIds.toList(),
-          requiresAck: announcementRequiresAck,
+          requiresAck: requiresAcknowledgement,
+          ackTargetEmployeeIds: requiresAcknowledgement && !acknowledgementSelection.allEmployees
+              ? acknowledgementSelection.employeeIds.toList()
+              : null,
         );
         if (!mounted) return;
         message.clear();
         pendingAttachments.clear();
         pendingMentionIds.clear();
         announcementRequiresAck = false;
+        announcementAckSelection = const AnnouncementAckSelection.all();
         unawaited(ChatLocalStore.instance.writeDraft(widget.session.id, '${widget.thread['id']}', ''));
         final updated = <Map<String, dynamic>>[
           ...(latestMessages ?? <Map<String, dynamic>>[]),
@@ -11762,6 +11834,14 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
             ...optimistic,
             'sender_name': widget.session.name,
             'sender_avatar_url': widget.session.avatarUrl,
+            if (requiresAcknowledgement) ...{
+              'acknowledgement_count': 0,
+              'ack_pending_count': acknowledgementSelection.allEmployees
+                  ? null
+                  : acknowledgementSelection.employeeIds.length,
+              'ack_required_for_me': false,
+              'can_view_ack_report': true,
+            },
             'reply_preview_body': reply?['body']?.toString(),
             'reply_preview_sender': reply == null
                 ? null
@@ -11840,6 +11920,130 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
           attachmentUploadProgress = null;
         });
       }
+    }
+  }
+
+  Future<void> chooseAnnouncementAckRecipients() async {
+    try {
+      final employees = (await loadAllActiveEmployees())
+          .where((employee) => employee.id != widget.session.id)
+          .toList();
+      if (!mounted) return;
+      if (employees.isEmpty) {
+        showSnack(context, 'لا يوجد موظفون نشطون يمكن طلب تأكيدهم');
+        return;
+      }
+
+      final search = TextEditingController();
+      var allEmployees = announcementAckSelection.allEmployees;
+      var selectedIds = <String>{...announcementAckSelection.employeeIds};
+      var searchText = '';
+      final selection = await showModalBottomSheet<AnnouncementAckSelection>(
+        context: context,
+        isScrollControlled: true,
+        builder: (sheetContext) => StatefulBuilder(
+          builder: (context, setSheetState) {
+            final visibleEmployees = employees.where((employee) {
+              final needle = searchText.trim().toLowerCase();
+              if (needle.isEmpty) return true;
+              return employee.name.toLowerCase().contains(needle) ||
+                  roleLabel(employee.role).toLowerCase().contains(needle);
+            }).toList();
+            return SafeArea(
+              child: FractionallySizedBox(
+                heightFactor: 0.86,
+                child: Column(
+                  children: [
+                    const ListTile(
+                      leading: Icon(Icons.fact_check_outlined, color: brandColor),
+                      title: Text('المطلوب منهم تأكيد الاطلاع', style: TextStyle(fontWeight: FontWeight.w900)),
+                      subtitle: Text('اختر الجميع أو موظفين محددين لهذا الإعلان'),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(14, 0, 14, 10),
+                      child: TextField(
+                        controller: search,
+                        decoration: const InputDecoration(
+                          prefixIcon: Icon(Icons.search_rounded),
+                          hintText: 'ابحث عن موظف',
+                        ),
+                        onChanged: (value) => setSheetState(() => searchText = value),
+                      ),
+                    ),
+                    ListTile(
+                      leading: Icon(
+                        allEmployees ? Icons.radio_button_checked_rounded : Icons.radio_button_off_rounded,
+                        color: allEmployees ? brandColor : mutedInk,
+                      ),
+                      title: const Text('جميع الموظفين', style: TextStyle(fontWeight: FontWeight.w900)),
+                      subtitle: Text('${employees.length} موظفاً نشطاً'),
+                      onTap: () => setSheetState(() => allEmployees = true),
+                    ),
+                    ListTile(
+                      leading: Icon(
+                        !allEmployees ? Icons.radio_button_checked_rounded : Icons.radio_button_off_rounded,
+                        color: !allEmployees ? brandColor : mutedInk,
+                      ),
+                      title: const Text('موظفون محددون', style: TextStyle(fontWeight: FontWeight.w900)),
+                      subtitle: Text(selectedIds.isEmpty ? 'لم يتم اختيار أحد' : 'تم اختيار ${selectedIds.length}'),
+                      onTap: () => setSheetState(() => allEmployees = false),
+                    ),
+                    const Divider(height: 1),
+                    Expanded(
+                      child: ListView.separated(
+                        itemCount: visibleEmployees.length,
+                        separatorBuilder: (_, __) => const Divider(height: 1, indent: 70),
+                        itemBuilder: (context, index) {
+                          final employee = visibleEmployees[index];
+                          final selected = selectedIds.contains(employee.id);
+                          return CheckboxListTile(
+                            value: !allEmployees && selected,
+                            onChanged: (_) => setSheetState(() {
+                              allEmployees = false;
+                              if (selected) {
+                                selectedIds.remove(employee.id);
+                              } else {
+                                selectedIds.add(employee.id);
+                              }
+                            }),
+                            secondary: EmployeeAvatar(name: employee.name, imageUrl: employee.avatarUrl, radius: 21),
+                            title: Text(employee.name, style: const TextStyle(fontWeight: FontWeight.w800)),
+                            subtitle: Text(roleLabel(employee.role)),
+                            controlAffinity: ListTileControlAffinity.trailing,
+                          );
+                        },
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: SizedBox(
+                        width: double.infinity,
+                        child: FilledButton.icon(
+                          onPressed: allEmployees || selectedIds.isNotEmpty
+                              ? () => Navigator.pop(
+                                    sheetContext,
+                                    allEmployees
+                                        ? const AnnouncementAckSelection.all()
+                                        : AnnouncementAckSelection.selected({...selectedIds}),
+                                  )
+                              : null,
+                          icon: const Icon(Icons.check_rounded),
+                          label: const Text('اعتماد المستلمين'),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      );
+      search.dispose();
+      if (!mounted || selection == null) return;
+      setState(() => announcementAckSelection = selection);
+    } catch (error) {
+      if (mounted) showSnack(context, cleanError(error));
     }
   }
 
@@ -12180,8 +12384,13 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   }
 
   Future<void> showMessageInfo(Map<String, dynamic> row) async {
-    final details = (row['receipt_details'] as List?)?.cast<Map<String, dynamic>>() ?? <Map<String, dynamic>>[];
-    final acknowledgedIds = (row['acknowledged_employee_ids'] as List?)?.map((value) => '$value').toSet() ?? <String>{};
+    final requiresAcknowledgement = row['requires_ack'] == true;
+    final receiptDetails = (row['receipt_details'] as List?)?.cast<Map<String, dynamic>>() ?? <Map<String, dynamic>>[];
+    final acknowledgementDetails =
+        (row['ack_target_details'] as List?)?.cast<Map<String, dynamic>>() ?? <Map<String, dynamic>>[];
+    final details = requiresAcknowledgement ? acknowledgementDetails : receiptDetails;
+    final acknowledgedCount = intValue(row['acknowledgement_count']);
+    final targetCount = intValue(row['ack_target_count']);
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -12193,24 +12402,39 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
               ListTile(
                 leading: const Icon(Icons.fact_check_outlined, color: brandColor),
                 title: const Text('معلومات الرسالة', style: TextStyle(fontWeight: FontWeight.w900)),
-                subtitle: Text(row['body']?.toString() ?? 'مرفق'),
-                trailing: row['requires_ack'] == true
-                    ? Chip(label: Text('${acknowledgedIds.length} اطلعوا'))
+                subtitle: Text(
+                  requiresAcknowledgement
+                      ? row['ack_target_scope'] == 'selected'
+                          ? 'تأكيد الاطلاع مطلوب من موظفين محددين'
+                          : 'تأكيد الاطلاع مطلوب من جميع الموظفين'
+                      : row['body']?.toString() ?? 'مرفق',
+                ),
+                trailing: requiresAcknowledgement
+                    ? Chip(label: Text('$acknowledgedCount / $targetCount'))
                     : null,
               ),
               const Divider(height: 1),
               Expanded(
                 child: details.isEmpty
-                    ? const EmptyState(icon: Icons.schedule_rounded, text: 'لم تتوفر إيصالات المستلمين بعد')
+                    ? EmptyState(
+                        icon: Icons.schedule_rounded,
+                        text: requiresAcknowledgement
+                            ? 'لا توجد قائمة مستلمين لهذا الإعلان'
+                            : 'لم تتوفر إيصالات المستلمين بعد',
+                      )
                     : ListView.separated(
                         itemCount: details.length,
                         separatorBuilder: (_, __) => const Divider(indent: 64, height: 1),
                         itemBuilder: (context, index) {
                           final detail = details[index];
+                          final acknowledged = detail['acknowledged'] == true;
                           final status = detail['status']?.toString() ?? 'sent';
-                          final label = status == 'read' ? 'تمت القراءة' : status == 'delivered' ? 'تم الوصول' : 'تم الإرسال';
+                          final label = status == 'read'
+                              ? 'تمت القراءة'
+                              : status == 'delivered'
+                                  ? 'تم الوصول'
+                                  : 'تم الإرسال';
                           final time = detail['read_at'] ?? detail['delivered_at'] ?? detail['sent_at'];
-                          final acknowledged = acknowledgedIds.contains('${detail['employee_id']}');
                           return ListTile(
                             leading: EmployeeAvatar(
                               name: detail['employee_name']?.toString() ?? 'موظف',
@@ -12219,13 +12443,27 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
                             ),
                             title: Text(detail['employee_name']?.toString() ?? 'موظف', style: const TextStyle(fontWeight: FontWeight.w800)),
                             subtitle: Text(
-                              row['requires_ack'] == true
-                                  ? '$label · ${formatEventTime(time)} · ${acknowledged ? 'أكد الاطلاع' : 'لم يؤكد الاطلاع'}'
+                              requiresAcknowledgement
+                                  ? acknowledged
+                                      ? 'أكد الاطلاع · ${formatEventTime(detail['acknowledged_at'])}'
+                                      : 'لم يؤكد الاطلاع بعد'
                                   : '$label · ${formatEventTime(time)}',
                             ),
                             trailing: Icon(
-                              status == 'read' ? Icons.done_all_rounded : status == 'delivered' ? Icons.done_all_rounded : Icons.done_rounded,
-                              color: status == 'read' ? infoColor : mutedInk,
+                              requiresAcknowledgement
+                                  ? acknowledged
+                                      ? Icons.verified_rounded
+                                      : Icons.schedule_rounded
+                                  : status == 'read' || status == 'delivered'
+                                      ? Icons.done_all_rounded
+                                      : Icons.done_rounded,
+                              color: requiresAcknowledgement
+                                  ? acknowledged
+                                      ? successColor
+                                      : accentColor
+                                  : status == 'read'
+                                      ? infoColor
+                                      : mutedInk,
                             ),
                           );
                         },
@@ -12749,7 +12987,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
 
   Future<void> acknowledgeAnnouncement(Map<String, dynamic> row) async {
     final messageId = '${row['id']}';
-    if (row['acknowledged_by_me'] == true) return;
+    if (row['acknowledged_by_me'] == true || row['ack_required_for_me'] != true) return;
     final before = latestMessages == null
         ? null
         : latestMessages!.map((messageRow) => Map<String, dynamic>.from(messageRow)).toList();
@@ -12764,6 +13002,16 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
             ...(messageRow['acknowledged_employee_ids'] as List? ?? const <dynamic>[]).map((value) => '$value'),
             widget.session.id,
           }.toList(),
+          'ack_pending_count': max(0, intValue(messageRow['ack_pending_count']) - 1),
+          'ack_target_details': (messageRow['ack_target_details'] as List? ?? const <dynamic>[]).map((raw) {
+            final detail = Map<String, dynamic>.from(raw as Map);
+            if ('${detail['employee_id']}' != widget.session.id) return detail;
+            return {
+              ...detail,
+              'acknowledged': true,
+              'acknowledged_at': DateTime.now().toUtc().toIso8601String(),
+            };
+          }).toList(),
         };
       }).toList();
       setState(() {
@@ -12772,18 +13020,10 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
       });
     }
     try {
-      try {
-        await supabase.rpc('ansar_acknowledge_chat_announcement', params: {
-          'p_employee_id': widget.session.id,
-          'p_message_id': messageId,
-        });
-      } catch (_) {
-        await supabase.from('ansar_chat_announcement_acknowledgements').upsert({
-          'message_id': messageId,
-          'employee_id': widget.session.id,
-          'acknowledged_at': DateTime.now().toUtc().toIso8601String(),
-        }, onConflict: 'message_id,employee_id');
-      }
+      await supabase.rpc('ansar_acknowledge_chat_announcement', params: {
+        'p_employee_id': widget.session.id,
+        'p_message_id': messageId,
+      });
       unawaited(refreshMessages());
     } catch (error) {
       if (mounted && before != null) {
@@ -13000,7 +13240,11 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
                                       ? closePoll
                                       : null,
                                   voiceSourceResolver: resolveVoiceSource,
-                                  onAcknowledge: () => acknowledgeAnnouncement(row),
+                                  onAcknowledge: row['ack_required_for_me'] == true
+                                      ? () => acknowledgeAnnouncement(row)
+                                      : row['can_view_ack_report'] == true
+                                          ? () => showMessageInfo(row)
+                                          : null,
                                 ),
                               ),
                             ],
@@ -13095,11 +13339,30 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
                       editingMessage == null) ...[
                     Align(
                       alignment: Alignment.centerRight,
-                      child: FilterChip(
-                        selected: announcementRequiresAck,
-                        avatar: const Icon(Icons.fact_check_outlined, size: 16),
-                        label: const Text('يتطلب تأكيد الاطلاع'),
-                        onSelected: (value) => setState(() => announcementRequiresAck = value),
+                      child: Wrap(
+                        spacing: 7,
+                        runSpacing: 7,
+                        children: [
+                          FilterChip(
+                            selected: announcementRequiresAck,
+                            avatar: const Icon(Icons.fact_check_outlined, size: 16),
+                            label: const Text('يتطلب تأكيد الاطلاع'),
+                            onSelected: (value) => setState(() {
+                              announcementRequiresAck = value;
+                              if (!value) announcementAckSelection = const AnnouncementAckSelection.all();
+                            }),
+                          ),
+                          if (announcementRequiresAck)
+                            ActionChip(
+                              avatar: const Icon(Icons.groups_2_outlined, size: 16),
+                              label: Text(
+                                announcementAckSelection.allEmployees
+                                    ? 'جميع الموظفين'
+                                    : '${announcementAckSelection.employeeIds.length} موظفين محددين',
+                              ),
+                              onPressed: chooseAnnouncementAckRecipients,
+                            ),
+                        ],
                       ),
                     ),
                     const SizedBox(height: 7),
@@ -13533,6 +13796,12 @@ class ChatMessageBubble extends StatelessWidget {
     final regularAttachments = attachments.where((attachment) => !chatAttachmentIsAudio(attachment)).toList();
     final poll = normalizedChatPoll(row['poll'], seed: '${row['id']}');
     final reactions = (row['reactions'] as List?)?.whereType<Map>().map(Map<String, dynamic>.from).toList() ?? <Map<String, dynamic>>[];
+    final requiresAcknowledgement = row['requires_ack'] == true;
+    final acknowledgementRequiredForMe = row['ack_required_for_me'] == true;
+    final acknowledgementConfirmedByMe = row['acknowledged_by_me'] == true;
+    final canViewAcknowledgementReport = row['can_view_ack_report'] == true;
+    final acknowledgementCount = intValue(row['acknowledgement_count']);
+    final acknowledgementTargetCount = intValue(row['ack_target_count']);
     return Column(
       children: [
         if (showDate) ...[
@@ -13679,17 +13948,28 @@ class ChatMessageBubble extends StatelessWidget {
                                   const SizedBox(height: 6),
                                   ChatReactionSummary(reactions: reactions),
                                 ],
-                                if (row['requires_ack'] == true && !deleted) ...[
+                                if (requiresAcknowledgement &&
+                                    !deleted &&
+                                    (acknowledgementRequiredForMe || canViewAcknowledgementReport)) ...[
                                   const SizedBox(height: 7),
                                   SizedBox(
                                     width: double.infinity,
                                     child: OutlinedButton.icon(
-                                      onPressed: row['acknowledged_by_me'] == true ? null : onAcknowledge,
-                                      icon: Icon(row['acknowledged_by_me'] == true ? Icons.verified_rounded : Icons.fact_check_outlined, size: 17),
+                                      onPressed: acknowledgementRequiredForMe && acknowledgementConfirmedByMe ? null : onAcknowledge,
+                                      icon: Icon(
+                                        acknowledgementRequiredForMe && acknowledgementConfirmedByMe
+                                            ? Icons.verified_rounded
+                                            : canViewAcknowledgementReport && !acknowledgementRequiredForMe
+                                                ? Icons.groups_2_outlined
+                                                : Icons.fact_check_outlined,
+                                        size: 17,
+                                      ),
                                       label: Text(
-                                        row['acknowledged_by_me'] == true
-                                            ? 'تم تأكيد اطلاعك'
-                                            : 'اطلعت (${row['acknowledgement_count'] ?? 0})',
+                                        acknowledgementRequiredForMe
+                                            ? acknowledgementConfirmedByMe
+                                                ? 'تم تأكيد اطلاعك'
+                                                : 'تأكيد الاطلاع'
+                                            : 'الاطلاع $acknowledgementCount / $acknowledgementTargetCount',
                                       ),
                                     ),
                                   ),

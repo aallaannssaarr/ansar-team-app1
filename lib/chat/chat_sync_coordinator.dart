@@ -182,6 +182,7 @@ class ChatSyncCoordinator {
     String? forwardedFromId,
     List<String> mentions = const [],
     bool requiresAck = false,
+    List<String>? ackTargetEmployeeIds,
     Map<String, dynamic>? poll,
   }) async {
     final clientMessageId = store.createClientMessageId(employeeId);
@@ -196,6 +197,7 @@ class ChatSyncCoordinator {
       'forwarded_from_id': forwardedFromId,
       'mentions': mentions,
       'requires_ack': requiresAck,
+      'ack_target_employee_ids': ackTargetEmployeeIds,
       'poll': poll,
     };
     final optimistic = <String, dynamic>{
@@ -210,6 +212,9 @@ class ChatSyncCoordinator {
       'forwarded_from_id': forwardedFromId,
       'mentions': mentions,
       'requires_ack': requiresAck,
+      if (requiresAck) 'ack_target_scope': ackTargetEmployeeIds == null ? 'all' : 'selected',
+      if (requiresAck) 'ack_target_employee_ids': ackTargetEmployeeIds,
+      if (requiresAck) 'ack_target_count': ackTargetEmployeeIds?.length,
       if (poll != null) 'poll': _pollForDisplay(poll, null, clientMessageId),
       'created_at': now,
       'local_state': _online ? 'sending' : 'pending',
@@ -325,6 +330,24 @@ class ChatSyncCoordinator {
     required Map<String, dynamic> payload,
     required List<Map<String, dynamic>> attachments,
   }) async {
+    if (payload['requires_ack'] == true) {
+      final result = await client.rpc('ansar_send_chat_message_v3', params: {
+        'p_employee_id': employeeId,
+        'p_thread_id': threadId,
+        'p_client_message_id': clientMessageId,
+        'p_body': payload['body'] ?? '',
+        'p_message_type': payload['message_type'] ?? 'text',
+        'p_attachments': attachments,
+        'p_reply_to_id': payload['reply_to_id'],
+        'p_mentions': payload['mentions'] ?? <String>[],
+        'p_requires_ack': true,
+        'p_ack_target_employee_ids': payload['ack_target_employee_ids'],
+        'p_forwarded_from_id': payload['forwarded_from_id'],
+        'p_poll': payload['poll'],
+      });
+      return result is Map ? Map<String, dynamic>.from(result) : <String, dynamic>{};
+    }
+
     // Core messages must not depend on the larger v2 RPC. That function also
     // creates notifications, receipts and inbox events, so a failure in any of
     // those secondary paths used to roll the message itself back.

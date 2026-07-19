@@ -504,6 +504,69 @@ void main() {
     expect(find.text('نص يجب ألا يظهر'), findsNothing);
   });
 
+  testWidgets('announcement acknowledgement remains actionable for each required employee', (tester) async {
+    var pressed = false;
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      _testShell(
+        ChatMessageBubble(
+          row: const {
+            'body': 'إعلان موجه للموظف',
+            'created_at': '2026-07-20T10:30:00Z',
+            'requires_ack': true,
+            'ack_required_for_me': true,
+            'acknowledged_by_me': false,
+            'acknowledgement_count': 1,
+            'ack_target_count': 3,
+          },
+          mine: false,
+          senderName: 'الإدارة',
+          avatarUrl: null,
+          showDate: false,
+          showIdentity: true,
+          onLongPress: null,
+          onAcknowledge: () => pressed = true,
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('تأكيد الاطلاع'), findsOneWidget);
+    await tester.tap(find.text('تأكيد الاطلاع'));
+    expect(pressed, isTrue);
+  });
+
+  testWidgets('announcement sender sees per-employee acknowledgement progress', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(390, 844));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(
+      _testShell(
+        ChatMessageBubble(
+          row: const {
+            'body': 'إعلان لجميع الموظفين',
+            'created_at': '2026-07-20T10:30:00Z',
+            'requires_ack': true,
+            'ack_required_for_me': false,
+            'can_view_ack_report': true,
+            'acknowledgement_count': 2,
+            'ack_target_count': 5,
+          },
+          mine: true,
+          senderName: 'أنت',
+          avatarUrl: null,
+          showDate: false,
+          showIdentity: false,
+          onLongPress: null,
+          onAcknowledge: () {},
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('الاطلاع 2 / 5'), findsOneWidget);
+  });
+
   test('delete for everyone belongs to the original sender only', () {
     final sender = EmployeeSession({
       'id': 'sender',
