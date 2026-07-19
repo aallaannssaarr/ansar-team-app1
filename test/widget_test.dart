@@ -1,4 +1,5 @@
 import 'package:ansar_team_app/chat/chat_local_store.dart';
+import 'package:ansar_team_app/chat/chat_sync_coordinator.dart';
 import 'package:ansar_team_app/main.dart';
 import 'package:ansar_team_app/product_cache.dart';
 import 'package:flutter/material.dart';
@@ -38,6 +39,28 @@ Widget _testShell(Widget child) {
 }
 
 void main() {
+  test('chat send falls back only when the v2 server function is unavailable', () {
+    expect(
+      shouldFallbackToLegacyChatSend(
+        'PostgrestException(message: Could not find the function public.ansar_send_chat_message_v2, code: PGRST202)',
+      ),
+      isTrue,
+    );
+    expect(
+      shouldFallbackToLegacyChatSend('PostgrestException(message: permission denied, code: 42501)'),
+      isFalse,
+    );
+  });
+
+  test('legacy chat insert retries without the client message column', () {
+    expect(
+      shouldRetryBasicLegacyChatInsert(
+        "PostgrestException(message: Could not find the 'client_message_id' column, code: PGRST204)",
+      ),
+      isTrue,
+    );
+  });
+
   test('chat database configures WAL through the query API', () async {
     final database = _RecordingDatabase();
 

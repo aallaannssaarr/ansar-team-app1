@@ -24,6 +24,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'ansar_config.dart';
+import 'chat/chat_app_presence.dart';
 import 'chat/chat_local_store.dart';
 import 'chat/chat_sync_coordinator.dart';
 import 'chat/chat_voice.dart';
@@ -259,6 +260,8 @@ SupabaseClient get supabase => Supabase.instance.client;
 ChatSyncCoordinator? _chatSyncCoordinator;
 ChatSyncCoordinator get chatSyncCoordinator =>
     _chatSyncCoordinator ??= ChatSyncCoordinator(client: supabase);
+ChatAppPresence? _chatAppPresence;
+ChatAppPresence get chatAppPresence => _chatAppPresence ??= ChatAppPresence(supabase);
 List<Map<String, dynamic>>? cachedProducts;
 Map<int, String>? cachedBarcodes;
 Future<List<Map<String, dynamic>>>? cachedProductsFuture;
@@ -827,6 +830,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     session = widget.initialSession;
     unawaited(EmployeeSessionStore.save(session));
     unawaited(touchEmployeePresence(session.id, online: true));
+    unawaited(chatAppPresence.start(employeeId: session.id, employeeName: session.name));
     startInAppNotificationMonitor();
     startUnreadMessagesMonitor();
     if (kIsBetaBuild) startHomeChatSync();
@@ -994,6 +998,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void updateSession(EmployeeSession value) {
     setState(() => session = value);
     unawaited(EmployeeSessionStore.save(value));
+    unawaited(chatAppPresence.start(employeeId: value.id, employeeName: value.name));
     if (notificationServicesInitialized) startNotificationRegistrationMonitor();
     startInAppNotificationMonitor();
     startUnreadMessagesMonitor();
@@ -1010,7 +1015,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           event.type == ChatSyncEventType.connected) {
         unawaited(refreshUnreadChatMessages());
       }
+      if (event.type == ChatSyncEventType.messageSent && event.payload?['_legacy_fallback'] == true) {
+        unawaited(enqueueLegacyFallbackChatNotification(event));
+      }
     });
+  }
+
+  Future<void> enqueueLegacyFallbackChatNotification(ChatSyncEvent event) async {
+    final threadId = event.threadId;
+    if (threadId == null || threadId.isEmpty) return;
+    try {
+      final thread = await supabase
+          .from('ansar_chat_threads')
+          .select('id, title, thread_type')
+          .eq('id', threadId)
+          .single();
+      await enqueueChatNotification(
+        thread: Map<String, dynamic>.from(thread),
+        sender: session,
+        body: event.payload?['body']?.toString() ?? '',
+      );
+    } catch (_) {
+      // The message is already delivered; a notification retry must not mark it failed.
+    }
   }
 
   void startUnreadMessagesMonitor() {
@@ -1130,6 +1157,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     unreadMessagesTimer?.cancel();
     homeChatSyncSubscription?.cancel();
     if (unreadMessagesChannel != null) supabase.removeChannel(unreadMessagesChannel!);
+    unawaited(chatAppPresence.stop());
     unawaited(touchEmployeePresence(session.id, online: false));
     super.dispose();
   }
@@ -1144,10 +1172,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         unawaited(initializeHomeNotificationServices());
       }
       startInAppNotificationMonitor();
+      unawaited(chatAppPresence.start(employeeId: session.id, employeeName: session.name));
       unawaited(touchEmployeePresence(session.id, online: true));
       unawaited(refreshUnreadChatMessages());
       if (kIsBetaBuild) unawaited(chatSyncCoordinator.flushOutbox());
     } else if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
+      unawaited(chatAppPresence.pause());
       unawaited(touchEmployeePresence(session.id, online: false));
     }
   }
@@ -1198,6 +1228,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     await homeChatSyncSubscription?.cancel();
     homeChatSyncSubscription = null;
     if (kIsBetaBuild) await chatSyncCoordinator.stop();
+    await chatAppPresence.stop();
     await notificationTokenRefreshSubscription?.cancel();
     notificationTokenRefreshSubscription = null;
     try {
@@ -10800,6 +10831,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   Timer? draftTimer;
   Timer? realtimeReconnectTimer;
   StreamSubscription<ChatSyncEvent>? chatSyncSubscription;
+  StreamSubscription<void>? appPresenceSubscription;
   RealtimeChannel? liveChannel;
   RealtimeChannel? messagesChannel;
   bool sendingMessage = false;
@@ -10832,6 +10864,8 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     future = kIsBetaBuild ? loadCachedMessages() : loadAndRememberMessages();
     message.addListener(handleTypingChanged);
     setupLiveConversation();
+    appPresenceSubscription = chatAppPresence.changes.listen((_) => updateAppOnlinePresence());
+    updateAppOnlinePresence();
     if (kIsBetaBuild) {
       unawaited(chatSyncCoordinator.start(widget.session.id));
       chatSyncSubscription = chatSyncCoordinator.events.listen(handleChatSyncEvent);
@@ -10859,11 +10893,9 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     draftTimer?.cancel();
     realtimeReconnectTimer?.cancel();
     chatSyncSubscription?.cancel();
+    appPresenceSubscription?.cancel();
     if (messagesChannel != null) supabase.removeChannel(messagesChannel!);
-    if (liveChannel != null) {
-      liveChannel!.untrack();
-      supabase.removeChannel(liveChannel!);
-    }
+    if (liveChannel != null) supabase.removeChannel(liveChannel!);
     message.removeListener(handleTypingChanged);
     scrollController
       ..removeListener(handleMessageScroll)
@@ -10871,7 +10903,6 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     composerFocus.dispose();
     voiceRecorder.dispose();
     message.dispose();
-    unawaited(touchEmployeePresence(widget.session.id, online: false));
     super.dispose();
   }
 
@@ -10911,11 +10942,15 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
         if (mounted) setState(() {
           latestMessages = cached;
           future = Future.value(cached);
-          messageSyncError = 'تعذر إرسال رسالة. اضغط عليها لإعادة المحاولة.';
         });
       }));
     } else if (event.type == ChatSyncEventType.connected) {
-      if (messageSyncError != null) setState(() => messageSyncError = null);
+      if (!realtimeConnected || messageSyncError != null) {
+        setState(() {
+          realtimeConnected = true;
+          messageSyncError = null;
+        });
+      }
       unawaited(refreshMessages());
     } else if (event.type == ChatSyncEventType.disconnected) {
       setState(() {
@@ -11014,6 +11049,8 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
 
   void setupLiveConversation() {
     final participantIds = (widget.thread['participant_ids'] as List?)?.map((value) => '$value').toSet() ?? <String>{};
+    final previousChannel = liveChannel;
+    if (previousChannel != null) unawaited(supabase.removeChannel(previousChannel));
     liveChannel = supabase.channel('ansar-chat-live-${widget.thread['id']}')
       ..onBroadcast(
         event: 'typing',
@@ -11031,26 +11068,32 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
           }
         },
       )
-      ..onPresenceSync((_) => updateOnlinePresence(participantIds))
-      ..onPresenceJoin((_) => updateOnlinePresence(participantIds))
-      ..onPresenceLeave((_) => updateOnlinePresence(participantIds))
-      ..subscribe((status, error) async {
+      ..subscribe((status, error) {
+        if (!mounted) return;
         if (status == RealtimeSubscribeStatus.subscribed) {
-          await liveChannel?.track({
-            'employee_id': widget.session.id,
-            'employee_name': widget.session.name,
-            'online_at': DateTime.now().toUtc().toIso8601String(),
+          if (!realtimeConnected || messageSyncError != null) {
+            setState(() {
+              realtimeConnected = true;
+              messageSyncError = null;
+            });
+          }
+        } else if (status == RealtimeSubscribeStatus.channelError ||
+            status == RealtimeSubscribeStatus.timedOut) {
+          if (realtimeConnected) setState(() => realtimeConnected = false);
+          realtimeReconnectTimer?.cancel();
+          realtimeReconnectTimer = Timer(const Duration(seconds: 3), () {
+            if (mounted && !realtimeConnected) setupLiveConversation();
           });
-          await touchEmployeePresence(widget.session.id, online: true);
         }
       });
+    updateAppOnlinePresence();
   }
 
-  void updateOnlinePresence(Set<String> participantIds) {
-    if (!mounted || liveChannel == null) return;
-    final state = liveChannel!.presenceState().toString();
+  void updateAppOnlinePresence() {
+    if (!mounted) return;
+    final participantIds = (widget.thread['participant_ids'] as List?)?.map((value) => '$value') ?? const <String>[];
     final others = participantIds.where((id) => id != widget.session.id);
-    final online = others.any(state.contains);
+    final online = chatAppPresence.isAnyOnline(others);
     if (online != otherParticipantOnline) setState(() => otherParticipantOnline = online);
     if (!online) unawaited(loadOtherParticipantLastSeen());
   }
@@ -12781,24 +12824,20 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
         children: [
           AnimatedSwitcher(
             duration: const Duration(milliseconds: 180),
-            child: realtimeConnected && messageSyncError == null
+            child: messageSyncError == null
                 ? const SizedBox.shrink()
                 : Container(
-                    key: ValueKey(messageSyncError ?? 'reconnecting'),
+                    key: ValueKey(messageSyncError),
                     width: double.infinity,
                     color: warningSurface,
                     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
                     child: Row(
                       children: [
-                        const SizedBox(
-                          width: 14,
-                          height: 14,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: accentColor),
-                        ),
+                        const Icon(Icons.cloud_off_rounded, size: 16, color: accentColor),
                         const SizedBox(width: 8),
                         Expanded(
                           child: Text(
-                            messageSyncError ?? 'جار إعادة الاتصال بالمحادثة...',
+                            messageSyncError!,
                             style: const TextStyle(fontSize: 11, color: inkColor, fontWeight: FontWeight.w700),
                           ),
                         ),

@@ -29,10 +29,13 @@ class ChatSyncCoordinator {
 
   String? _employeeId;
   RealtimeChannel? _inboxChannel;
+  RealtimeChannel? _messageChangesChannel;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
   Timer? _retryTimer;
   bool _flushing = false;
   bool _online = true;
+  bool _inboxConnected = false;
+  bool _messageChangesConnected = false;
 
   Future<void> start(String employeeId) async {
     if (_employeeId == employeeId && _inboxChannel != null) return;
@@ -50,6 +53,7 @@ class ChatSyncCoordinator {
       if (connected) unawaited(flushOutbox());
     });
     _subscribeInbox();
+    _subscribeMessageChanges();
     _retryTimer = Timer.periodic(const Duration(seconds: 20), (_) => unawaited(_retryPendingWork()));
     if (_online) unawaited(flushOutbox());
   }
@@ -81,12 +85,58 @@ class ChatSyncCoordinator {
       )
       ..subscribe((status, error) {
         if (status == RealtimeSubscribeStatus.subscribed) {
+          _inboxConnected = true;
           _events.add(const ChatSyncEvent(ChatSyncEventType.connected));
           unawaited(_recoverMissedEvents());
         } else if (status == RealtimeSubscribeStatus.channelError || status == RealtimeSubscribeStatus.timedOut) {
-          _events.add(ChatSyncEvent(ChatSyncEventType.disconnected, error: error));
-          Future<void>.delayed(const Duration(seconds: 3), () {
+          _inboxConnected = false;
+          if (!_messageChangesConnected) {
+            _events.add(ChatSyncEvent(ChatSyncEventType.disconnected, error: error));
+          }
+          Future<void>.delayed(const Duration(seconds: 15), () {
             if (_employeeId == employeeId) _subscribeInbox();
+          });
+        }
+      });
+  }
+
+  void _subscribeMessageChanges() {
+    final employeeId = _employeeId;
+    if (employeeId == null) return;
+    final old = _messageChangesChannel;
+    if (old != null) unawaited(client.removeChannel(old));
+    _messageChangesChannel = client.channel(
+      'ansar-chat-message-changes-$employeeId-${DateTime.now().millisecondsSinceEpoch}',
+    )
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.all,
+        schema: 'public',
+        table: 'ansar_chat_messages',
+        callback: (payload) {
+          final row = payload.newRecord.isNotEmpty ? payload.newRecord : payload.oldRecord;
+          final threadId = row['thread_id']?.toString();
+          if (threadId == null || threadId.isEmpty) return;
+          _events.add(
+            ChatSyncEvent(
+              ChatSyncEventType.threadChanged,
+              threadId: threadId,
+              payload: Map<String, dynamic>.from(row),
+            ),
+          );
+        },
+      )
+      ..subscribe((status, error) {
+        if (status == RealtimeSubscribeStatus.subscribed) {
+          _messageChangesConnected = true;
+          _events.add(const ChatSyncEvent(ChatSyncEventType.connected));
+        } else if (status == RealtimeSubscribeStatus.channelError ||
+            status == RealtimeSubscribeStatus.timedOut) {
+          _messageChangesConnected = false;
+          if (!_inboxConnected) {
+            _events.add(ChatSyncEvent(ChatSyncEventType.disconnected, error: error));
+          }
+          Future<void>.delayed(const Duration(seconds: 5), () {
+            if (_employeeId == employeeId) _subscribeMessageChanges();
           });
         }
       });
@@ -207,19 +257,13 @@ class ChatSyncCoordinator {
             originalAttachments,
           );
           payload['attachments'] = uploaded;
-          final result = await client.rpc('ansar_send_chat_message_v2', params: {
-            'p_employee_id': employeeId,
-            'p_thread_id': item['thread_id'],
-            'p_client_message_id': clientMessageId,
-            'p_body': payload['body'] ?? '',
-            'p_message_type': payload['message_type'] ?? 'text',
-            'p_attachments': uploaded,
-            'p_reply_to_id': payload['reply_to_id'],
-            'p_mentions': payload['mentions'] ?? <String>[],
-            'p_requires_ack': payload['requires_ack'] == true,
-            'p_forwarded_from_id': payload['forwarded_from_id'],
-            'p_poll': payload['poll'],
-          });
+          final result = await _sendMessageToServer(
+            employeeId: employeeId,
+            threadId: item['thread_id']?.toString() ?? '',
+            clientMessageId: clientMessageId,
+            payload: payload,
+            attachments: uploaded,
+          );
           final resultMap = result is Map ? Map<String, dynamic>.from(result) : <String, dynamic>{};
           final rawMessage = resultMap['message'];
           final serverMessage = rawMessage is Map ? Map<String, dynamic>.from(rawMessage) : <String, dynamic>{};
@@ -273,6 +317,107 @@ class ChatSyncCoordinator {
     }
   }
 
+  Future<Map<String, dynamic>> _sendMessageToServer({
+    required String employeeId,
+    required String threadId,
+    required String clientMessageId,
+    required Map<String, dynamic> payload,
+    required List<Map<String, dynamic>> attachments,
+  }) async {
+    try {
+      final result = await client.rpc('ansar_send_chat_message_v2', params: {
+        'p_employee_id': employeeId,
+        'p_thread_id': threadId,
+        'p_client_message_id': clientMessageId,
+        'p_body': payload['body'] ?? '',
+        'p_message_type': payload['message_type'] ?? 'text',
+        'p_attachments': attachments,
+        'p_reply_to_id': payload['reply_to_id'],
+        'p_mentions': payload['mentions'] ?? <String>[],
+        'p_requires_ack': payload['requires_ack'] == true,
+        'p_forwarded_from_id': payload['forwarded_from_id'],
+        'p_poll': payload['poll'],
+      });
+      return result is Map ? Map<String, dynamic>.from(result) : <String, dynamic>{};
+    } catch (error) {
+      if (!shouldFallbackToLegacyChatSend(error)) rethrow;
+      final message = await _sendLegacyMessage(
+        employeeId: employeeId,
+        threadId: threadId,
+        clientMessageId: clientMessageId,
+        payload: payload,
+        attachments: attachments,
+      );
+      return {
+        'message': {...message, '_legacy_fallback': true},
+        'legacy_fallback': true,
+      };
+    }
+  }
+
+  Future<Map<String, dynamic>> _sendLegacyMessage({
+    required String employeeId,
+    required String threadId,
+    required String clientMessageId,
+    required Map<String, dynamic> payload,
+    required List<Map<String, dynamic>> attachments,
+  }) async {
+    if (payload['poll'] != null) {
+      throw StateError('The chat upgrade is required before sending polls.');
+    }
+    final basicRow = <String, dynamic>{
+      'thread_id': threadId,
+      'sender_id': employeeId,
+      'body': payload['body'] ?? '',
+      'message_type': payload['message_type'] ?? 'text',
+      if (attachments.isNotEmpty) 'attachments': attachments,
+      if (payload['reply_to_id'] != null) 'reply_to_id': payload['reply_to_id'],
+    };
+    try {
+      final inserted = await client
+          .from('ansar_chat_messages')
+          .insert({...basicRow, 'client_message_id': clientMessageId})
+          .select()
+          .single();
+      await _touchThread(threadId);
+      return Map<String, dynamic>.from(inserted);
+    } catch (error) {
+      if (_looksLikeDuplicate(error)) {
+        try {
+          final rows = await client
+              .from('ansar_chat_messages')
+              .select()
+              .eq('sender_id', employeeId)
+              .eq('client_message_id', clientMessageId)
+              .limit(1);
+          if (rows.isNotEmpty) return Map<String, dynamic>.from(rows.first);
+        } catch (_) {
+          // Continue to the legacy schema fallback below.
+        }
+      }
+      if (!shouldRetryBasicLegacyChatInsert(error)) rethrow;
+    }
+
+    final inserted = await client.from('ansar_chat_messages').insert(basicRow).select().single();
+    await _touchThread(threadId);
+    return Map<String, dynamic>.from(inserted);
+  }
+
+  Future<void> _touchThread(String threadId) async {
+    try {
+      await client.from('ansar_chat_threads').update({
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+      }).eq('id', threadId);
+    } catch (_) {
+      // Message delivery is successful even if the legacy thread timestamp fails.
+    }
+  }
+
+  bool _looksLikeDuplicate(Object error) {
+    final text = error.toString().toLowerCase();
+    return text.contains('23505') || text.contains('duplicate key') || text.contains('unique constraint');
+  }
+
   Future<void> _retryPendingWork() async {
     if (!_online) {
       final connectivity = await Connectivity().checkConnectivity();
@@ -281,6 +426,7 @@ class ChatSyncCoordinator {
         _online = true;
         _events.add(const ChatSyncEvent(ChatSyncEventType.connected));
         _subscribeInbox();
+        _subscribeMessageChanges();
       }
     }
     await flushOutbox();
@@ -352,6 +498,11 @@ class ChatSyncCoordinator {
     final channel = _inboxChannel;
     _inboxChannel = null;
     if (channel != null) await client.removeChannel(channel);
+    final messageChangesChannel = _messageChangesChannel;
+    _messageChangesChannel = null;
+    if (messageChangesChannel != null) await client.removeChannel(messageChangesChannel);
+    _inboxConnected = false;
+    _messageChangesConnected = false;
     _employeeId = null;
   }
 
@@ -359,4 +510,27 @@ class ChatSyncCoordinator {
     await stop();
     await _events.close();
   }
+}
+
+bool shouldFallbackToLegacyChatSend(Object error) {
+  final text = error.toString().toLowerCase();
+  if (text.contains('pgrst202') ||
+      text.contains('could not find the function') ||
+      text.contains('ansar_send_chat_message_v2') && text.contains('not found')) {
+    return true;
+  }
+  const upgradeObjects = <String>[
+    'ansar_chat_inbox_events',
+    'ansar_chat_message_receipts',
+    'client_message_id',
+  ];
+  return (text.contains('does not exist') || text.contains('schema cache')) &&
+      upgradeObjects.any(text.contains);
+}
+
+bool shouldRetryBasicLegacyChatInsert(Object error) {
+  final text = error.toString().toLowerCase();
+  return (text.contains('client_message_id') &&
+          (text.contains('does not exist') || text.contains('schema cache') || text.contains('pgrst204'))) ||
+      text.contains("could not find the 'client_message_id' column");
 }
