@@ -10658,7 +10658,12 @@ class ChatThreadTile extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 12),
           child: Row(
             children: [
-              if (general || group)
+              if (branchChannel)
+                BranchLogo(
+                  branchName: thread['title']?.toString() ?? '',
+                  size: 50,
+                )
+              else if (general || group)
                 Container(
                   width: 50,
                   height: 50,
@@ -10765,6 +10770,11 @@ class ChatAttachmentDraft {
 
 String chatMessageListPreview(Map<String, dynamic> message) {
   final body = message['body']?.toString().trim() ?? '';
+  final attachments = (message['attachments'] as List?)?.whereType<Map>() ?? const <Map>[];
+  if (attachments.any(chatAttachmentIsAudio)) return 'رسالة صوتية';
+  if (message['poll'] is Map || message['poll_id'] != null) {
+    return 'استبيان: ${body.isEmpty ? 'استبيان جديد' : body}';
+  }
   switch (message['message_type']?.toString()) {
     case 'voice':
       return '🎙 رسالة صوتية';
@@ -10777,6 +10787,36 @@ String chatMessageListPreview(Map<String, dynamic> message) {
     default:
       return body;
   }
+}
+
+bool chatAttachmentIsAudio(Map attachment) {
+  final mimeType = attachment['mime_type']?.toString().toLowerCase() ?? '';
+  return mimeType.startsWith('audio/') || intValue(attachment['duration_ms']) > 0;
+}
+
+Map<String, dynamic>? normalizedChatPoll(Object? value, {String seed = 'poll'}) {
+  if (value is! Map) return null;
+  final poll = Map<String, dynamic>.from(value);
+  final rawOptions = poll['options'] as List? ?? const <dynamic>[];
+  final options = <Map<String, dynamic>>[];
+  for (var index = 0; index < rawOptions.length; index++) {
+    final raw = rawOptions[index];
+    final option = raw is Map
+        ? Map<String, dynamic>.from(raw)
+        : <String, dynamic>{'option_text': raw.toString()};
+    options.add({
+      ...option,
+      'id': option['id'] ?? 'local:$seed:$index',
+      'option_text': option['option_text'] ?? option['text'] ?? '',
+      'votes': intValue(option['votes']),
+      'selected': option['selected'] == true,
+    });
+  }
+  return {
+    ...poll,
+    'options': options,
+    'total_votes': intValue(poll['total_votes']),
+  };
 }
 
 String chatAttachmentMime(String extension) {
@@ -12214,17 +12254,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   }
 
   Future<void> openThreadHeader() async {
-    if (widget.thread['thread_type'] != 'direct') {
-      await openThreadInfo();
-      return;
-    }
-    final ids = (widget.thread['participant_ids'] as List?)?.map((value) => '$value').toList() ?? const <String>[];
-    final others = ids.where((id) => id != widget.session.id).toList();
-    if (others.isEmpty) {
-      await openThreadInfo();
-      return;
-    }
-    await openEmployeePublicProfile(context, widget.session, others.first);
+    await openThreadInfo();
   }
 
   Future<void> openThreadInfo() async {
@@ -12444,10 +12474,45 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   }
 
   Future<void> openAttachment(Map<String, dynamic> attachment) async {
-    final path = attachment['path']?.toString();
-    if (path == null || path.isEmpty) return;
     try {
-      final url = await supabase.storage.from('ansar-chat').createSignedUrl(path, 600);
+      final url = await resolveChatAttachmentSource(attachment);
+      if (url == null || url.isEmpty) throw Exception('تعذر العثور على المرفق');
+      final mimeType = attachment['mime_type']?.toString().toLowerCase() ?? '';
+      if (mimeType.startsWith('image/')) {
+        if (!mounted) return;
+        await showDialog<void>(
+          context: context,
+          barrierColor: Colors.black87,
+          builder: (dialogContext) => Dialog.fullscreen(
+            backgroundColor: Colors.black,
+            child: SafeArea(
+              child: Stack(
+                children: [
+                  Center(
+                    child: InteractiveViewer(
+                      minScale: 0.7,
+                      maxScale: 5,
+                      child: url.startsWith('http')
+                          ? Image.network(url, fit: BoxFit.contain)
+                          : Image.file(File(url), fit: BoxFit.contain),
+                    ),
+                  ),
+                  Positioned(
+                    top: 8,
+                    right: 8,
+                    child: IconButton.filledTonal(
+                      tooltip: 'إغلاق',
+                      onPressed: () => Navigator.pop(dialogContext),
+                      icon: const Icon(Icons.close_rounded),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        return;
+      }
       final opened = await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
       if (!opened && mounted) showSnack(context, 'تعذر فتح المرفق على هذا الجهاز');
     } catch (error) {
@@ -12743,13 +12808,50 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   }
 
   Future<void> acknowledgeAnnouncement(Map<String, dynamic> row) async {
-    try {
-      await supabase.rpc('ansar_acknowledge_chat_announcement', params: {
-        'p_employee_id': widget.session.id,
-        'p_message_id': '${row['id']}',
+    final messageId = '${row['id']}';
+    if (row['acknowledged_by_me'] == true) return;
+    final before = latestMessages == null
+        ? null
+        : latestMessages!.map((messageRow) => Map<String, dynamic>.from(messageRow)).toList();
+    if (mounted && latestMessages != null) {
+      final updated = latestMessages!.map((messageRow) {
+        if ('${messageRow['id']}' != messageId) return messageRow;
+        return {
+          ...messageRow,
+          'acknowledged_by_me': true,
+          'acknowledgement_count': intValue(messageRow['acknowledgement_count']) + 1,
+          'acknowledged_employee_ids': {
+            ...(messageRow['acknowledged_employee_ids'] as List? ?? const <dynamic>[]).map((value) => '$value'),
+            widget.session.id,
+          }.toList(),
+        };
+      }).toList();
+      setState(() {
+        latestMessages = updated;
+        future = Future.value(updated);
       });
+    }
+    try {
+      try {
+        await supabase.rpc('ansar_acknowledge_chat_announcement', params: {
+          'p_employee_id': widget.session.id,
+          'p_message_id': messageId,
+        });
+      } catch (_) {
+        await supabase.from('ansar_chat_announcement_acknowledgements').upsert({
+          'message_id': messageId,
+          'employee_id': widget.session.id,
+          'acknowledged_at': DateTime.now().toUtc().toIso8601String(),
+        }, onConflict: 'message_id,employee_id');
+      }
       unawaited(refreshMessages());
     } catch (error) {
+      if (mounted && before != null) {
+        setState(() {
+          latestMessages = before;
+          future = Future.value(before);
+        });
+      }
       if (mounted) showSnack(context, chatUpgradeError(error));
     }
   }
@@ -12773,21 +12875,24 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
           onTap: openThreadHeader,
           child: Row(
             children: [
-              CircleAvatar(
-                radius: 17,
-                backgroundColor: accentColor.withValues(alpha: 0.12),
-                child: widget.thread['thread_type'] == 'direct'
-                    ? EmployeeAvatar(
-                        name: widget.thread['thread_avatar_name']?.toString() ?? widget.thread['title']?.toString() ?? 'محادثة',
-                        imageUrl: widget.thread['thread_avatar_url']?.toString(),
-                        radius: 17,
-                      )
-                    : Icon(
-                        widget.thread['thread_type'] == 'general' ? Icons.campaign_rounded : Icons.forum_rounded,
-                        color: widget.thread['thread_type'] == 'general' ? accentColor : brandColor,
-                        size: 19,
-                      ),
-              ),
+              if (widget.thread['channel_kind'] == 'branch')
+                BranchLogo(branchName: widget.thread['title']?.toString() ?? '', size: 34)
+              else
+                CircleAvatar(
+                  radius: 17,
+                  backgroundColor: accentColor.withValues(alpha: 0.12),
+                  child: widget.thread['thread_type'] == 'direct'
+                      ? EmployeeAvatar(
+                          name: widget.thread['thread_avatar_name']?.toString() ?? widget.thread['title']?.toString() ?? 'محادثة',
+                          imageUrl: widget.thread['thread_avatar_url']?.toString(),
+                          radius: 17,
+                        )
+                      : Icon(
+                          widget.thread['thread_type'] == 'general' ? Icons.campaign_rounded : Icons.forum_rounded,
+                          color: widget.thread['thread_type'] == 'general' ? accentColor : brandColor,
+                          size: 19,
+                        ),
+                ),
               const SizedBox(width: 9),
               Expanded(
                 child: Column(
@@ -13354,7 +13459,9 @@ class ChatMessageBubble extends StatelessWidget {
             .toList() ??
         <Map<String, dynamic>>[];
     final messageType = row['message_type']?.toString() ?? 'text';
-    final poll = row['poll'] is Map ? Map<String, dynamic>.from(row['poll'] as Map) : null;
+    final audioAttachments = attachments.where(chatAttachmentIsAudio).toList();
+    final regularAttachments = attachments.where((attachment) => !chatAttachmentIsAudio(attachment)).toList();
+    final poll = normalizedChatPoll(row['poll'], seed: '${row['id']}');
     final reactions = (row['reactions'] as List?)?.whereType<Map>().map(Map<String, dynamic>.from).toList() ?? <Map<String, dynamic>>[];
     return Column(
       children: [
@@ -13464,17 +13571,19 @@ class ChatMessageBubble extends StatelessWidget {
                                     ],
                                   )
                                 else ...[
-                                  if (messageType == 'voice' && attachments.isNotEmpty && voiceSourceResolver != null)
+                                  if ((messageType == 'voice' || audioAttachments.isNotEmpty) &&
+                                      audioAttachments.isNotEmpty &&
+                                      voiceSourceResolver != null)
                                     ChatVoicePlayer(
-                                      sourceResolver: () => voiceSourceResolver!(attachments.first),
-                                      duration: Duration(milliseconds: intValue(attachments.first['duration_ms'])),
-                                      waveform: (attachments.first['waveform'] as List?)
+                                      sourceResolver: () => voiceSourceResolver!(audioAttachments.first),
+                                      duration: Duration(milliseconds: intValue(audioAttachments.first['duration_ms'])),
+                                      waveform: (audioAttachments.first['waveform'] as List?)
                                               ?.whereType<num>()
                                               .map((value) => value.toDouble())
                                               .toList() ??
                                           const [],
                                     )
-                                  else if (messageType == 'poll' && poll != null)
+                                  else if ((messageType == 'poll' || row['poll_id'] != null) && poll != null)
                                     ChatPollCard(
                                       poll: poll,
                                       onVote: onPollVote == null ? null : (ids) => onPollVote!(poll, ids),
@@ -13489,10 +13598,10 @@ class ChatMessageBubble extends StatelessWidget {
                                     )
                                   else if ((row['body']?.toString() ?? '').isNotEmpty)
                                     Text(row['body']?.toString() ?? '', style: const TextStyle(height: 1.45)),
-                                  if (attachments.isNotEmpty) ...[
-                                    if (messageType != 'voice') ...[
+                                  if (regularAttachments.isNotEmpty) ...[
+                                    if (messageType != 'voice' || audioAttachments.isEmpty) ...[
                                       if ((row['body']?.toString() ?? '').isNotEmpty) const SizedBox(height: 7),
-                                      ChatAttachmentList(attachments: attachments, onTap: onAttachmentTap),
+                                      ChatAttachmentList(attachments: regularAttachments, onTap: onAttachmentTap),
                                     ],
                                   ],
                                 ],
@@ -13779,6 +13888,27 @@ class TransferChatMessageCard extends StatelessWidget {
   }
 }
 
+final Map<String, Future<String?>> _chatAttachmentUrlCache = <String, Future<String?>>{};
+
+Future<String?> resolveChatAttachmentSource(Map<String, dynamic> attachment) async {
+  final localPath = attachment['local_path']?.toString();
+  if (localPath != null && localPath.isNotEmpty && await File(localPath).exists()) return localPath;
+  final directUrl = attachment['url']?.toString();
+  if (directUrl != null && directUrl.startsWith('http')) return directUrl;
+  final path = attachment['path']?.toString();
+  if (path == null || path.isEmpty) return null;
+  final pending = _chatAttachmentUrlCache.putIfAbsent(
+    path,
+    () => supabase.storage.from('ansar-chat').createSignedUrl(path, 3600),
+  );
+  try {
+    return await pending;
+  } catch (_) {
+    _chatAttachmentUrlCache.remove(path);
+    rethrow;
+  }
+}
+
 class ChatAttachmentList extends StatelessWidget {
   const ChatAttachmentList({super.key, required this.attachments, this.onTap});
 
@@ -13792,37 +13922,37 @@ class ChatAttachmentList extends StatelessWidget {
         for (final attachment in attachments)
           Padding(
             padding: const EdgeInsets.only(bottom: 5),
-            child: Material(
-              color: softSurface,
-              borderRadius: BorderRadius.circular(7),
-              child: InkWell(
-                onTap: onTap == null ? null : () => onTap!(attachment),
-                borderRadius: BorderRadius.circular(7),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 8),
-                  child: Row(
-                    children: [
-                      Icon(
-                        (attachment['mime_type']?.toString() ?? '').startsWith('image/')
-                            ? Icons.image_outlined
-                            : Icons.description_outlined,
-                        color: brandColor,
-                      ),
-                      const SizedBox(width: 7),
-                      Expanded(
-                        child: Text(
-                          attachment['name']?.toString() ?? 'مرفق',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 11),
+            child: (attachment['mime_type']?.toString().toLowerCase() ?? '').startsWith('image/')
+                ? ChatInlineImage(
+                    attachment: attachment,
+                    onTap: onTap == null ? null : () => onTap!(attachment),
+                  )
+                : Material(
+                    color: softSurface,
+                    borderRadius: BorderRadius.circular(7),
+                    child: InkWell(
+                      onTap: onTap == null ? null : () => onTap!(attachment),
+                      borderRadius: BorderRadius.circular(7),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 8),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.description_outlined, color: brandColor),
+                            const SizedBox(width: 7),
+                            Expanded(
+                              child: Text(
+                                attachment['name']?.toString() ?? 'مرفق',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 11),
+                              ),
+                            ),
+                            const Icon(Icons.open_in_new_rounded, color: mutedInk, size: 16),
+                          ],
                         ),
                       ),
-                      const Icon(Icons.open_in_new_rounded, color: mutedInk, size: 16),
-                    ],
+                    ),
                   ),
-                ),
-              ),
-            ),
           ),
       ],
     );
@@ -14438,6 +14568,99 @@ Future<Map<String, int>> loadChatUnreadCounts(String employeeId) async {
   } catch (_) {
     // Unread badges are optional; their absence must not hide the conversations themselves.
     return <String, int>{};
+  }
+}
+
+class ChatInlineImage extends StatefulWidget {
+  const ChatInlineImage({super.key, required this.attachment, this.onTap});
+
+  final Map<String, dynamic> attachment;
+  final VoidCallback? onTap;
+
+  @override
+  State<ChatInlineImage> createState() => _ChatInlineImageState();
+}
+
+class _ChatInlineImageState extends State<ChatInlineImage> {
+  late Future<String?> source = resolveChatAttachmentSource(widget.attachment);
+
+  @override
+  void didUpdateWidget(covariant ChatInlineImage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.attachment['path'] != widget.attachment['path'] ||
+        oldWidget.attachment['local_path'] != widget.attachment['local_path']) {
+      source = resolveChatAttachmentSource(widget.attachment);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: softSurface,
+      borderRadius: BorderRadius.circular(7),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: widget.onTap,
+        child: FutureBuilder<String?>(
+          future: source,
+          builder: (context, snapshot) {
+            if (snapshot.connectionState != ConnectionState.done) {
+              return const SizedBox(
+                width: 230,
+                height: 150,
+                child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+              );
+            }
+            final value = snapshot.data;
+            if (snapshot.hasError || value == null || value.isEmpty) {
+              return const SizedBox(
+                width: 230,
+                height: 130,
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.broken_image_outlined, color: mutedInk),
+                    SizedBox(height: 5),
+                    Text('تعذر عرض الصورة', style: TextStyle(color: mutedInk, fontSize: 10)),
+                  ],
+                ),
+              );
+            }
+            final image = value.startsWith('http')
+                ? Image.network(
+                    value,
+                    width: 230,
+                    height: 180,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => const Center(child: Icon(Icons.broken_image_outlined, color: mutedInk)),
+                  )
+                : Image.file(
+                    File(value),
+                    width: 230,
+                    height: 180,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => const Center(child: Icon(Icons.broken_image_outlined, color: mutedInk)),
+                  );
+            return Stack(
+              children: [
+                image,
+                const Positioned(
+                  left: 7,
+                  bottom: 7,
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(color: Colors.black54, shape: BoxShape.circle),
+                    child: Padding(
+                      padding: EdgeInsets.all(5),
+                      child: Icon(Icons.fullscreen_rounded, color: Colors.white, size: 17),
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
   }
 }
 
@@ -15331,6 +15554,8 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
                         imageUrl: widget.thread['thread_avatar_url']?.toString(),
                         radius: 44,
                       )
+                    : channelKind == 'branch'
+                        ? BranchLogo(branchName: currentTitle, size: 88)
                     : Container(
                         width: 88,
                         height: 88,

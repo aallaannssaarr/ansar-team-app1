@@ -930,8 +930,30 @@ void main() {
 
   test('chat list preview describes rich message types', () {
     expect(chatMessageListPreview({'message_type': 'voice'}), contains('صوتية'));
+    expect(
+      chatMessageListPreview({
+        'message_type': 'attachment',
+        'attachments': [
+          {'mime_type': 'audio/mp4', 'duration_ms': 1500},
+        ],
+      }),
+      contains('صوتية'),
+    );
     expect(chatMessageListPreview({'message_type': 'poll', 'body': 'موعد الاجتماع'}), contains('موعد الاجتماع'));
     expect(chatMessageListPreview({'message_type': 'attachment'}), 'مرفق');
+  });
+
+  test('poll drafts with plain string options are normalized for rendering', () {
+    final poll = normalizedChatPoll({
+      'question': 'اختر موعداً',
+      'options': ['صباحاً', 'مساءً'],
+      'allows_multiple': false,
+    }, seed: 'draft');
+
+    expect(poll, isNotNull);
+    expect((poll!['options'] as List).length, 2);
+    expect((poll['options'] as List).first['option_text'], 'صباحاً');
+    expect((poll['options'] as List).first['id'], 'local:draft:0');
   });
 
   testWidgets('chat unread divider and poll fit a narrow Arabic screen', (tester) async {
