@@ -141,13 +141,15 @@ class ChatLocalStore {
     for (final thread in threads) {
       final id = thread['id']?.toString();
       if (id == null || id.isEmpty) continue;
+      final payload = encodeChatCachePayload(thread);
+      if (payload == null) continue;
       final updated = DateTime.tryParse(thread['updated_at']?.toString() ?? '')?.millisecondsSinceEpoch ?? now;
       batch.insert(
         'chat_threads',
         {
           'employee_id': employeeId,
           'thread_id': id,
-          'payload': jsonEncode(thread),
+          'payload': payload,
           'updated_at': updated,
         },
         conflictAlgorithm: ConflictAlgorithm.replace,
@@ -186,6 +188,8 @@ class ChatLocalStore {
       for (final message in messages) {
         final id = message['id']?.toString() ?? message['client_message_id']?.toString();
         if (id == null || id.isEmpty) continue;
+        final payload = encodeChatCachePayload(message);
+        if (payload == null) continue;
         final created = DateTime.tryParse(message['created_at']?.toString() ?? '')?.millisecondsSinceEpoch ?? now;
         batch.insert(
           'chat_messages',
@@ -194,7 +198,7 @@ class ChatLocalStore {
             'thread_id': threadId,
             'message_id': id,
             'client_message_id': message['client_message_id']?.toString(),
-            'payload': jsonEncode(message),
+            'payload': payload,
             'created_at': created,
             'updated_at': now,
           },
@@ -442,6 +446,14 @@ class ChatLocalStore {
     } catch (_) {
       return null;
     }
+  }
+}
+
+String? encodeChatCachePayload(Map<String, dynamic> value) {
+  try {
+    return jsonEncode(value);
+  } catch (_) {
+    return null;
   }
 }
 

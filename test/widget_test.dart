@@ -48,6 +48,42 @@ void main() {
     expect(database.queriedSql, contains('PRAGMA journal_mode = WAL'));
   });
 
+  test('chat contact rows remain serializable in the local cache', () {
+    final employee = EmployeeLite(
+      id: 'employee-1',
+      name: 'موظف تجريبي',
+      username: 'employee1',
+      branchNum: 2,
+      role: 'employee',
+      isActive: true,
+      avatarUrl: 'https://example.com/avatar.jpg',
+    );
+    final thread = <String, dynamic>{
+      'id': 'contact:${employee.id}',
+      'thread_type': 'contact',
+      'title': employee.name,
+      'contact_employee': employee.toCacheRow(),
+    };
+
+    final payload = encodeChatCachePayload(thread);
+
+    expect(payload, isNotNull);
+    expect(EmployeeLite.fromRow(employee.toCacheRow()).id, employee.id);
+  });
+
+  test('an unsupported chat cache row is skipped instead of failing the snapshot', () {
+    final employee = EmployeeLite(
+      id: 'employee-2',
+      name: 'موظف',
+      username: 'employee2',
+      branchNum: 1,
+      role: 'employee',
+      isActive: true,
+    );
+
+    expect(encodeChatCachePayload({'id': 'bad', 'employee': employee}), isNull);
+  });
+
   test('cleanError hides Flutter setState Future noise', () {
     expect(
       cleanError('setState() callback argument returned a Future'),

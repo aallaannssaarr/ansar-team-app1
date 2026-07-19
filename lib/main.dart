@@ -435,6 +435,17 @@ class EmployeeLite {
 
   bool get isGeneralAdmin => role == 'admin' || canManageAllBranches;
 
+  Map<String, dynamic> toCacheRow() => {
+        'id': id,
+        'display_name': name,
+        'username': username,
+        'branch_num': branchNum,
+        'role': role,
+        'is_active': isActive,
+        'avatar_url': avatarUrl,
+        'can_manage_all_branches': canManageAllBranches,
+      };
+
   factory EmployeeLite.fromRow(Map<String, dynamic> row) {
     return EmployeeLite(
       id: row['id']?.toString() ?? '',
@@ -9919,10 +9930,14 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Future<List<Map<String, dynamic>>> loadCachedThreads() async {
-    final cached = await ChatLocalStore.instance.readThreads(widget.session.id);
-    final enriched = await enrichThreadsFromLocalChat(cached);
-    latestThreads = enriched;
-    return enriched;
+    try {
+      final cached = await ChatLocalStore.instance.readThreads(widget.session.id);
+      final enriched = await enrichThreadsFromLocalChat(cached);
+      latestThreads = enriched;
+      return enriched;
+    } catch (_) {
+      return latestThreads ?? <Map<String, dynamic>>[];
+    }
   }
 
   Future<List<Map<String, dynamic>>> enrichThreadsFromLocalChat(List<Map<String, dynamic>> threads) async {
@@ -9948,14 +9963,19 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> refreshThreadsFromServer() async {
     try {
       final loaded = await loadThreads();
-      await ChatLocalStore.instance.writeThreads(widget.session.id, loaded);
-      final enriched = await enrichThreadsFromLocalChat(loaded);
+      var enriched = loaded;
+      try {
+        enriched = await enrichThreadsFromLocalChat(loaded);
+      } catch (_) {
+        // Remote conversations are still authoritative when the local cache is unavailable.
+      }
       if (!mounted) return;
       setState(() {
         latestThreads = enriched;
         future = Future.value(enriched);
         chatListNotice = null;
       });
+      unawaited(cacheThreadsSafely(loaded));
     } catch (error) {
       if (!mounted) return;
       final cached = await loadCachedThreads();
@@ -9964,6 +9984,14 @@ class _ChatPageState extends State<ChatPage> {
         future = Future.value(cached);
         chatListNotice = 'تعذر تحديث المحادثات، تُعرض النسخة المحفوظة';
       });
+    }
+  }
+
+  Future<void> cacheThreadsSafely(List<Map<String, dynamic>> threads) async {
+    try {
+      await ChatLocalStore.instance.writeThreads(widget.session.id, threads);
+    } catch (_) {
+      // A cache failure must never hide conversations that were loaded from the server.
     }
   }
 
@@ -9979,8 +10007,30 @@ class _ChatPageState extends State<ChatPage> {
   Future<List<Map<String, dynamic>>> loadAndRememberThreads() async {
     final loaded = await loadThreads();
     latestThreads = loaded;
-    if (kIsBetaBuild) unawaited(ChatLocalStore.instance.writeThreads(widget.session.id, loaded));
+    if (kIsBetaBuild) unawaited(cacheThreadsSafely(loaded));
     return loaded;
+  }
+
+  Future<List<Map<String, dynamic>>> loadJoinedChatParticipants() async {
+    const projections = [
+      'thread_id, role, is_pinned, is_muted, muted_until, is_archived, last_read_at',
+      'thread_id, role, is_pinned, is_muted, muted_until, last_read_at',
+      'thread_id, role, last_read_at',
+      'thread_id',
+    ];
+    Object? lastError;
+    for (final projection in projections) {
+      try {
+        final rows = await supabase
+            .from('ansar_chat_participants')
+            .select(projection)
+            .eq('employee_id', widget.session.id);
+        return rows.cast<Map<String, dynamic>>();
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError ?? StateError('Unable to load chat participants');
   }
 
   Future<List<Map<String, dynamic>>> loadThreads() async {
@@ -9989,13 +10039,10 @@ class _ChatPageState extends State<ChatPage> {
         .select()
         .eq('is_active', true)
         .order('updated_at', ascending: false);
-    final joinedParticipantsFuture = supabase
-        .from('ansar_chat_participants')
-        .select('thread_id, role, is_pinned, is_muted, muted_until, is_archived, last_read_at')
-        .eq('employee_id', widget.session.id);
+    final joinedParticipantsFuture = loadJoinedChatParticipants();
     final employeesFuture = loadAllActiveEmployees();
     final rows = (await threadRowsFuture).cast<Map<String, dynamic>>();
-    final joinedParticipants = (await joinedParticipantsFuture).cast<Map<String, dynamic>>();
+    final joinedParticipants = await joinedParticipantsFuture;
     final activeEmployees = await employeesFuture;
     final joinedThreadIds = joinedParticipants.map((row) => row['thread_id']).toSet();
     final settingsByThread = {
@@ -10088,7 +10135,7 @@ class _ChatPageState extends State<ChatPage> {
               'thread_avatar_url': employee.avatarUrl,
               'thread_avatar_name': employee.name,
               'participant_ids': [widget.session.id, employee.id],
-              'contact_employee': employee,
+              'contact_employee': employee.toCacheRow(),
             })
         .toList()
       ..sort((a, b) => normalizeSearch('${a['title']}').compareTo(normalizeSearch('${b['title']}')));
@@ -10190,8 +10237,13 @@ class _ChatPageState extends State<ChatPage> {
 
   Future<void> openThread(Map<String, dynamic> thread) async {
     if (thread['thread_type'] == 'contact') {
-      final employee = thread['contact_employee'];
-      if (employee is EmployeeLite) {
+      final rawEmployee = thread['contact_employee'];
+      final employee = rawEmployee is EmployeeLite
+          ? rawEmployee
+          : rawEmployee is Map
+              ? EmployeeLite.fromRow(Map<String, dynamic>.from(rawEmployee))
+              : null;
+      if (employee != null && employee.id.isNotEmpty) {
         await openOrCreateDirectChat(context, widget.session, employee);
         if (mounted) refreshThreads();
       }
@@ -11067,16 +11119,20 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     try {
       var loaded = await loadMessages();
       if (kIsBetaBuild) {
-        final local = await ChatLocalStore.instance.readMessages(widget.session.id, '${widget.thread['id']}', limit: 500);
-        final serverClientIds = loaded.map((row) => row['client_message_id']?.toString()).whereType<String>().toSet();
-        final pending = local.where((row) {
-          final state = row['local_state']?.toString();
-          final clientId = row['client_message_id']?.toString();
-          return {'pending', 'sending', 'failed'}.contains(state) && (clientId == null || !serverClientIds.contains(clientId));
-        });
-        loaded = [...loaded, ...pending]
-          ..sort((a, b) => parseChatDate(a['created_at']).compareTo(parseChatDate(b['created_at'])));
-        await ChatLocalStore.instance.writeMessages(widget.session.id, '${widget.thread['id']}', loaded);
+        try {
+          final local = await ChatLocalStore.instance.readMessages(widget.session.id, '${widget.thread['id']}', limit: 500);
+          final serverClientIds = loaded.map((row) => row['client_message_id']?.toString()).whereType<String>().toSet();
+          final pending = local.where((row) {
+            final state = row['local_state']?.toString();
+            final clientId = row['client_message_id']?.toString();
+            return {'pending', 'sending', 'failed'}.contains(state) &&
+                (clientId == null || !serverClientIds.contains(clientId));
+          });
+          loaded = [...loaded, ...pending]
+            ..sort((a, b) => parseChatDate(a['created_at']).compareTo(parseChatDate(b['created_at'])));
+        } catch (_) {
+          // Server messages remain usable even if the local database needs recovery.
+        }
       }
       if (!mounted) return;
       if (messageSyncError != null) setState(() => messageSyncError = null);
@@ -11085,6 +11141,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
         latestMessages = loaded;
         future = Future.value(loaded);
       });
+      if (kIsBetaBuild) unawaited(cacheMessagesSafely(loaded));
     } catch (_) {
       if (mounted && messageSyncError == null) {
         setState(() => messageSyncError = 'تعذر تحديث الرسائل مؤقتاً، نعرض آخر نسخة محفوظة');
@@ -11191,10 +11248,20 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   Future<List<Map<String, dynamic>>> loadAndRememberMessages() async {
     final loaded = await loadMessages();
     latestMessages = loaded;
-    if (kIsBetaBuild) {
-      await ChatLocalStore.instance.writeMessages(widget.session.id, '${widget.thread['id']}', loaded);
-    }
+    if (kIsBetaBuild) unawaited(cacheMessagesSafely(loaded));
     return loaded;
+  }
+
+  Future<void> cacheMessagesSafely(List<Map<String, dynamic>> messages) async {
+    try {
+      await ChatLocalStore.instance.writeMessages(
+        widget.session.id,
+        '${widget.thread['id']}',
+        messages,
+      );
+    } catch (_) {
+      // Local persistence is best effort and must not replace live messages with an error state.
+    }
   }
 
   Future<List<Map<String, dynamic>>> loadMessages() async {
@@ -14317,17 +14384,22 @@ Future<Map<String, int>> loadChatUnreadCounts(String employeeId) async {
   } catch (_) {
     // Fall back to the receipt table while the RPC migration is being deployed.
   }
-  final rows = await supabase
-      .from('ansar_chat_message_receipts')
-      .select('thread_id')
-      .eq('employee_id', employeeId)
-      .neq('status', 'read');
-  final counts = <String, int>{};
-  for (final row in rows) {
-    final threadId = '${row['thread_id']}';
-    counts[threadId] = (counts[threadId] ?? 0) + 1;
+  try {
+    final rows = await supabase
+        .from('ansar_chat_message_receipts')
+        .select('thread_id')
+        .eq('employee_id', employeeId)
+        .neq('status', 'read');
+    final counts = <String, int>{};
+    for (final row in rows) {
+      final threadId = '${row['thread_id']}';
+      counts[threadId] = (counts[threadId] ?? 0) + 1;
+    }
+    return counts;
+  } catch (_) {
+    // Unread badges are optional; their absence must not hide the conversations themselves.
+    return <String, int>{};
   }
-  return counts;
 }
 
 Future<void> touchEmployeePresence(String employeeId, {required bool online}) async {
