@@ -12623,74 +12623,10 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   }
 
   Future<void> showPollComposer() async {
-    final question = TextEditingController();
-    final options = [TextEditingController(), TextEditingController()];
-    var multiple = false;
     final result = await showDialog<Map<String, dynamic>>(
       context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Row(
-            children: [
-              Icon(Icons.poll_outlined, color: brandColor),
-              SizedBox(width: 8),
-              Text('استبيان جديد'),
-            ],
-          ),
-          content: SizedBox(
-            width: 420,
-            child: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  TextField(controller: question, decoration: const InputDecoration(labelText: 'السؤال')),
-                  const SizedBox(height: 10),
-                  for (var index = 0; index < options.length; index++) ...[
-                    TextField(
-                      controller: options[index],
-                      decoration: InputDecoration(labelText: 'الخيار ${index + 1}'),
-                    ),
-                    const SizedBox(height: 8),
-                  ],
-                  if (options.length < 8)
-                    Align(
-                      alignment: Alignment.centerRight,
-                      child: TextButton.icon(
-                        onPressed: () => setDialogState(() => options.add(TextEditingController())),
-                        icon: const Icon(Icons.add_rounded),
-                        label: const Text('إضافة خيار'),
-                      ),
-                    ),
-                  SwitchListTile(
-                    contentPadding: EdgeInsets.zero,
-                    value: multiple,
-                    onChanged: (value) => setDialogState(() => multiple = value),
-                    title: const Text('السماح باختيار أكثر من إجابة'),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('إلغاء')),
-            FilledButton(
-              onPressed: () {
-                final values = options.map((controller) => controller.text.trim()).where((value) => value.isNotEmpty).toList();
-                if (question.text.trim().isEmpty || values.length < 2) return;
-                Navigator.pop(dialogContext, {
-                  'question': question.text.trim(),
-                  'options': values,
-                  'allows_multiple': multiple,
-                });
-              },
-              child: const Text('إرسال الاستبيان'),
-            ),
-          ],
-        ),
-      ),
+      builder: (_) => const ChatPollComposerDialog(),
     );
-    for (final controller in options) controller.dispose();
-    question.dispose();
     if (result == null || !mounted) return;
     setState(() => sendingMessage = true);
     try {
@@ -13378,6 +13314,136 @@ class ChatMessagesSkeleton extends StatelessWidget {
               ),
             ),
           ),
+      ],
+    );
+  }
+}
+
+class ChatPollComposerDialog extends StatefulWidget {
+  const ChatPollComposerDialog({super.key});
+
+  @override
+  State<ChatPollComposerDialog> createState() => _ChatPollComposerDialogState();
+}
+
+class _ChatPollComposerDialogState extends State<ChatPollComposerDialog> {
+  final question = TextEditingController();
+  final options = <TextEditingController>[
+    TextEditingController(),
+    TextEditingController(),
+  ];
+  bool multiple = false;
+  String? validationMessage;
+
+  @override
+  void dispose() {
+    question.dispose();
+    for (final controller in options) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  void addOption() {
+    if (options.length >= 8) return;
+    setState(() {
+      options.add(TextEditingController());
+      validationMessage = null;
+    });
+  }
+
+  void submit() {
+    final questionText = question.text.trim();
+    final values = options
+        .map((controller) => controller.text.trim())
+        .where((value) => value.isNotEmpty)
+        .toList();
+    if (questionText.isEmpty || values.length < 2) {
+      setState(() => validationMessage = 'اكتب السؤال وخيارين على الأقل');
+      return;
+    }
+    Navigator.of(context).pop(<String, dynamic>{
+      'question': questionText,
+      'options': values,
+      'allows_multiple': multiple,
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.poll_outlined, color: brandColor),
+          SizedBox(width: 8),
+          Expanded(child: Text('استبيان جديد')),
+        ],
+      ),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                key: const ValueKey('poll-question'),
+                controller: question,
+                textInputAction: TextInputAction.next,
+                decoration: const InputDecoration(labelText: 'السؤال'),
+                onChanged: (_) {
+                  if (validationMessage != null) setState(() => validationMessage = null);
+                },
+              ),
+              const SizedBox(height: 10),
+              for (var index = 0; index < options.length; index++) ...[
+                TextField(
+                  key: ValueKey('poll-option-$index'),
+                  controller: options[index],
+                  textInputAction: index == options.length - 1 ? TextInputAction.done : TextInputAction.next,
+                  decoration: InputDecoration(labelText: 'الخيار ${index + 1}'),
+                  onChanged: (_) {
+                    if (validationMessage != null) setState(() => validationMessage = null);
+                  },
+                ),
+                const SizedBox(height: 8),
+              ],
+              if (validationMessage != null)
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: Padding(
+                    padding: const EdgeInsets.only(bottom: 4),
+                    child: Text(
+                      validationMessage!,
+                      style: const TextStyle(color: dangerColor, fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                ),
+              if (options.length < 8)
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    onPressed: addOption,
+                    icon: const Icon(Icons.add_rounded),
+                    label: const Text('إضافة خيار'),
+                  ),
+                ),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                value: multiple,
+                onChanged: (value) => setState(() => multiple = value),
+                title: const Text('السماح باختيار أكثر من إجابة'),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('إلغاء')),
+        FilledButton(
+          key: const ValueKey('send-poll'),
+          onPressed: submit,
+          child: const Text('إرسال الاستبيان'),
+        ),
       ],
     );
   }

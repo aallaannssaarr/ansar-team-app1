@@ -1,7 +1,7 @@
 name: ansar_team_app
 description: Native mobile app for Al Ansar team operations.
 publish_to: "none"
-version: 0.6.5+23
+version: 0.6.6+24
 
 environment:
   sdk: ">=3.4.0 <4.0.0"

@@ -990,4 +990,38 @@ void main() {
     expect(find.text('رسائل غير مقروءة'), findsOneWidget);
     expect(find.textContaining('الموعد الأنسب'), findsOneWidget);
   });
+
+  testWidgets('poll composer closes cleanly after returning a valid poll', (tester) async {
+    Map<String, dynamic>? result;
+    await tester.pumpWidget(
+      _testShell(
+        Builder(
+          builder: (context) => Center(
+            child: FilledButton(
+              onPressed: () async {
+                result = await showDialog<Map<String, dynamic>>(
+                  context: context,
+                  builder: (_) => const ChatPollComposerDialog(),
+                );
+              },
+              child: const Text('فتح الاستبيان'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('فتح الاستبيان'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const ValueKey('poll-question')), 'ما الموعد المناسب؟');
+    await tester.enterText(find.byKey(const ValueKey('poll-option-0')), 'صباحاً');
+    await tester.enterText(find.byKey(const ValueKey('poll-option-1')), 'مساءً');
+    await tester.tap(find.byKey(const ValueKey('send-poll')));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    expect(result?['question'], 'ما الموعد المناسب؟');
+    expect(result?['options'], ['صباحاً', 'مساءً']);
+    expect(find.byType(ChatPollComposerDialog), findsNothing);
+  });
 }
