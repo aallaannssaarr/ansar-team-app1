@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - codex/design-beta
+      - codex/chat-v2
 
 permissions:
   contents: read

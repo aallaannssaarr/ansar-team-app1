@@ -835,4 +835,45 @@ void main() {
 
     expect(tester.takeException(), isNull);
   });
+
+  test('chat list preview describes rich message types', () {
+    expect(chatMessageListPreview({'message_type': 'voice'}), contains('صوتية'));
+    expect(chatMessageListPreview({'message_type': 'poll', 'body': 'موعد الاجتماع'}), contains('موعد الاجتماع'));
+    expect(chatMessageListPreview({'message_type': 'attachment'}), 'مرفق');
+  });
+
+  testWidgets('chat unread divider and poll fit a narrow Arabic screen', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _testShell(
+        MediaQuery(
+          data: MediaQueryData(textScaler: TextScaler.linear(1.2)),
+          child: ListView(
+            padding: const EdgeInsets.all(12),
+            children: const [
+              ChatUnreadDivider(),
+              ChatPollCard(
+                poll: {
+                  'id': 'poll-1',
+                  'question': 'ما الموعد الأنسب للاجتماع القادم؟',
+                  'allows_multiple': false,
+                  'total_votes': 3,
+                  'options': [
+                    {'id': 'one', 'option_text': 'الساعة التاسعة صباحاً', 'votes': 2},
+                    {'id': 'two', 'option_text': 'الساعة الثانية ظهراً', 'votes': 1},
+                  ],
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    expect(tester.takeException(), isNull);
+    expect(find.text('رسائل غير مقروءة'), findsOneWidget);
+    expect(find.textContaining('الموعد الأنسب'), findsOneWidget);
+  });
 }
