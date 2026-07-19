@@ -38,6 +38,10 @@ export 'design/ansar_tokens.dart';
 import 'product_cache.dart';
 import 'rich_notifications.dart';
 
+// Chat v2 is now the production chat implementation. Keep this independent
+// from the beta application flavor so the main APK runs the same tested sync.
+const bool kChatV2Enabled = true;
+
 @pragma('vm:entry-point')
 Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp();
@@ -833,7 +837,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     unawaited(chatAppPresence.start(employeeId: session.id, employeeName: session.name));
     startInAppNotificationMonitor();
     startUnreadMessagesMonitor();
-    if (kIsBetaBuild) startHomeChatSync();
+    if (kChatV2Enabled) startHomeChatSync();
     transferDeepLinkSubscription = transferDeepLinks.stream.listen(openTransferDeepLink);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final orderId = pendingTransferOrderId;
@@ -1002,7 +1006,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     if (notificationServicesInitialized) startNotificationRegistrationMonitor();
     startInAppNotificationMonitor();
     startUnreadMessagesMonitor();
-    if (kIsBetaBuild) startHomeChatSync();
+    if (kChatV2Enabled) startHomeChatSync();
   }
 
   void startHomeChatSync() {
@@ -1044,7 +1048,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     unreadMessagesTimer?.cancel();
     if (unreadMessagesChannel != null) supabase.removeChannel(unreadMessagesChannel!);
     unawaited(refreshUnreadChatMessages());
-    if (kIsBetaBuild) return;
+    if (kChatV2Enabled) return;
     unreadMessagesTimer = Timer.periodic(const Duration(seconds: 5), (_) => refreshUnreadChatMessages());
     unreadMessagesChannel = supabase.channel('chat-unread-${session.id}')
       ..onPostgresChanges(
@@ -1175,7 +1179,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       unawaited(chatAppPresence.start(employeeId: session.id, employeeName: session.name));
       unawaited(touchEmployeePresence(session.id, online: true));
       unawaited(refreshUnreadChatMessages());
-      if (kIsBetaBuild) unawaited(chatSyncCoordinator.flushOutbox());
+      if (kChatV2Enabled) unawaited(chatSyncCoordinator.flushOutbox());
     } else if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
       unawaited(chatAppPresence.pause());
       unawaited(touchEmployeePresence(session.id, online: false));
@@ -1227,7 +1231,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> logout() async {
     await homeChatSyncSubscription?.cancel();
     homeChatSyncSubscription = null;
-    if (kIsBetaBuild) await chatSyncCoordinator.stop();
+    if (kChatV2Enabled) await chatSyncCoordinator.stop();
     await chatAppPresence.stop();
     await notificationTokenRefreshSubscription?.cancel();
     notificationTokenRefreshSubscription = null;
@@ -9887,8 +9891,8 @@ class _ChatPageState extends State<ChatPage> {
   @override
   void initState() {
     super.initState();
-    future = kIsBetaBuild ? loadCachedThreads() : loadAndRememberThreads();
-    if (kIsBetaBuild) {
+    future = kChatV2Enabled ? loadCachedThreads() : loadAndRememberThreads();
+    if (kChatV2Enabled) {
       unawaited(chatSyncCoordinator.start(widget.session.id));
       chatSyncSubscription = chatSyncCoordinator.events.listen((event) {
         if (!mounted) return;
@@ -9953,7 +9957,7 @@ class _ChatPageState extends State<ChatPage> {
 
   void refreshThreads() {
     if (!mounted) return;
-    if (kIsBetaBuild) {
+    if (kChatV2Enabled) {
       unawaited(refreshThreadsFromServer());
     } else {
       setState(() => future = loadAndRememberThreads());
@@ -10038,7 +10042,7 @@ class _ChatPageState extends State<ChatPage> {
   Future<List<Map<String, dynamic>>> loadAndRememberThreads() async {
     final loaded = await loadThreads();
     latestThreads = loaded;
-    if (kIsBetaBuild) unawaited(cacheThreadsSafely(loaded));
+    if (kChatV2Enabled) unawaited(cacheThreadsSafely(loaded));
     return loaded;
   }
 
@@ -10901,12 +10905,12 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     activeChatThreadId = '${widget.thread['id']}';
     openedLastReadAt = DateTime.tryParse(widget.thread['last_read_at']?.toString() ?? '')?.toLocal();
     openedUnreadCount = intValue(widget.thread['unread_count']);
-    future = kIsBetaBuild ? loadCachedMessages() : loadAndRememberMessages();
+    future = kChatV2Enabled ? loadCachedMessages() : loadAndRememberMessages();
     message.addListener(handleTypingChanged);
     setupLiveConversation();
     appPresenceSubscription = chatAppPresence.changes.listen((_) => updateAppOnlinePresence());
     updateAppOnlinePresence();
-    if (kIsBetaBuild) {
+    if (kChatV2Enabled) {
       unawaited(chatSyncCoordinator.start(widget.session.id));
       chatSyncSubscription = chatSyncCoordinator.events.listen(handleChatSyncEvent);
       unawaited(restoreDraft());
@@ -10919,7 +10923,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     // Realtime can report a connected channel even when a table is not yet
     // published. Keep a light reconciliation loop so another device's message
     // still appears without leaving and reopening the conversation.
-    if (!kIsBetaBuild) {
+    if (!kChatV2Enabled) {
       timer = Timer.periodic(const Duration(seconds: 3), (_) => unawaited(refreshMessages()));
     }
   }
@@ -10949,8 +10953,8 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      if (!kIsBetaBuild && !realtimeConnected) setupMessageChanges();
-      if (kIsBetaBuild) unawaited(chatSyncCoordinator.flushOutbox());
+      if (!kChatV2Enabled && !realtimeConnected) setupMessageChanges();
+      if (kChatV2Enabled) unawaited(chatSyncCoordinator.flushOutbox());
       unawaited(refreshMessages());
       unawaited(markThreadDelivered());
     }
@@ -11165,7 +11169,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   }
 
   void handleTypingChanged() {
-    if (kIsBetaBuild && editingMessage == null) {
+    if (kChatV2Enabled && editingMessage == null) {
       draftTimer?.cancel();
       draftTimer = Timer(const Duration(milliseconds: 350), () {
         unawaited(ChatLocalStore.instance.writeDraft(
@@ -11201,7 +11205,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     refreshingMessages = true;
     try {
       var loaded = await loadMessages();
-      if (kIsBetaBuild) {
+      if (kChatV2Enabled) {
         try {
           final local = await ChatLocalStore.instance.readMessages(widget.session.id, '${widget.thread['id']}', limit: 500);
           final serverClientIds = loaded.map((row) => row['client_message_id']?.toString()).whereType<String>().toSet();
@@ -11224,7 +11228,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
         latestMessages = loaded;
         future = Future.value(loaded);
       });
-      if (kIsBetaBuild) unawaited(cacheMessagesSafely(loaded));
+      if (kChatV2Enabled) unawaited(cacheMessagesSafely(loaded));
     } catch (_) {
       if (mounted && messageSyncError == null) {
         setState(() => messageSyncError = 'تعذر تحديث الرسائل مؤقتاً، نعرض آخر نسخة محفوظة');
@@ -11244,7 +11248,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   }
 
   void handleMessageScroll() {
-    if (kIsBetaBuild && scrollController.hasClients && scrollController.position.pixels < 80 && !loadingOlderMessages) {
+    if (kChatV2Enabled && scrollController.hasClients && scrollController.position.pixels < 80 && !loadingOlderMessages) {
       loadingOlderMessages = true;
       messageLimit = min(500, messageLimit + 80);
       unawaited(refreshMessages().whenComplete(() => loadingOlderMessages = false));
@@ -11331,7 +11335,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
   Future<List<Map<String, dynamic>>> loadAndRememberMessages() async {
     final loaded = await loadMessages();
     latestMessages = loaded;
-    if (kIsBetaBuild) unawaited(cacheMessagesSafely(loaded));
+    if (kChatV2Enabled) unawaited(cacheMessagesSafely(loaded));
     return loaded;
   }
 
@@ -11349,7 +11353,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
 
   Future<List<Map<String, dynamic>>> loadMessages() async {
     List<Map<String, dynamic>> allMessages;
-    if (kIsBetaBuild) {
+    if (kChatV2Enabled) {
       try {
         allMessages = <Map<String, dynamic>>[];
         String? before;
@@ -11485,7 +11489,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     final acknowledgementCounts = <String, int>{};
     final acknowledgementsByMessage = <String, Set<String>>{};
     final acknowledgedIds = <String>{};
-    if (kIsBetaBuild && messages.isNotEmpty) {
+    if (kChatV2Enabled && messages.isNotEmpty) {
       final messageIds = messages.map((row) => '${row['id']}').toList();
       try {
         final rows = await supabase
@@ -11719,7 +11723,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
       return;
     }
     setState(() => sendingMessage = true);
-    if (kIsBetaBuild) {
+    if (kChatV2Enabled) {
       try {
         final localAttachments = <Map<String, dynamic>>[];
         for (final attachment in pendingAttachments) {
@@ -11845,7 +11849,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     setState(() => sendingMessage = true);
     final editedAt = DateTime.now().toUtc().toIso8601String();
     try {
-      if (kIsBetaBuild) {
+      if (kChatV2Enabled) {
         await supabase.rpc('ansar_edit_chat_message_v2', params: {
           'p_employee_id': widget.session.id,
           'p_message_id': '${target['id']}',
@@ -11906,7 +11910,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
     if (confirmed != true || !mounted) return;
     final deletedAt = DateTime.now().toUtc().toIso8601String();
     try {
-      if (kIsBetaBuild) {
+      if (kChatV2Enabled) {
         await supabase.rpc('ansar_delete_chat_message_v2', params: {
           'p_employee_id': widget.session.id,
           'p_message_id': '${row['id']}',
@@ -12057,7 +12061,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              if (kIsBetaBuild && !deleted)
+              if (kChatV2Enabled && !deleted)
                 Padding(
                   padding: const EdgeInsets.fromLTRB(12, 6, 12, 3),
                   child: Row(
@@ -12102,7 +12106,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
                     unawaited(forwardMessage(row));
                   },
                 ),
-              if (kIsBetaBuild && !deleted)
+              if (kChatV2Enabled && !deleted)
                 ListTile(
                   leading: Icon(row['is_starred'] == true ? Icons.star_rounded : Icons.star_border_rounded, color: accentColor),
                   title: Text(row['is_starred'] == true ? 'إزالة من الرسائل المميزة' : 'تمييز الرسالة'),
@@ -12111,7 +12115,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
                     unawaited(toggleMessageStar(row));
                   },
                 ),
-              if (kIsBetaBuild && !deleted && widget.thread['thread_type'] != 'direct')
+              if (kChatV2Enabled && !deleted && widget.thread['thread_type'] != 'direct')
                 ListTile(
                   leading: Icon(row['is_message_pinned'] == true ? Icons.push_pin_rounded : Icons.push_pin_outlined, color: infoColor),
                   title: Text(row['is_message_pinned'] == true ? 'إلغاء تثبيت الرسالة' : 'تثبيت الرسالة'),
@@ -13085,7 +13089,7 @@ class _ChatThreadPageState extends State<ChatThreadPage> with WidgetsBindingObse
                     ),
                     const SizedBox(height: 8),
                   ],
-                  if (kIsBetaBuild &&
+                  if (kChatV2Enabled &&
                       widget.thread['channel_kind'] == 'announcement' &&
                       widget.session.isGeneralAdmin &&
                       editingMessage == null) ...[
@@ -14856,7 +14860,7 @@ class _ForwardMessagePageState extends State<ForwardMessagePage> {
     setState(() => sending = true);
     try {
       final body = widget.sourceMessage['body']?.toString() ?? '';
-      if (kIsBetaBuild) {
+      if (kChatV2Enabled) {
         await chatSyncCoordinator.start(widget.session.id);
         final attachments = (widget.sourceMessage['attachments'] as List?)
                 ?.whereType<Map>()
@@ -14897,7 +14901,7 @@ class _ForwardMessagePageState extends State<ForwardMessagePage> {
             break;
           }
         }
-        if (!kIsBetaBuild && thread != null) {
+        if (!kChatV2Enabled && thread != null) {
           unawaited(enqueueChatNotification(thread: thread, sender: widget.session, body: body));
         }
       }
@@ -15392,7 +15396,7 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
     );
     if (selected == null || selected.isEmpty) return;
     try {
-      if (kIsBetaBuild) {
+      if (kChatV2Enabled) {
         for (final employee in selected) {
           await supabase.rpc('ansar_manage_chat_member_v2', params: {
             'p_actor_id': widget.session.id,
@@ -15432,7 +15436,7 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
       ),
     );
     if (confirmed != true) return;
-    if (kIsBetaBuild) {
+    if (kChatV2Enabled) {
       await supabase.rpc('ansar_manage_chat_member_v2', params: {
         'p_actor_id': widget.session.id,
         'p_thread_id': threadId,
@@ -15456,7 +15460,7 @@ class _ChatInfoPageState extends State<ChatInfoPage> {
   Future<void> toggleMemberAdmin(Map<String, dynamic> participant) async {
     final nextRole = participant['participant_role'] == 'admin' ? 'member' : 'admin';
     try {
-      if (kIsBetaBuild) {
+      if (kChatV2Enabled) {
         await supabase.rpc('ansar_manage_chat_member_v2', params: {
           'p_actor_id': widget.session.id,
           'p_thread_id': threadId,

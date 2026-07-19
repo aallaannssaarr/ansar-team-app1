@@ -39,6 +39,10 @@ Widget _testShell(Widget child) {
 }
 
 void main() {
+  test('rich chat sync remains enabled in the production application', () {
+    expect(kChatV2Enabled, isTrue);
+  });
+
   test('chat send falls back only when the v2 server function is unavailable', () {
     expect(
       shouldFallbackToLegacyChatSend(
